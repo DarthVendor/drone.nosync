@@ -130,6 +130,28 @@ class QuadrupedAgent(EmbodiedAgent):
         return terms
 
 
+class NavAgent(EmbodiedAgent):
+    """Quadrotor navigating an obstacle field, avoiding from RANGE MEASUREMENTS.
+
+    Exists as a registered class rather than a hand-assembled term list so the
+    whole rig is expressible from a `Config` -- which is what lets worker
+    processes rebuild it, since a closure over terms is not picklable.
+
+    `RangeBarrier` is handed beams and never told where anything is, which is the
+    difference that makes transfer to an unseen layout mean something: an
+    `ObstacleBarrier` is given geometry at construction and cannot transfer.
+    """
+
+    for_systems = ("QuadrotorNav",)
+
+    @classmethod
+    def build_terms(cls, system, n_bowls: int = 3, n_beams: int = 12,
+                    sensor_name: str = "range", barrier_weight: float = 1.2, **kw):
+        from .sensor_terms import RangeBarrier
+        return cls._core(system, n_bowls) + [
+            RangeBarrier(system.task_dim, sensor_name, n_beams, w0=barrier_weight)]
+
+
 class ArmAgent(EmbodiedAgent):
     """Articulated arm in joint space: core plus joint-limit barriers."""
 
@@ -163,6 +185,7 @@ class PlanarQuadrotorAgent(QuadrotorAgent):
 
 AGENTS = {
     "quadrotor_agent": QuadrotorAgent,
+    "nav_agent": NavAgent,
     "planar_quadrotor_agent": PlanarQuadrotorAgent,
     "quadruped_agent": QuadrupedAgent,
     "arm_agent": ArmAgent,

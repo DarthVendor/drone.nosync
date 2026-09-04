@@ -68,9 +68,10 @@ class TrainResult:
 def build(cfg: Config):
     """(system, trainable, task) from names -- one place, so scripts agree."""
     dt = torch_dtype(cfg.dtype)
-    system = make_system(cfg.system, dtype=dt)
+    kw = {"environment": cfg.environment} if cfg.environment else {}
+    system = make_system(cfg.system, dtype=dt, **kw)
     trainable = make_trainable(cfg.trainable, system)
-    task = make_task(cfg.task, system)
+    task = make_task(cfg.task, system, gating=cfg.gating)
     return system, trainable, task
 
 
@@ -104,10 +105,14 @@ def _log(rec, verbose, tag):
 # distribution-based ES
 # --------------------------------------------------------------------------- #
 def train_es(cfg, system, trainable, task, callback=None, verbose=False,
-             constraints=None, sensors=None) -> TrainResult:
+             constraints=None, sensors=None, evaluator=None) -> TrainResult:
     es, rc = cfg.es, cfg.rollout
     roll = Rollout(system, trainable, task, rc,
                    sensors if sensors is not None else build_sensors(cfg, system))
+    # `evaluator` shards the population across processes; the metric and the
+    # traces still use the in-process rollout, which is what keeps the whole
+    # thing bit-identical either way
+    ev = evaluator or roll
     theta = trainable.init()
     sigma = es.sigma0
     P = identity_preconditioner(theta.shape[-1], theta.dtype, theta.device)
@@ -121,7 +126,8 @@ def train_es(cfg, system, trainable, task, callback=None, verbose=False,
         # The parent rides along in the same batch: it gives a same-goals
         # reference for the 1/5th rule and a mean-genome learning curve, without
         # spending a second rollout on it.
-        res = roll.run(torch.cat([TH, theta[None]], 0), goals, seed=gen_seed(cfg.seed, g, 5))
+        res = ev.run(torch.cat([TH, theta[None]], 0), goals,
+                     seed=gen_seed(cfg.seed, g, 5))
         off = res.genome_slice(slice(0, es.pop))
         off_fit, parent_fit = res.fitness[: es.pop], res.fitness[es.pop]
         success_frac = float((off_fit < parent_fit).to(torch.float64).mean())
@@ -155,10 +161,11 @@ def train_es(cfg, system, trainable, task, callback=None, verbose=False,
 # genetic algorithm over a persistent population
 # --------------------------------------------------------------------------- #
 def train_ga(cfg, system, trainable, task, callback=None, verbose=False,
-             constraints=None, sensors=None) -> TrainResult:
+             constraints=None, sensors=None, evaluator=None) -> TrainResult:
     es, rc = cfg.es, cfg.rollout
     roll = Rollout(system, trainable, task, rc,
                    sensors if sensors is not None else build_sensors(cfg, system))
+    ev = evaluator or roll
     theta0 = trainable.init()
     sigma = es.sigma0
     P = identity_preconditioner(theta0.shape[-1], theta0.dtype, theta0.device)
@@ -175,7 +182,7 @@ def train_ga(cfg, system, trainable, task, callback=None, verbose=False,
     for g in range(es.gens):
         P, minfo = _maybe_metric(cfg, g, best, system, trainable, task, roll, P)
         goals = task.sample(rc.n_eps, make_gen(gen_seed(cfg.seed, g, 1)))
-        res = roll.run(TH, goals, seed=gen_seed(cfg.seed, g, 5))
+        res = ev.run(TH, goals, seed=gen_seed(cfg.seed, g, 5))
         fit = res.fitness
         cinfo = {}
         if constraints is not None and len(constraints):
@@ -227,7 +234,7 @@ _STRATEGIES = {"es": train_es, "ga": train_ga}
 
 def train(cfg: Config, system=None, trainable=None, task=None,
           callback: Optional[Callable] = None, verbose: bool = False,
-          constraints=None, sensors=None) -> TrainResult:
+          constraints=None, sensors=None, evaluator=None) -> TrainResult:
     """`constraints` is an optional `ConstraintSet`.  It is passed here rather
     than folded into the genome on purpose -- see `constraints.py` for why a
     multiplier inside theta silently rank-deficits the metric."""
@@ -237,4 +244,4 @@ def train(cfg: Config, system=None, trainable=None, task=None,
         raise KeyError(f"unknown strategy {cfg.es.strategy!r}; "
                        f"expected one of {sorted(_STRATEGIES)}")
     return _STRATEGIES[cfg.es.strategy](cfg, system, trainable, task, callback,
-                                        verbose, constraints, sensors)
+                                        verbose, constraints, sensors, evaluator)

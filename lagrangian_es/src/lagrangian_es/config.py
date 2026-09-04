@@ -70,6 +70,8 @@ class Config:
     trainable: str = "energy_shaping"
     task: str = "waypoint_pair"
     sensors: tuple = ()           # sensor registry names; () = full-state path
+    environment: str = ""         # scene preset for plants that take one
+    gating: str = "arrival"       # "time" | "arrival"; see tasks.Task.gating
     seed: int = 0
     dtype: str = "float64"
     rollout: RolloutCfg = field(default_factory=RolloutCfg)
