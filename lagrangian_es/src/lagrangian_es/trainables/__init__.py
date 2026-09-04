@@ -28,6 +28,10 @@ def make_trainable(name: str, system, **kw) -> Trainable:
     return TRAINABLES[name](system, **kw)
 
 
+from .embodied import (                    # noqa: E402
+    AGENTS, ArmAgent, EmbodiedAgent, PlanarQuadrotorAgent, QuadrotorAgent,
+    QuadrupedAgent,
+)
 from .energy_shaping import EnergyShaping  # noqa: E402
 from .mlp import MLPPolicy                 # noqa: E402
 from .pd_baseline import FixedPD           # noqa: E402
@@ -35,8 +39,11 @@ from .pd_baseline import FixedPD           # noqa: E402
 register_trainable("energy_shaping")(EnergyShaping)
 register_trainable("pd")(FixedPD)
 register_trainable("mlp")(MLPPolicy)
+for _n, _c in AGENTS.items():
+    register_trainable(_n)(_c)
 
 __all__ = [
     "Trainable", "TRAINABLES", "register_trainable", "make_trainable",
-    "EnergyShaping", "FixedPD", "MLPPolicy",
+    "EnergyShaping", "FixedPD", "MLPPolicy", "EmbodiedAgent", "QuadrotorAgent",
+    "QuadrupedAgent", "ArmAgent", "PlanarQuadrotorAgent",
 ]

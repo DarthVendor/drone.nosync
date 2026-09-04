@@ -142,6 +142,46 @@ On the arm, where `M(q)` varies, it drops the Coriolis correction the IDA-PBC
 matching conditions demand, so it is an approximation there. The same
 constant-vs-varying split that bounds the whitening claim bounds this one.
 
+## Robot-specific agents
+
+`EnergyShaping` is the composition machinery; it knows how to sum terms and
+certify the result, but nothing about any particular robot. *Which* terms a robot
+should have is a property of that robot, so each one declares its own:
+
+```
+Trainable                      the evolvable-object interface
+  └─ EnergyShaping             composition of LagrangianTerms
+       └─ EmbodiedAgent        an agent that knows its robot
+            ├─ QuadrotorAgent  bowls + damping + ground-clearance barrier
+            ├─ QuadrupedAgent  … + kinetic shaping + a base-pose envelope
+            └─ ArmAgent        … + joint-limit barriers
+```
+
+A subclass may read its own plant's attributes — `z_floor`, `stand_height`, link
+lengths — because that is exactly what the specialization buys. `supports()`
+records which plants an agent is for, so the conformance sweep **skips** pairs
+that were never intended rather than failing them.
+
+The barrier is not decoration. On the drone, crashing is the untrained prior's
+dominant failure, and a compactly-supported repulsion just above `z_floor` makes
+clearance a property of the search space instead of something evolution must
+discover by killing individuals (3 seeds, 192 held-out tasks):
+
+| | genome | gen-0 crash | trained crash | trained leg-B |
+|---|---|---|---|---|
+| `energy_shaping` | 45 | 69% | 0% | 0.011 m |
+| `quadrotor_agent` | 47 | **14%** | 0% | 0.018 m |
+
+Five times fewer crashes before any learning, for two extra genome slots. The
+trade is honest: final accuracy is slightly worse, because the barrier is one
+more thing shaping the potential near the floor.
+
+Priors are sized by the plant (`potential_scale`, `damping_scale`), because a
+stiffness calibrated for a 0.5 kg drone produces ~0.15 N of correction on an
+11 kg robot — three orders of magnitude below its own weight. It does not "fly
+badly"; it fails to respond at all. The quadrotor's calibration (K = 3.00,
+K_d = 1.44) is pinned by a test so it cannot drift.
+
 ## Multi-body robots: the quadruped
 
 `PlanarQuadruped` is a sagittal-plane "robot dog": a floating trunk plus four
@@ -213,6 +253,40 @@ invariant object is the constrained inverse inertia
 `P = M⁻¹ − M⁻¹Jᵀ(JM⁻¹Jᵀ)⁻¹JM⁻¹`, which is what a generalized force actually sees.
 Its relative spread across configurations is **1.1331 in both formulations** —
 identical. That is the quantity the mechanical metric should be built from.
+
+### What the quadruped does and does not do
+
+**Does:** stand and hold a commanded base pose with all four feet in contact,
+under constraint-based contact, with the identical ES/GA loop, metric and
+operators used for the drone. The plant is verified independently — mass matrix
+SPD, gravity wrench recovering the legs' +2.446 N·m moment analytically, contact
+multipliers carrying the full weight, feet held to 0.0000 m.
+
+**Does not:** walk. Gaits need a contact schedule and swing-leg tracking, which
+is a separate piece of machinery this does not have.
+
+**Honest status of the learning:** the drone's numbers do not carry over. On the
+balance task the trained controller improves pose error only modestly, and the
+generic `energy_shaping` arm does not improve it at all. The bottleneck is the
+controller/allocator, not the plant or the search: a wrench-to-torque map through
+a redundant contact set has far more scope to be badly conditioned than a
+quadrotor's thrust-plus-attitude loop, and several drone-calibrated constants had
+to be re-derived before the loop responded to a goal at all —
+
+- `pos_eps`, the cost's smoothing floor, was `1e-2`, sized for metre-scale
+  errors. At the quadruped's 0.1 m scale the entire task spanned 0.100→0.141 in
+  cost: a nearly flat objective no amount of search would fix.
+- `gravity_force` returned `(0, Mg, 0)`. The legs' mass sits off the trunk
+  centreline, so equilibrium needs a real pitch moment; without it the trunk
+  accelerated at several rad/s² while the controller believed it was balanced.
+- the allocator's contact weight was `sigmoid(−h·k)`, which is **½ for a foot
+  exactly on the ground** — the normal standing case — halving the grasp matrix
+  and doubling every commanded contact force.
+- `BasePose` asked for heights up to 0.40 m, exactly the legs' full reach, i.e.
+  the straight-leg singularity.
+
+All four are fixed and covered by tests. Treat the quadruped as a working plant
+with a controller that still needs work, not as a solved task.
 
 ### Hybrid contact: constraint + learned residual
 

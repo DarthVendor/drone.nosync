@@ -14,7 +14,8 @@ from lagrangian_es.systems import SYSTEMS, make_system
 from lagrangian_es.trainables import TRAINABLES, make_trainable
 from lagrangian_es.util import make_gen, tree_where
 
-PAIRS = [(s, t) for s in sorted(SYSTEMS) for t in sorted(TRAINABLES)]
+PAIRS = [(s, t) for s in sorted(SYSTEMS) for t in sorted(TRAINABLES)
+         if TRAINABLES[t].supports(SYSTEMS[s]())]
 IDS = [f"{s}+{t}" for s, t in PAIRS]
 B = 8
 

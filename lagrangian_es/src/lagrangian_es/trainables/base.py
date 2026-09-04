@@ -64,6 +64,16 @@ class Trainable(ABC):
         return (theta[..., : self.policy_dim],
                 theta[..., self.policy_dim : self.policy_dim + a])
 
+    @classmethod
+    def supports(cls, system) -> bool:
+        """Is this trainable meant for this plant?
+
+        Generic trainables answer True for everything.  A plant-specific agent
+        narrows it, so `test_conformance` can skip pairs that were never intended
+        instead of reporting them as failures.
+        """
+        return True
+
     def segments(self):
         """Crossover-safe blocks of the genome, as slices.
 

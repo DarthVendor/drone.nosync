@@ -112,8 +112,12 @@ class BasePose(Task):
 
     n_legs = 2
 
-    def __init__(self, system, x_range: float = 0.08, z_lo: float = 0.28,
-                 z_hi: float = 0.40, pitch: float = 0.12, tol: float = 0.03):
+    def __init__(self, system, x_range: float = 0.06, z_lo: float = 0.30,
+                 z_hi: float = 0.37, pitch: float = 0.10, tol: float = 0.03):
+        # Heights must stay inside the legs' reach.  With 0.2 m links the feet can
+        # never be more than 0.40 m below the hips, so a goal at 0.40 asks for the
+        # fully-straight-leg singularity and a goal above it is unreachable
+        # outright -- the controller cannot be blamed for missing either.
         super().__init__(system)
         if system.task_dim != 3:
             raise ValueError(f"BasePose needs task_dim 3, got {system.task_dim}")
