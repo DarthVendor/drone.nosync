@@ -80,6 +80,14 @@ class LagrangianSystem(ABC):
         Must be vmap- and jacrev-safe.
         """
 
+    def allocator_init(self) -> Tensor:
+        """[allocator_dim] prior for the allocator's own genome slots.
+
+        The system owns the allocator, so it owns the allocator's prior; a
+        trainable must never hardcode a plant-shaped phi0.  Default: zeros.
+        """
+        return torch.zeros(self.allocator_dim, dtype=self.dtype, device=self.device)
+
     # --- task-space accessors -----------------------------------------------
     @abstractmethod
     def task_position(self, s: State) -> Tensor:

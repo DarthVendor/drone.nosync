@@ -29,7 +29,7 @@ from torch import Tensor
 from torch.func import jacrev, vmap
 
 from .rollout import Rollout
-from .util import make_gen, tree_index
+from .util import make_gen
 
 
 @dataclass
@@ -88,13 +88,35 @@ def _subsample(trace, n_states: int, gen: torch.Generator):
 
 
 @torch.no_grad()
-def _precondition(G: Tensor, ridge: float):
+def _precondition(G: Tensor, ridge: float, null_mode: str = "ridge", sign: float = -1.0):
+    """Build P from G.
+
+    `null_mode` decides what happens in directions where G is (near) singular --
+    directions in which the genome barely moves the commanded force at all:
+
+      * "ridge"  -- the literal reading of N(0, sigma^2 G^-1): those directions get
+        amplified up to ridge^-1/2.  But G is genuinely rank-deficient here (19 of
+        45 at the prior, because the three bowls start identical), so this spends
+        most of the step budget on directions that do almost nothing.
+      * "cap"    -- whitening is applied one-sidedly: shrink the step in stiff
+        directions, but never amplify beyond isotropic in flat ones.  Where G
+        carries no information, the honest prior is the isotropic step, not an
+        arbitrarily large one bounded only by the ridge.
+
+    `sign = -1` is the specified operator G^-1/2; `sign = +1` inverts the
+    intuition (large steps where a change is energetically EXPENSIVE) and exists
+    only so the ablation can show which direction actually helps.
+    """
     G = 0.5 * (G + G.transpose(-1, -2))
     scale = torch.diagonal(G).mean().clamp_min(1e-30)
     G = G / scale                                  # sigma keeps a stable meaning
     lam, V = torch.linalg.eigh(G)
     lam_c = lam.clamp_min(0.0)
-    inv_sqrt = (lam_c + ridge).rsqrt()
+    inv_sqrt = (lam_c + ridge).pow(0.5 * sign)
+    if null_mode == "cap":
+        inv_sqrt = inv_sqrt.clamp(max=1.0)
+    elif null_mode != "ridge":
+        raise ValueError(f"unknown null_mode {null_mode!r}")
     inv_sqrt = inv_sqrt / inv_sqrt.mean()          # step SHAPE changes, not length
     P = (V * inv_sqrt) @ V.transpose(-1, -2)
     P = 0.5 * (P + P.transpose(-1, -2))
@@ -113,6 +135,8 @@ def physics_metric(
     seed: int,
     n_states: int = 96,
     ridge: float = 1e-3,
+    null_mode: str = "ridge",
+    sign: float = -1.0,
     task=None,
     roll: Optional[Rollout] = None,
 ) -> MetricResult:
@@ -122,8 +146,9 @@ def physics_metric(
     calls are essentially free.  Do one throwaway call before timing anything.
     """
     if roll is None:
-        from .tasks import WaypointPair
-        roll = Rollout(system, trainable, task or WaypointPair(system), cfg)
+        if task is None:
+            raise ValueError("physics_metric needs either `roll` or `task`")
+        roll = Rollout(system, trainable, task, cfg)
 
     # 1. where the controller actually operates, under the current mean genome
     trace = roll.trace(theta[None], goals, seed)
@@ -145,7 +170,7 @@ def physics_metric(
     else:
         G = torch.einsum("sid,si,sie->de", Jac, Minv, Jac) / S
 
-    G, P, P_inv, lam, cond = _precondition(G, ridge)
+    G, P, P_inv, lam, cond = _precondition(G, ridge, null_mode, sign)
 
     dim = theta.shape[-1]
     eye = torch.eye(dim, dtype=P.dtype, device=P.device)

@@ -13,8 +13,6 @@ variance swamps the effect the ablation is trying to measure.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
-
 import torch
 from torch import Tensor
 from torch.func import vmap
@@ -183,17 +181,12 @@ class Rollout:
 # --------------------------------------------------------------------------- #
 # functional wrappers (spec signatures); the ES loop reuses a `Rollout` instead
 # --------------------------------------------------------------------------- #
-def rollout(system, trainable, TH, goals, cfg, seed, task: Optional[Task] = None,
-            record: bool = False):
-    from .tasks import WaypointPair
-
-    task = task or WaypointPair(system)
+def rollout(system, trainable, TH, goals, cfg, seed, task: Task, record: bool = False):
+    """Convenience wrapper.  The ES loop reuses a `Rollout` instead, so that the
+    vmapped controller map is built once rather than per generation."""
     r = Rollout(system, trainable, task, cfg)
     return r.trace(TH, goals, seed) if record else r.run(TH, goals, seed)
 
 
-def state_trace(system, trainable, TH, goals, cfg, seed, task: Optional[Task] = None):
-    from .tasks import WaypointPair
-
-    task = task or WaypointPair(system)
+def state_trace(system, trainable, TH, goals, cfg, seed, task: Task):
     return Rollout(system, trainable, task, cfg).trace(TH, goals, seed)

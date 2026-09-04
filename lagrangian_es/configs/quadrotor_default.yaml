@@ -1,0 +1,38 @@
+# Reference configuration: reproduces the section 6 acceptance criteria.
+#
+# Measured over 2 seeds, 192 held-out tasks:  crash 0%, leg-B error 0.141 m,
+# 85% of tasks within 25 cm, ~7 s wall clock.
+#
+# Deviation from the v2 spec worth knowing about: the spec's 60-generation row
+# says n_eps = 4.  At 4 episodes the fitness estimate is noisy enough that
+# leg-B error plateaus around 0.17 m; 8 episodes clears the 0.15 m bar and costs
+# almost nothing, because a rollout is Python-overhead-bound rather than
+# batch-size-bound (B = 32 costs 0.074 s, B = 192 costs 0.087 s).
+system: quadrotor
+trainable: energy_shaping
+task: waypoint_pair
+seed: 0
+dtype: float64
+
+rollout:
+  dt: 0.02
+  ep_steps: 250
+  n_eps: 8
+  lambda_e: 0.02
+  lambda_s: 0.10
+  dead_cost: 5.0
+
+es:
+  pop: 48
+  gens: 60
+  sigma0: 0.15
+  elite_frac: 0.5
+  strategy: ga          # "es" for the distribution-based loop the ablation uses
+  elitism: 2
+  tournament_k: 3
+  crossover_rate: 0.7
+  blx_alpha: 0.5
+  whiten: true
+  metric_every: 5
+  metric_states: 96
+  ridge: 1.0e-3

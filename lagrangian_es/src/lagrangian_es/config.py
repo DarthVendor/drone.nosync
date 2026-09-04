@@ -48,6 +48,8 @@ class ESCfg:
     metric_every: int = 5         # generations between metric refreshes
     metric_states: int = 96       # states subsampled per refresh
     ridge: float = 1e-3           # added to normalized eigenvalues
+    null_mode: str = "ridge"      # "ridge" | "cap" -- see metric._precondition
+    metric_sign: float = -1.0     # -1 = G^-1/2 (specified); +1 inverts it
 
 
 @dataclass(frozen=True)

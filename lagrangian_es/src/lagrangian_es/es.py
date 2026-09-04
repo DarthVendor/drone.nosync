@@ -36,7 +36,7 @@ import torch
 from torch import Tensor
 
 from .config import Config
-from .metric import MetricResult, identity_preconditioner, physics_metric
+from .metric import identity_preconditioner, physics_metric
 from .operators import (
     ga_step, mirrored_offspring, rank_weights, recombine, update_sigma,
     whitened_mutation,
@@ -81,7 +81,8 @@ def _maybe_metric(cfg, g, theta, system, trainable, task, roll, P):
     mgoals = task.sample(max(4, rc.n_eps), make_gen(gen_seed(cfg.seed, g, 3)))
     P = physics_metric(system, trainable, theta, mgoals, rc,
                        seed=gen_seed(cfg.seed, g, 4), n_states=es.metric_states,
-                       ridge=es.ridge, roll=roll)
+                       ridge=es.ridge, null_mode=es.null_mode,
+                       sign=es.metric_sign, roll=roll)
     return P, P.summary()
 
 

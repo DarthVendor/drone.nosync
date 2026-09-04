@@ -11,8 +11,6 @@ import json
 import pathlib
 import sys
 
-import torch
-
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from lagrangian_es.config import Config, ESCfg, RolloutCfg          # noqa: E402

@@ -1,0 +1,8 @@
+# The section 6 smoke test: 6 generations at pop 16, n_eps 2, ~0.6 s.
+# Expected: crash rate -> ~0, leg-B error ~0.46 m (GA arm).
+system: quadrotor
+trainable: energy_shaping
+task: waypoint_pair
+seed: 0
+rollout: {n_eps: 2}
+es: {pop: 16, gens: 6, strategy: ga, sigma0: 0.08, elite_frac: 0.5, metric_every: 5}

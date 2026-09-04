@@ -33,7 +33,7 @@ class FixedPD(Trainable):
             torch.full((self.d,), self.kd0, dtype=self.dtype, device=self.device),
         ]
         if self.system.allocator_dim:
-            parts.append(self._t(self.phi0))
+            parts.append(self.system.allocator_init())
         return torch.cat(parts, dim=0)
 
     def forward(self, theta: Tensor, s: State, goal: Tensor) -> Tensor:

@@ -29,11 +29,15 @@ def make_system(name: str, **kw) -> LagrangianSystem:
     return SYSTEMS[name](**kw)
 
 
-from .quadrotor import QuadrotorSE3  # noqa: E402
+from .planar_quad import PlanarQuadrotor  # noqa: E402
+from .quadrotor import QuadrotorSE3        # noqa: E402
+from .two_link_arm import TwoLinkArm       # noqa: E402
 
 register_system("quadrotor")(QuadrotorSE3)
+register_system("planar_quad")(PlanarQuadrotor)
+register_system("two_link_arm")(TwoLinkArm)
 
 __all__ = [
     "LagrangianSystem", "State", "SYSTEMS", "register_system", "make_system",
-    "QuadrotorSE3", "hat", "vee", "rodrigues", "log_so3", "renormalize",
+    "QuadrotorSE3", "PlanarQuadrotor", "TwoLinkArm", "hat", "vee", "rodrigues", "log_so3", "renormalize",
 ]

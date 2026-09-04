@@ -1,0 +1,12 @@
+# Step 9: the identical ES on a plant where M(q) genuinely varies.
+#
+# On the quadrotor, M is constant in the body frame, so the trajectory dependence
+# of G enters only through the controller Jacobian.  Here it enters through
+# inv_mass as well, which is what upgrades the narrow claim to the strong one.
+system: two_link_arm
+trainable: energy_shaping
+task: joint_pair
+seed: 0
+rollout: {dt: 0.01, ep_steps: 300, n_eps: 8, lambda_e: 0.01, lambda_s: 0.0, dead_cost: 5.0}
+es: {pop: 48, gens: 60, sigma0: 0.15, elite_frac: 0.5, strategy: es,
+     whiten: true, metric_every: 5, metric_states: 96, ridge: 1.0e-3}

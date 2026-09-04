@@ -7,7 +7,7 @@ is key-agnostic on purpose -- that is what lets `rollout.py` stay plant-agnostic
 from __future__ import annotations
 
 import dataclasses
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable
 
 import torch
 from torch import Tensor

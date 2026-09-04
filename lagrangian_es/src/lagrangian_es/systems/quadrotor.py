@@ -17,7 +17,7 @@ import torch
 from torch import Tensor
 
 from .base import LagrangianSystem, State
-from .so3 import hat, rodrigues, vee
+from .so3 import rodrigues, vee
 
 
 class QuadrotorSE3(LagrangianSystem):
@@ -34,6 +34,7 @@ class QuadrotorSE3(LagrangianSystem):
         g: float = 9.81,
         thrust_ratio: float = 2.2,     # f_max / (m g)
         tau_max: float = 0.30,
+        phi0: tuple = (0.25, 0.25, 0.25, 0.10, 0.10, 0.10),   # kR, kW priors
         # --- reset distribution
         reset_z: float = 0.5,
         reset_pos_noise: float = 0.05,
@@ -55,6 +56,7 @@ class QuadrotorSE3(LagrangianSystem):
         self.f_max = float(thrust_ratio) * self.m * self.g
         self.f_min = 0.0
         self.tau_max = float(tau_max)
+        self.phi0 = tuple(phi0)
 
         self.reset_z = float(reset_z)
         self.reset_pos_noise = float(reset_pos_noise)
@@ -163,6 +165,12 @@ class QuadrotorSE3(LagrangianSystem):
         return torch.cat([f[..., None], tau], dim=-1)
 
     # --- task-space accessors -----------------------------------------------
+    def allocator_init(self) -> Tensor:
+        """kR = 0.25, kW = 0.10 (used squared) -> an attitude loop barely faster
+        than the position loop.  Deliberately marginal: this is what makes the
+        generation-0 prior crash rather than merely track poorly."""
+        return self._t(self.phi0)
+
     def task_position(self, s: State) -> Tensor:
         return s["p"]
 

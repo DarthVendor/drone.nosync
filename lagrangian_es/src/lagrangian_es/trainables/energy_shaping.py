@@ -89,13 +89,7 @@ class EnergyShaping(Trainable):
             (self.d0 * eye).reshape(-1),
         ]
         if self.system.allocator_dim:
-            phi0 = self._t(self.phi0)
-            if phi0.numel() != self.system.allocator_dim:
-                raise ValueError(
-                    f"phi0 has {phi0.numel()} entries but "
-                    f"{type(self.system).__name__}.allocator_dim = {self.system.allocator_dim}"
-                )
-            parts.append(phi0)
+            parts.append(self.system.allocator_init())
         return torch.cat(parts, dim=0)
 
     # --- the shaped potential ----------------------------------------------
