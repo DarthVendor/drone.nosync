@@ -24,6 +24,9 @@ from lagrangian_es.config import Config, ESCfg, RolloutCfg   # noqa: E402
 from lagrangian_es.es import train                            # noqa: E402
 from lagrangian_es.evaluate import evaluate                   # noqa: E402
 from lagrangian_es.rollout import Rollout                     # noqa: E402
+from lagrangian_es.sensors import make_sensor                 # noqa: E402
+from lagrangian_es.trainables.sensor_terms import FovBarrier  # noqa: E402
+from lagrangian_es.trainables.terms import DissipationTerm, GoalBowl  # noqa: E402
 from lagrangian_es.systems import make_system                 # noqa: E402
 from lagrangian_es.tasks import make_task                     # noqa: E402
 from lagrangian_es.trainables import make_trainable           # noqa: E402
@@ -33,6 +36,25 @@ PRESETS = {
     "quadrotor": dict(system="quadrotor", trainable="quadrotor_agent",
                       task="waypoint_pair", label="SE(3) quadrotor",
                       rollout=dict(n_eps=8), gens=60, pop=48, stride=1),
+    "quadrotor_vision": dict(system="quadrotor", trainable="energy_shaping",
+                            task="waypoint_pair", label="Quadrotor + landmark camera",
+                            rollout=dict(n_eps=8), gens=60, pop=48, stride=1,
+                            sensor=dict(kind="landmark_camera", n_landmarks=14,
+                                        sigma_px=0.4, dropout=0.03,
+                                        latency_steps=3)),
+    "quadrotor_nav": dict(system="quadrotor_nav", trainable="energy_shaping",
+                         task="waypoint_pair", label="Quadrotor + obstacle field",
+                         rollout=dict(n_eps=8, lambda_s=0.2), gens=60, pop=48,
+                         stride=1, environment="pillars",
+                         sensor=dict(kind="range", n_beams=12, sigma=0.02,
+                                     latency_steps=1)),
+    "quadrotor_hoops": dict(system="quadrotor_nav", trainable="energy_shaping",
+                            task="hoop_course", task_kw=dict(n_gates=3),
+                            label="Quadrotor + hoop course",
+                            rollout=dict(n_eps=8, lambda_s=0.2, ep_steps=340),
+                            gens=60, pop=48, stride=1, environment="hoop_course",
+                            sensor=dict(kind="range", n_beams=12, sigma=0.02,
+                                        latency_steps=1)),
     "quadruped": dict(system="quadruped", trainable="quadruped_agent",
                       task="base_pose", label="Planar quadruped",
                       rollout=dict(dt=0.002, ep_steps=500, n_eps=4, lambda_e=2e-4,
@@ -61,12 +83,13 @@ def _r(x, nd=3):
     return [round(float(v), nd) for v in x.reshape(-1)]
 
 
-def capture(system, roll, theta, goals, seed, stride=1):
+def capture(system, roll, theta, goals, seed, stride=1, sensor=None):
     tr = roll.trace(theta[None], goals, seed)
     T, B = tr.goals.shape[0], tr.goals.shape[1]
     poses = system.render_poses(tr.states)                    # [T+1, B, nb, K]
     task = system.task_position(tr.states)                    # [T+1, B, task_dim]
     extras = system.render_extras(tr.states)
+    static = system.render_static(tr.states)
     sel = list(range(0, T + 1, stride))
     alive_sel = [min(i, T - 1) for i in sel]
     out = []
@@ -80,6 +103,21 @@ def capture(system, roll, theta, goals, seed, stride=1):
                "goal_task": _r(goals[b], 4)}
         for k, v in extras.items():
             rec[k] = _r(v[sel, b], 4)
+        for g in static.get("obstacles", []):
+            grp = {"kind": g["kind"]}
+            for k, v in g.items():
+                if k == "kind":
+                    continue
+                grp[k] = (_r(v[0, b], 4) if isinstance(v, torch.Tensor)
+                          else float(v))          # frame 0: geometry is constant
+            rec.setdefault("obstacles", []).append(grp)
+        if sensor is not None:
+            f = sensor.render_frame(tr.states)
+            if "uv" in f:
+                rec["uv"] = _r(f["uv"][sel, b], 1)
+                rec["seen"] = [int(x) for x in f["visible"][sel, b].reshape(-1)]
+            if "range" in f:
+                rec["beams"] = _r(f["range"][sel, b], 3)
         out.append(rec)
     return out
 
@@ -88,22 +126,42 @@ def build_one(name, args):
     pre = PRESETS[name]
     rc = RolloutCfg(**pre["rollout"])
     cfg = Config(system=pre["system"], trainable=pre["trainable"], task=pre["task"],
-                 seed=args.seed, rollout=rc,
+                 sensors=tuple(), seed=args.seed, rollout=rc,
                  es=ESCfg(pop=pre["pop"], gens=args.gens or pre["gens"], sigma0=0.15,
                           elite_frac=0.5, strategy="ga", whiten=True,
                           metric_every=5, null_mode="cap"))
-    system = make_system(pre["system"])
-    trainable = make_trainable(pre["trainable"], system)
-    task = make_task(pre["task"], system)
+    skw = {"environment": pre["environment"]} if pre.get("environment") else {}
+    system = make_system(pre["system"], **skw)
+    sensor, sensors = None, ()
+    if pre.get("sensor"):
+        sk = dict(pre["sensor"])
+        sensor = make_sensor(sk.pop("kind"), system, **sk)
+        sensors = (sensor,)
+        # a vision genome: the usual core plus a barrier on the image border
+        if sensor.kind == "range":
+            from lagrangian_es.trainables.sensor_terms import RangeBarrier
+            extra = RangeBarrier(system.task_dim, sensor.name, sensor.n_beams,
+                                 w0=1.2)
+        else:
+            extra = FovBarrier(system.task_dim, sensor.name, sensor.lens.width,
+                               sensor.lens.height, sensor.K, w0=0.5)
+        terms = ([GoalBowl(system.task_dim, a0=1.0) for _ in range(3)]
+                 + [DissipationTerm(system.task_dim, d0=1.2), extra])
+        trainable = make_trainable(pre["trainable"], system, terms=terms)
+    else:
+        trainable = make_trainable(pre["trainable"], system)
+    task = make_task(pre["task"], system, **pre.get("task_kw", {}))
     print(f"  training {name} ({trainable.dim} genome slots) ...", flush=True)
-    res = train(cfg, system, trainable, task)
+    res = train(cfg, system, trainable, task, sensors=sensors)
     theta0 = trainable.init()
 
     tol = 0.25 if pre["system"].startswith("quadrotor") else 0.05
-    ev_t = evaluate(system, trainable, task, res.theta, rc, n_tasks=128, tol=tol)
-    ev_0 = evaluate(system, trainable, task, theta0, rc, n_tasks=128, tol=tol)
+    ev_t = evaluate(system, trainable, task, res.theta, rc, n_tasks=128, tol=tol,
+                    roll=Rollout(system, trainable, task, rc, sensors))
+    ev_0 = evaluate(system, trainable, task, theta0, rc, n_tasks=128, tol=tol,
+                    roll=Rollout(system, trainable, task, rc, sensors))
 
-    roll = Rollout(system, trainable, task, rc)
+    roll = Rollout(system, trainable, task, rc, sensors)
     goals = task.sample(args.episodes, make_gen(4242))
     spec = system.render_spec()
     stride = pre["stride"]
@@ -117,11 +175,14 @@ def build_one(name, args):
         **{k: v for k, v in spec.items()
            if k not in ("dim", "ground", "scale", "bodies")},
         "dt": rc.dt * stride, "n_frames": len(range(0, rc.ep_steps + 1, stride)),
-        "switch_frac": 0.5 if task.n_legs > 1 else 1.0,
+        "switch_frac": 1.0 / task.n_legs,
         "n_legs": task.n_legs, "task_labels": _labels(pre["system"]),
         "tol": tol,
-        "runs": {"trained": capture(system, roll, res.theta, goals, 4243, stride),
-                 "prior": capture(system, roll, theta0, goals, 4243, stride)},
+        "runs": {"trained": capture(system, roll, res.theta, goals, 4243, stride,
+                                    sensor),
+                 "prior": capture(system, roll, theta0, goals, 4243, stride,
+                                  sensor)},
+        **({"sensor": sensor.render_spec()} if sensor is not None else {}),
         "eval": {"trained": ev_t, "prior": ev_0},
         "curve": {k: [round(h[k], 5) for h in res.history]
                   for k in ("fitness_elite", "crash_rate", "final_err")},
@@ -140,7 +201,11 @@ def _labels(system_name):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="trajectories.json")
-    ap.add_argument("--robots", nargs="+", default=list(PRESETS),
+    # Drone family by default; the quadruped and arms are still selectable by
+    # name but are not trained unless asked for.
+    ap.add_argument("--robots", nargs="+",
+                    default=["quadrotor", "quadrotor_vision", "quadrotor_nav",
+                             "quadrotor_hoops", "quadrotor_payload"],
                     choices=list(PRESETS))
     ap.add_argument("--episodes", type=int, default=4)
     ap.add_argument("--gens", type=int, default=None)

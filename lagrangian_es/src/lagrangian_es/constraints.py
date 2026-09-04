@@ -38,7 +38,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, List, Optional, Sequence
 
-import torch
 from torch import Tensor
 
 from .rollout import RolloutResult

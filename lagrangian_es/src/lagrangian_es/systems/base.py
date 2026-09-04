@@ -201,6 +201,17 @@ class LagrangianSystem(ABC):
         """Plant-specific regularizer, [...].  Default: zeros."""
         return torch.zeros_like(self.task_position(s)[..., 0])
 
+    def camera_pose(self, s: State):
+        """(position [..., 3], orientation [..., 3, 3]) of the body a camera is
+        mounted on.  Default: the task position with identity attitude, which is
+        right for plants whose task space IS position and which have no attitude
+        to speak of.  Plants that carry one override it."""
+        x = self.task_position(s)
+        p3 = x if x.shape[-1] == 3 else torch.cat(
+            [x, torch.zeros_like(x[..., :1])], dim=-1)
+        eye = torch.eye(3, dtype=self.dtype, device=self.device)
+        return p3, eye.expand(p3.shape[:-1] + (3, 3))
+
     # --- rendering ----------------------------------------------------------
     def render_spec(self) -> dict:
         """Static description of what to draw, plant-agnostic.
@@ -227,6 +238,29 @@ class LagrangianSystem(ABC):
         so a ghost of the target configuration comes out for free on every plant.
         """
         raise NotImplementedError(f"{type(self).__name__} declares no render_poses")
+
+    #: does this plant place geometry relative to the episode's waypoints?
+    needs_course: bool = False
+
+    def place_course(self, s: State, goals: Tensor) -> State:
+        """Lay out scene geometry against this episode's goals, [B, n_legs, d].
+
+        Called by the rollout right after `reset` when `needs_course` is set.
+        Geometry and waypoints are drawn from different generators, so a gate can
+        only be guaranteed to sit ON the route if one of them is derived from the
+        other -- and a gate the vehicle is not required to pass through is not a
+        gate at all.
+        """
+        return s
+
+    def render_static(self, s: State) -> dict:
+        """Per-episode constants for the renderer -- scene geometry.
+
+        Separate from `render_extras` because obstacles do not move: emitting them
+        once per episode rather than once per frame is the difference between a
+        few hundred numbers and a few hundred thousand.
+        """
+        return {}
 
     def render_extras(self, s: State) -> dict:
         """Optional per-frame overlays, e.g. {"feet": [..., k, 2],

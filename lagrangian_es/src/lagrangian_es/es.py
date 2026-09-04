@@ -42,6 +42,7 @@ from .operators import (
     update_sigma, whitened_mutation,
 )
 from .rollout import Rollout
+from .sensors import make_sensor
 from .systems import make_system
 from .tasks import make_task
 from .trainables import make_trainable
@@ -73,6 +74,11 @@ def build(cfg: Config):
     return system, trainable, task
 
 
+def build_sensors(cfg: Config, system):
+    """Sensor instances named by the config, or () for the full-state path."""
+    return tuple(make_sensor(n, system) for n in (cfg.sensors or ()))
+
+
 def _maybe_metric(cfg, g, theta, system, trainable, task, roll, P):
     """Refresh the preconditioner, or keep P = I for the isotropic arm."""
     es, rc = cfg.es, cfg.rollout
@@ -98,9 +104,10 @@ def _log(rec, verbose, tag):
 # distribution-based ES
 # --------------------------------------------------------------------------- #
 def train_es(cfg, system, trainable, task, callback=None, verbose=False,
-             constraints=None) -> TrainResult:
+             constraints=None, sensors=None) -> TrainResult:
     es, rc = cfg.es, cfg.rollout
-    roll = Rollout(system, trainable, task, rc)
+    roll = Rollout(system, trainable, task, rc,
+                   sensors if sensors is not None else build_sensors(cfg, system))
     theta = trainable.init()
     sigma = es.sigma0
     P = identity_preconditioner(theta.shape[-1], theta.dtype, theta.device)
@@ -148,9 +155,10 @@ def train_es(cfg, system, trainable, task, callback=None, verbose=False,
 # genetic algorithm over a persistent population
 # --------------------------------------------------------------------------- #
 def train_ga(cfg, system, trainable, task, callback=None, verbose=False,
-             constraints=None) -> TrainResult:
+             constraints=None, sensors=None) -> TrainResult:
     es, rc = cfg.es, cfg.rollout
-    roll = Rollout(system, trainable, task, rc)
+    roll = Rollout(system, trainable, task, rc,
+                   sensors if sensors is not None else build_sensors(cfg, system))
     theta0 = trainable.init()
     sigma = es.sigma0
     P = identity_preconditioner(theta0.shape[-1], theta0.dtype, theta0.device)
@@ -219,7 +227,7 @@ _STRATEGIES = {"es": train_es, "ga": train_ga}
 
 def train(cfg: Config, system=None, trainable=None, task=None,
           callback: Optional[Callable] = None, verbose: bool = False,
-          constraints=None) -> TrainResult:
+          constraints=None, sensors=None) -> TrainResult:
     """`constraints` is an optional `ConstraintSet`.  It is passed here rather
     than folded into the genome on purpose -- see `constraints.py` for why a
     multiplier inside theta silently rank-deficits the metric."""
@@ -229,4 +237,4 @@ def train(cfg: Config, system=None, trainable=None, task=None,
         raise KeyError(f"unknown strategy {cfg.es.strategy!r}; "
                        f"expected one of {sorted(_STRATEGIES)}")
     return _STRATEGIES[cfg.es.strategy](cfg, system, trainable, task, callback,
-                                        verbose, constraints)
+                                        verbose, constraints, sensors)

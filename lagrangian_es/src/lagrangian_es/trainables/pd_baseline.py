@@ -38,7 +38,7 @@ class FixedPD(Trainable):
             parts.append(self.system.residual_init())
         return torch.cat(parts, dim=0)
 
-    def forward(self, theta: Tensor, s: State, goal: Tensor) -> Tensor:
+    def forward(self, theta: Tensor, s: State, goal: Tensor, obs=None) -> Tensor:
         sysm = self.system
         kp = theta[..., : self.d] ** 2
         kd = theta[..., self.d : 2 * self.d] ** 2

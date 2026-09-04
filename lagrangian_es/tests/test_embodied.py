@@ -122,8 +122,6 @@ def test_quadrotor_agent_ground_barrier_pushes_up_near_the_floor():
     system = make_system("quadrotor")
     tr = make_trainable("quadrotor_agent", system)
     low = torch.tensor([[0.0, 0.0, system.z_floor + 0.05]], dtype=DT)
-    s = system.nominal_state(low, torch.zeros_like(low))
-    goal = torch.tensor([[0.0, 0.0, system.z_floor + 0.05]], dtype=DT)   # at the goal
     barrier = tr.terms[-1]
     e = torch.zeros(1, 3, dtype=DT)
     g = barrier.grad_potential(tr.term_slices(tr.init())[-1], e, e, low)

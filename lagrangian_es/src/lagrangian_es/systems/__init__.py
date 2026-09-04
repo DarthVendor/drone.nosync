@@ -34,6 +34,7 @@ from .maximal_chain import MaximalChain        # noqa: E402
 from .payload import QuadrotorPayload          # noqa: E402
 from .planar_quadruped import PlanarQuadruped  # noqa: E402
 from .quadrotor import QuadrotorSE3        # noqa: E402
+from .quadrotor_nav import QuadrotorNav    # noqa: E402
 from .two_link_arm import TwoLinkArm       # noqa: E402
 
 register_system("quadrotor")(QuadrotorSE3)
@@ -41,9 +42,10 @@ register_system("planar_quad")(PlanarQuadrotor)
 register_system("quadruped")(PlanarQuadruped)
 register_system("maximal_chain")(MaximalChain)
 register_system("quadrotor_payload")(QuadrotorPayload)
+register_system("quadrotor_nav")(QuadrotorNav)
 register_system("two_link_arm")(TwoLinkArm)
 
 __all__ = [
     "LagrangianSystem", "State", "SYSTEMS", "register_system", "make_system",
-    "QuadrotorSE3", "PlanarQuadrotor", "PlanarQuadruped", "MaximalChain", "QuadrotorPayload", "TwoLinkArm", "hat", "vee", "rodrigues", "log_so3", "renormalize",
+    "QuadrotorSE3", "PlanarQuadrotor", "PlanarQuadruped", "MaximalChain", "QuadrotorPayload", "QuadrotorNav", "TwoLinkArm", "hat", "vee", "rodrigues", "log_so3", "renormalize",
 ]

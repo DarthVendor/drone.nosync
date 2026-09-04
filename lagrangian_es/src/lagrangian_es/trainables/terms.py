@@ -27,7 +27,7 @@ reconstruct the other from a goal it was never handed.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Callable, Dict, Optional, Type
+from typing import Dict, Optional, Type
 
 import torch
 from torch import Tensor
@@ -42,6 +42,10 @@ class LagrangianTerm(ABC):
 
     #: human-readable kind, used in logs and in `describe`
     kind: str = "term"
+
+    #: does this term consume sensor observations?  Terms that do get `obs`
+    #: passed through; the rest keep their original signature untouched.
+    uses_obs: bool = False
 
     def __init__(self, d: int):
         self.d = int(d)

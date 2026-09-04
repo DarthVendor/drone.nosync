@@ -91,9 +91,15 @@ class Trainable(ABC):
 
     # --- the controller map -------------------------------------------------
     @abstractmethod
-    def forward(self, theta: Tensor, s: State, goal: Tensor) -> Tensor:
+    def forward(self, theta: Tensor, s: State, goal: Tensor, obs=None) -> Tensor:
         """SINGLE-SAMPLE.  theta [dim], unbatched state, goal [task_dim].
         Returns a generalized force [n_force].
+
+        `obs` is a dict of delayed sensor observations, or None when the rollout
+        carries no sensors.  It is optional so that the sensor-free path is
+        literally the code that ran before -- and so that sensors enter the
+        metric only through du/dtheta, which `jacrev` picks up automatically once
+        `forward` consumes them.
 
         Batching is vmap's job; differentiability is jacrev's business.  So:
         no in-place ops, no `.item()`, no Python `if` on tensor values, every

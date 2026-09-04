@@ -179,6 +179,9 @@ class QuadrotorSE3(LagrangianSystem):
         generation-0 prior crash rather than merely track poorly."""
         return self._t(self.phi0)
 
+    def camera_pose(self, s: State):
+        return s["p"], s["R"]
+
     def render_spec(self) -> dict:
         return {"dim": 3, "ground": 0.0, "scale": 1.0,
                 "bodies": [{"type": "quadrotor", "size": [0.17, 0.17, 0.045],

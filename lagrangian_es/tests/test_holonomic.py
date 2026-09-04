@@ -1,12 +1,10 @@
 """Constraint-based coupling: multipliers, the KKT solve, and the hybrid model."""
-import pytest
 import torch
 from torch.func import jacrev, vmap
 
 from lagrangian_es.systems import make_system
 from lagrangian_es.systems.holonomic import (
-    ConstraintStack, GroundContact, JointCoupling, PinJointChain,
-    constrained_inverse_inertia,
+    ConstraintStack, GroundContact, JointCoupling, constrained_inverse_inertia,
 )
 from lagrangian_es.trainables import make_trainable
 from lagrangian_es.util import make_gen

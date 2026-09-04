@@ -39,7 +39,7 @@ from torch import Tensor
 
 from ..systems.base import LagrangianSystem, State
 from .base import Trainable
-from .terms import DissipationTerm, GoalBowl, KineticShaping, LagrangianTerm, make_term
+from .terms import DissipationTerm, GoalBowl, LagrangianTerm
 
 
 class EnergyShaping(Trainable):
@@ -190,7 +190,7 @@ class EnergyShaping(Trainable):
         return out
 
     # --- the controller map -------------------------------------------------
-    def forward(self, theta: Tensor, s: State, goal: Tensor) -> Tensor:
+    def forward(self, theta: Tensor, s: State, goal: Tensor, obs=None) -> Tensor:
         sysm = self.system
         x = sysm.task_position(s)
         v = sysm.task_velocity(s)
@@ -198,7 +198,8 @@ class EnergyShaping(Trainable):
 
         bracket = None
         for t, th in zip(self.terms, self.term_slices(theta)):
-            g = t.grad_potential(th, e, v, x)
+            g = t.grad_potential(th, e, v, x, obs) if t.uses_obs \
+                else t.grad_potential(th, e, v, x)
             bracket = g if bracket is None else bracket + g
 
         Md = self.desired_mass(theta, s)

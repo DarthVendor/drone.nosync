@@ -9,7 +9,6 @@ from lagrangian_es.constraints import (
     SaturationBudget, ShapingBudget, make_constraint,
 )
 from lagrangian_es.es import build, train
-from lagrangian_es.metric import physics_metric
 from lagrangian_es.rollout import Rollout
 from lagrangian_es.util import make_gen
 

@@ -27,10 +27,10 @@ import torch
 from torch import Tensor
 
 from .base import State
-from .connectors import Cable, Connector, SpringCable, _attach
+from .connectors import Connector, _attach
 from .holonomic import ConstraintStack
 from .quadrotor import QuadrotorSE3
-from .so3 import hat, rodrigues
+from .so3 import rodrigues
 
 
 class QuadrotorPayload(QuadrotorSE3):

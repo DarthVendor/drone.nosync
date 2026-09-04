@@ -44,7 +44,7 @@ kinematic loops, and deliberate couplings between joints such as gait symmetry.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 from torch import Tensor
@@ -183,8 +183,7 @@ class ConstraintStack:
         nonsingular when the active constraints are redundant (four feet on flat
         ground over-determine a planar base).
         """
-        lead = M.shape[:-2]
-        n, m = M.shape[-1], J.shape[-2]
+        n = M.shape[-1]
         E = torch.diag_embed(eps / act.clamp_min(1e-9))
 
         top = torch.cat([M, -J.transpose(-1, -2)], dim=-1)          # [..., n, n+m]
@@ -236,7 +235,7 @@ class PinJointChain(HolonomicConstraint):
 
     def rows(self, sys, q, dq, kin):
         N, h = self.n_links, 0.5 * self.length
-        p, th = kin["p"], kin["th"]              # [..., N, 2], [..., N]
+        p = kin["p"]                              # [..., N, 2]
         dth = kin["dth"]                         # [..., N]
         u, w = kin["u"], kin["w"]                # [..., N, 2]
         lead = q.shape[:-1]

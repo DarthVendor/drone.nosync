@@ -135,8 +135,41 @@ class BasePose(Task):
         return goals[:, 0] if t < ep_steps // 2 else goals[:, 1]
 
 
+class HoopCourse(Task):
+    """A sequence of gates to fly through, in order.
+
+    Waypoints are the hoop centres, so reaching the goal and passing through the
+    gate are the same event -- the vehicle cannot score by drifting past the ring.
+    The plant places the hoops on these points via `place_course`.
+    """
+
+    def __init__(self, system, n_gates: int = 3, radius: float = 2.0,
+                 z_lo: float = 1.0, z_hi: float = 2.0, tol: float = 0.3):
+        super().__init__(system)
+        if system.task_dim != 3:
+            raise ValueError(f"HoopCourse needs task_dim 3, got {system.task_dim}")
+        self.n_legs = int(n_gates)
+        self.radius, self.z_lo, self.z_hi = float(radius), float(z_lo), float(z_hi)
+        self.tol = float(tol)
+
+    def sample(self, n: int, gen: torch.Generator) -> Tensor:
+        kw = dict(gen=gen, dtype=self.system.dtype, device=self.system.device)
+        # gates spread around the vehicle in sequence, so consecutive legs turn
+        base = uniform((n, 1), 0.0, 6.283185307179586, **kw)
+        step = uniform((n, self.n_legs), 1.2, 2.6, **kw)
+        ang = base + torch.cumsum(step, dim=-1)
+        rad = uniform((n, self.n_legs), 0.65 * self.radius, self.radius, **kw)
+        z = uniform((n, self.n_legs), self.z_lo, self.z_hi, **kw)
+        return torch.stack([rad * torch.cos(ang), rad * torch.sin(ang), z], dim=-1)
+
+    def goal_at(self, goals: Tensor, t: int, ep_steps: int) -> Tensor:
+        leg = min(t * self.n_legs // ep_steps, self.n_legs - 1)
+        return goals[:, leg]
+
+
 TASKS: Dict[str, Type[Task]] = {
     "base_pose": BasePose,
+    "hoop_course": HoopCourse,
     "waypoint_pair": WaypointPair,
     "joint_target": JointTarget,
     "joint_pair": JointPair,

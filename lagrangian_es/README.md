@@ -16,32 +16,85 @@ derived from Lagrangian mechanics** rather than chosen generically.
    variation isotropic in **energy** rather than in parameter coordinates.
 
 Only the controller map is differentiated. Nothing differentiates through the
-integrator, the liveness logic, or (later) the contact model, so the method stays
+integrator, the liveness logic, or the contact model, so the method stays
 gradient-free with respect to the dynamics — the property that motivates
 evolutionary search on non-smooth systems in the first place.
+
+Beyond the v2 spec, the same two seams now carry a quadruped with constraint-based
+contact, drones with slung payloads on unilateral cables, obstacle fields and hoop
+courses, and a sensing layer in which a camera deforms the *desired* Lagrangian
+rather than feeding an estimator. Each is a composition, not a fork: one loop, one
+metric, one set of operators throughout.
 
 ## Quickstart
 
 ```bash
 python3.11 -m venv .venv && .venv/bin/pip install -e .
-.venv/bin/python -m pytest -q                                   # 150+ tests, ~15 s
-.venv/bin/python scripts/train.py --config configs/smoke.yaml   # ~1 s
+.venv/bin/python -m pytest -q                                    # 550 tests, ~35 s
+
+.venv/bin/python scripts/train.py --config configs/smoke.yaml    # ~1 s
 .venv/bin/python scripts/train.py --config configs/quadrotor_default.yaml
-.venv/bin/python scripts/ablate.py --seeds 0 1 2 3 4            # the 2x2
+.venv/bin/python scripts/ablate.py --seeds 0 1 2 3 4             # the 2x2
+.venv/bin/python scripts/replay.py --out traj.json               # visualizer data
+```
+
+Configs: `smoke`, `quadrotor_default`, `ablation_2x2`, `payload_delivery`,
+`quadruped`, `arm_transfer`, `maximal_chain`.
+
+Everything composes from four registries, so a new robot, controller, scene or
+sensor is a class plus a line:
+
+```python
+system  = make_system("quadrotor_nav", environment="hoop_course")
+agent   = make_trainable("quadrotor_agent", system)
+sensor  = make_sensor("range", system, n_beams=12)
+env     = Environment([Pillars(n=6), Hoops(n=3)])
 ```
 
 ## Results
 
-Held-out (192 unseen tasks), quadrotor + `energy_shaping`, 60 generations:
+Held-out evaluation, 128–192 unseen tasks, 60 generations, identical search loop
+throughout — only the plant and its Lagrangian terms change.
 
-| | crash | leg-A err | leg-B err | within 25 cm |
-|---|---|---|---|---|
-| generation-0 prior | 69% | 0.82 m | 2.04 m | 0% |
-| trained (GA)       | **0%** | 0.09 m | **0.09 m** | **98%** |
-| §6 acceptance      | 0% | — | < 0.15 m | > 80% |
+| plant | task | error before → after | failures before → after |
+|---|---|---|---|
+| `QuadrotorSE3` | two waypoints | 1.85 → **0.017 m** | 12% → **0%** |
+| `QuadrotorSE3` + landmark camera | two waypoints | 2.09 → **0.041 m** | 78% → **0%** |
+| `QuadrotorPayload` | two waypoints, slung load | 1.05 → **0.046 m** | 2% → **0%** |
+| `TwoLinkArm` (minimal coords) | joint pair | 0.558 → **0.039 rad** | 0% → 0% |
+| `MaximalChain` (maximal coords) | joint pair | 0.559 → **0.035 rad** | 0% → 0% |
+| `PlanarQuadruped` | base pose | 0.052 → 0.062 m | 7% → 28% |
 
-The prior flies badly but does not fail to fly — which is the point. If it already
-succeeded, the task would be too easy and the ablation would have no dynamic range.
+Against the spec's §6 acceptance criteria (quadrotor, GA, 60 generations):
+**crash 0%, leg-B error 0.09 m (< 0.15), 98% within 25 cm (> 80%)** — all met.
+
+Two rows deserve reading carefully:
+
+- The **arm in both coordinate systems** starts from near-identical priors
+  (0.558 / 0.559) and trains to near-identical results (0.039 / 0.035). That is
+  the coordinate-invariance claim confirmed end to end, not just at a single state.
+- The **quadruped does not improve.** The plant is verified independently
+  (SPD mass matrix, gravity wrench recovering the legs' 2.446 N·m moment
+  analytically, contact multipliers carrying full weight, feet held to 0.0000 m),
+  but the wrench-to-torque allocator through a redundant contact set still needs
+  work. Treat it as a working plant with an unfinished controller, not a solved
+  task.
+
+The generation-0 prior flies badly but does not fail to fly — which is the point.
+If it already succeeded, the task would be too easy and the ablation would have no
+dynamic range.
+
+## Plants
+
+| system | n_force | task_dim | allocator | `M(q)` | notes |
+|---|---|---|---|---|---|
+| `QuadrotorSE3` | 4 | 3 | 6 | constant | the primary plant |
+| `QuadrotorPayload` | 4 | 3 | 6 | constant | + slung packages on connectors |
+| `QuadrotorNav` | 4 | 3 | 6 | constant | + obstacle field in the state |
+| `PlanarQuadrotor` | 2 | 2 | 2 | constant | cheap 2-D test plant |
+| `PlanarQuadruped` | 8 | 3 | 4 | **varies** | 11 coords, 3 unactuated, contact |
+| `TwoLinkArm` | 2 | 2 | 0 | **varies** | minimal coordinates |
+| `MaximalChain` | 2 | 2 | 0 | *constant* | maximal coordinates, joints as constraints |
 
 ## The two abstractions
 
@@ -405,6 +458,185 @@ cs = ConstraintSet([CrashBudget(0.0), SaturationBudget(0.02)], multiplier="pid")
 train(cfg, system, trainable, task, constraints=cs)   # theta's dimension is unchanged
 ```
 
+## Physical environments
+
+A scene is a **list of obstacle groups**, exactly as a controller is a list of
+Lagrangian terms and a robot is a list of connectors:
+
+```python
+env = Environment([Pillars(n=6), Walls(n=2)])
+env = make_environment("forest")            # or a named preset
+sys = make_system("quadrotor_nav", environment="hoop_course")
+```
+
+| group | shape | you must |
+|---|---|---|
+| `Pillars` | vertical cylinders | go **around** — not over |
+| `Walls` | finite wall segments | go around or over |
+| `Gate` | two posts with a gap | plan a route, not a heading |
+| `Hoops` | rings (torus) | fly **through** |
+
+Presets: `empty`, `sparse`, `pillars`, `forest`, `slalom`, `gate`, `walls`,
+`cluttered`, `gate_forest`, `hoops`, `hoop_course`, `hoops_upright`,
+`hoops_flat`, `hoop_slalom`.
+
+**Adding a primitive is one class.** `ObstacleGroup.raycast` defaults to sphere
+marching the group's own SDF, so a new shape only has to implement `sdf`
+(and optionally `normal`). `Pillars` and `Walls` override it with closed-form
+intersections and are exact and faster; `Hoops` inherits the marcher and gets
+correct ranges for free — verified by a test asserting `Hoops` defines no
+`raycast` of its own.
+
+**Geometry lives in the state, one layout per episode.** That is what makes
+generalization *measurable* rather than assumed: `reset` draws a fresh scene from
+its generator, so a held-out evaluation seed is automatically a held-out set of
+layouts, with no separate bookkeeping to get wrong and no way to silently test on
+the training scenes.
+
+### Hoops are gates, not decoration
+
+Hoop tilt is sampled across the full range — vertical (fly through sideways),
+horizontal (fly up through), and everything between — so a course cannot be
+solved with one approach direction. `hoops_upright` and `hoops_flat` pin the
+extremes.
+
+The waypoints **are** the hoop centres. Geometry and goals are drawn from
+different generators, so a gate can only be guaranteed to sit on the route if one
+is derived from the other: `place_course` puts hoop *k* on waypoint *k*, facing
+along the leg that reaches it, keeping the tilt the group already sampled. A gate
+the vehicle is not required to pass through is not a gate.
+
+### Does obstacle navigation generalize?
+
+Trained on `pillars`, evaluated on held-out **layouts** of that preset and on five
+presets never seen in training. Two arms matched on seed, population and budget:
+*blind* is the standard genome with no sensor at all; *ranged* adds a
+`RangeSensor` and a `RangeBarrier` that sees only beams and is never told where
+anything is. 3 seeds, 192 held-out tasks each, 60 generations.
+
+| test scene | blind fail | ranged fail | blind reach | ranged reach |
+|---|---|---|---|---|
+| `pillars` *(trained here)* | 0.29 | **0.18** | 0.38 | 0.36 |
+| `sparse` | 0.17 | **0.10** | 0.46 | 0.38 |
+| `forest` | 0.34 | **0.24** | 0.36 | 0.34 |
+| `gate` | 0.14 | **0.06** | 0.46 | 0.42 |
+| `walls` | 0.21 | **0.14** | 0.43 | 0.37 |
+| `cluttered` | 0.31 | **0.22** | 0.38 | 0.34 |
+
+**What holds up.** Range sensing cuts collisions in *every* scene, by roughly a
+third relative, and the benefit transfers intact to five presets — including wall
+segments and gates, geometry the controller never trained against. That is the
+payoff of a barrier built on measurements rather than on known geometry.
+
+**Why there is no train/test gap.** Performance tracks scene *difficulty*, not
+whether the scene was trained on: the training preset is among the harder rows,
+and easier unseen scenes (`gate`, `sparse`) score better than it. Layouts are
+resampled every episode and every generation, so the controller never sees the
+same scene twice and has nothing to memorize — generalization is a property of the
+training distribution here, not an achievement of the controller.
+
+**What does not hold up.** The absolute numbers are poor. Reaching the goal
+34–46% of the time while colliding 6–24% of the time is a vehicle that navigates
+*somewhat*, not a competent navigator. Two contributors are worth separating:
+
+- 2.6–8% of sampled waypoints land inside geometry and are simply unreachable —
+  the task samples goals independently of obstacles. Real, but far too small to
+  explain the gap.
+- The rest is the controller. A reactive barrier on 12 beams has no memory and no
+  plan; it cannot back out of a pocket or route around a wall it is already
+  pressed against. Getting past this needs a policy with state, not a better
+  barrier — which is a different piece of work, not a longer training run.
+
+The honest summary: **the sensing benefit generalizes; the navigation competence
+is not there yet.**
+
+### Sensing the scene
+
+`RangeSensor` fans horizontal beams and reports distances, so avoidance can come
+from **measurements** rather than known geometry — `RangeBarrier` is handed beams
+and is never told where anything is, which is the difference that makes transfer
+to an unseen layout meaningful. `ObstacleBarrier`, by contrast, is given geometry
+at construction and cannot transfer.
+
+Rays are 3-D throughout even for planar primitives. Letting flat shapes set a 2-D
+convention is exactly what crashed the first hoop added to a shared scene: a
+torus's distance genuinely depends on height. Vertical primitives report an
+*exactly zero* height gradient — the truth — rather than a fudged small value the
+pullback would then act on.
+
+## Sensing (spec addendum §3.5)
+
+A camera does not change the plant Lagrangian — `M(q)q̈ + Cq̇ + g = u` is
+indifferent to what we measure — so **`M⁻¹` in `G(θ)` stays a ground-truth,
+design-time quantity and no estimator ever enters the metric**. `metric.py`,
+`operators.py` and `es.py` are untouched. What sensing changes is the *desired*
+Lagrangian: `L_d = L₀(θ) + ΔL(θ, obs)`.
+
+### The regression gate
+
+With `FullState` and `latency_steps = 0`, training, evaluation and traces
+reproduce **bit-identically** to the sensor-free path
+(`test_full_state_training_is_bit_identical`). The sensor-free path also still
+uses the literal 3-argument `vmap`, so "no sensors" is unchanged rather than
+merely equivalent.
+
+### Delay and common random numbers, built before any real sensor
+
+Both are cheap now and expensive to retrofit:
+
+- **Per-sensor `DelayBuffer`**, not one global lag — flow/IMU at ~2 ms, ToF at
+  5–20 ms, vision at 30–80 ms. Delay costs `ω·τ` of phase margin; evolve without
+  it and evolution finds stiff, lightly-damped potentials that are optimal in sim
+  and oscillate on hardware.
+- **Sensor noise joins CRN** — drawn once per episode and tiled across the
+  population, exactly like goals and reset noise. Otherwise sensor stochasticity
+  becomes fitness-ranking variance, and ES is already variance-limited.
+
+### `ΔL` as a `LagrangianTerm`
+
+Partitioned **by argument kind**: `SensorPotential` takes `position_like`/`range`,
+`SensorDissipation` takes `velocity_like`. Never one net across both — that
+produces forces with no sign guarantee, gyroscopic terms that are neither
+conservative nor dissipative.
+
+`ΔV ≥ 0` and `ΔV ≡ 0` for `‖e‖ < r_goal`, enforced by a smoothstep gate that is
+*exactly* zero inside the ball (value **and** gradient). That is what replaces
+unbiasedness:
+
+> **Bias immunity, measured.** Inject a constant **+60 pixel** bias into the
+> observation and the closed-loop equilibrium is still the goal to **< 1e-3 m**.
+> An estimator-based controller settles wherever its bias vanishes; `ΔV` cannot
+> move the goal because it has no support there.
+
+`FovBarrier` keeps features off the frame border — image-based servoing's
+best-known failure mode — and is compactly supported in pixel space, so a
+centred feature contributes nothing.
+
+### Lenses and the landmark camera
+
+`Pinhole` and `DoubleSphere` (Usenko et al. 2018) round-trip to **2e-16** with
+closed-form Jacobians matching central differences to **5e-8**. The fisheye sees
+1233 of 2000 random directions where the pinhole sees 501 — wide FOV makes the
+barrier less binding.
+
+`LandmarkCamera` **projects, never renders**: 192 vehicles × 250 steps would be
+48,000 images per generation. Trained end-to-end with the camera and barrier in
+the loop: error **2.092 → 0.041 m**, crashes **78% → 0%**.
+
+**Runtime deviates from the spec's target.** §7 asks for <15% at `B=192, K=32`;
+measured it is ~15% at K=4 and ~45% at K=32. The cost is per-op *dispatch*, not
+arithmetic — the ~12 tensor ops per step are paid whatever K is — so the lever is
+K or fusing the projection, not batch size. The test asserts the level actually
+achieved rather than a target that is not met.
+
+### Not built
+
+Steps 4–5 of the addendum's build order (adaptive skipping with `skip_thresh` and
+`heartbeat` in the genome; `EventCamera`) are deliberately absent, per the scope
+warning: past step 3 this stops being an evolutionary operator for actuator
+control and becomes a vision-based control system. The `Sensor` ABC keeps the
+door open at near-zero cost.
+
 ## Search strategies
 
 Two loops over the same genome and the same whitened variation operator, so the
@@ -463,26 +695,114 @@ bit-identical, so `G` is genuinely rank-19 of 45; symmetry-breaking lifts it to 
   plant constants behind the prototype's numbers were not recoverable.
 - **Runtime is ~3.4× faster than the spec's budget** (250-step rollout at B=192:
   0.087 s vs ~0.3 s), so the refactor-regression gate passes comfortably.
+- **`null_mode="cap"` is the default, not a bare ridge.** With `ridge=1e-3` the
+  whitened arm was measurably *worse* than isotropic — §7's first failure mode, but
+  in the opposite direction from how the spec describes it. See below.
+- **`LandmarkCamera` runtime misses §7's <15% target** (~15% at K=4, ~45% at
+  K=32). The cost is per-op dispatch, not arithmetic, so the lever is K or fusing
+  the projection. The test asserts what is actually achieved rather than a target
+  that is not met.
+- **Sensing steps 4–5 are deliberately absent** (adaptive skipping in the genome;
+  `EventCamera`), per the addendum's own scope warning: past step 3 this stops
+  being an evolutionary operator for actuator control and becomes a vision-based
+  control system.
+- **The quadruped's controller is unfinished.** Several drone-calibrated constants
+  had to be re-derived before its loop responded to a goal at all — the cost's
+  smoothing floor `pos_eps` (sized for metre-scale errors, flattening a 0.1 m
+  task), `gravity_force` ignoring the legs' pitch moment, an allocator contact
+  weight of ½ for a foot exactly on the ground, and goals at the straight-leg
+  singularity. All four are fixed and tested; the wrench allocator still is not.
+
+### What the ablation found
+
+The first 2×2 said whitening **hurt** on 0/5 seeds. That was a defaults bug, not a
+property of the method: `ridge=1e-3` amplified `G`'s null space (rank ≈ 0.73 of 45)
+by up to 31×, spending the step budget on directions that barely move the
+commanded force. A sign-flipped control (`G^{+1/2}`) was catastrophic (leg-B 2.32),
+confirming the direction was right.
+
+With `null_mode="cap"` — whitening applied one-sidedly, so an uninformative
+direction gets an isotropic step rather than an amplified one — the paired
+difference flips:
+
+| genome | paired Δ leg-B (whitened − isotropic) | helped on |
+|---|---|---|
+| structured | **−0.0045** | **5/5 seeds** |
+| unstructured (MLP) | +0.125 (sd 0.24) | 2/5 seeds |
+
+So whitening helps the structured genome consistently and shows no clear effect on
+the unstructured one — which is a sharper result than "whitening helps", and the
+kind the 2×2 exists to produce.
+
+Worth noting how the bug presented: §7 warns that a *large* ridge collapses `P → I`
+so the whitened arm silently becomes the baseline. The damage here came from the
+ridge being too **small**. Both diagnostics (`metric_dist_I`, `metric_cond`) were
+logged and healthy throughout — the metric was genuinely anisotropic, it was just
+anisotropic in useless directions.
 
 ## Layout
 
 ```
 src/lagrangian_es/
-  config.py util.py            frozen dataclasses; pytree + RNG helpers
-  systems/                     so3, base, quadrotor, planar_quad, two_link_arm
-  trainables/                  base, energy_shaping, pd_baseline, mlp
-  tasks.py rollout.py          goal distributions; plant-agnostic episodes
+  config.py  util.py           frozen dataclasses; pytree + RNG helpers
+  systems/
+    base.py so3.py             LagrangianSystem ABC; batched SO(3)
+    quadrotor.py  payload.py   SE(3) drone; + slung packages
+    quadrotor_nav.py           + obstacle field carried in the state
+    planar_quad.py             cheap 2-D drone
+    planar_quadruped.py        11-coord legged robot with contact
+    two_link_arm.py            minimal coordinates
+    maximal_chain.py           maximal coordinates, joints as constraints
+    holonomic.py               constraint rows + the KKT solve
+    connectors.py              welds, cables, compliant links
+    environment.py             composable obstacle groups
+  trainables/
+    base.py energy_shaping.py  Trainable ABC; composition of terms
+    terms.py sensor_terms.py   LagrangianTerm library; ΔL from observations
+    embodied.py                robot-specific agents
+    pd_baseline.py mlp.py      sanity floor; unstructured arm of the 2×2
+  sensors/
+    base.py full_state.py      Sensor ABC + DelayBuffer; the identity gate
+    lens.py landmarks.py       pinhole/fisheye; project-never-render camera
+    range_sensor.py            beam ranging against the environment
+  tasks.py  rollout.py         goal distributions; plant-agnostic episodes
+  constraints.py               episode-level budgets + multipliers
   metric.py operators.py es.py G(θ) and P; variation/selection; the loops
   evaluate.py viz.py           held-out metrics; figures
 scripts/  train.py  ablate.py  replay.py
 ```
+
+Registries: `SYSTEMS`, `TRAINABLES`, `TERMS`, `SENSORS`, `CONNECTORS`, `GROUPS`,
+`PRESETS` (scenes), `TASKS`, `CONSTRAINTS`, `MULTIPLIERS`, `LENSES`.
 
 Dependency order is strictly acyclic and asserted by
 `test_lint_seam.py::test_dependency_order_is_acyclic`.
 
 ## Visualizer
 
-`scripts/replay.py` exports flight trajectories as JSON (position, orientation,
-liveness, goals) for an interactive 3D replay that renders the airframe as an
-oriented box and the waypoints as points, flying the trained genome and the
-untrained prior through the same episode side by side.
+`scripts/replay.py` trains, then exports trajectories as JSON for an interactive
+replay: trained genome and untrained prior flying the identical episode.
+
+Nothing in the renderer is plant-specific. Each system publishes
+
+- `render_spec()` — dimensionality, body shapes, ground plane;
+- `render_poses(s)` — `[n_bodies, 12]` (position + rotation) in 3-D, or
+  `[n_bodies, 3]` (`x, z, angle`) in 2-D;
+- `render_static(s)` / `render_extras(s)` — scene geometry, cables, feet, beams;
+
+and the page knows only that vocabulary, so **a new robot becomes drawable by
+describing itself**. The target is drawn by pushing the goal through the plant's
+own `nominal_state` and rendering it, so a ghost of the target configuration
+comes out for free on every plant.
+
+Plant-specific detail still reaches the screen: cable lines for a slung load,
+foot markers that swell with contact force (a Lagrange multiplier read from the
+state, not a spring), pillars and walls and tilted hoops, and a live camera panel
+showing which landmarks are in frame against the FOV barrier's margin band.
+
+```bash
+.venv/bin/python scripts/replay.py --robots quadrotor quadrotor_hoops --out t.json
+```
+
+Training defaults to the drone family; the quadruped and arms stay registered and
+selectable by name.

@@ -96,7 +96,7 @@ class MLPPolicy(Trainable):
             flat = torch.cat([flat, self.system.residual_init()], dim=0)
         return flat
 
-    def forward(self, theta: Tensor, s: State, goal: Tensor) -> Tensor:
+    def forward(self, theta: Tensor, s: State, goal: Tensor, obs=None) -> Tensor:
         sysm = self.system
         W1, b1, W2, b2, W3, b3, phi = self.unpack(theta)
         e = (sysm.task_position(s) - goal) / self.e_scale

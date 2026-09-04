@@ -13,11 +13,14 @@ variance swamps the effect the ablation is trying to measure.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import List, Optional, Sequence
+
 import torch
 from torch import Tensor
 from torch.func import vmap
 
 from .config import RolloutCfg
+from .sensors.base import DelayBuffer, Sensor
 from .systems.base import LagrangianSystem, State
 from .tasks import Task
 from .trainables.base import Trainable
@@ -103,10 +106,51 @@ class Rollout:
     """
 
     def __init__(self, system: LagrangianSystem, trainable: Trainable, task: Task,
-                 cfg: RolloutCfg):
+                 cfg: RolloutCfg, sensors: Optional[Sequence[Sensor]] = None):
         self.system, self.trainable, self.task, self.cfg = system, trainable, task, cfg
-        # in_dims=(0, 0, 0): every batch entry carries its own genome, state, goal.
-        self.forward_batch = vmap(trainable.forward, in_dims=(0, 0, 0))
+        self.sensors: List[Sensor] = list(sensors or [])
+        # Per-sensor delay, not one global lag: flow and IMU run at ~2 ms, ToF at
+        # 5-20 ms, vision at 30-80 ms, and collapsing them loses the very
+        # timescale separation the allocator/potential split depends on.
+        self.buffers = [DelayBuffer(s.latency_steps) for s in self.sensors]
+        # The pullback Jacobian costs about as much as the projection itself, so
+        # it is computed only when some term declares it consumes observations.
+        self._needs_jac = any(getattr(t, "uses_obs", False)
+                              for t in getattr(trainable, "terms", ()))
+        for sen in self.sensors:
+            sen.crn_group = cfg.n_eps          # noise shared across the population
+        # in_dims: every batch entry carries its own genome, state, goal (and obs).
+        # The sensor-free path keeps the original 3-argument signature verbatim,
+        # so "no sensors" is bit-identical rather than merely equivalent.
+        self.forward_batch = vmap(trainable.forward,
+                                  in_dims=(0, 0, 0, 0) if self.sensors
+                                  else (0, 0, 0))
+
+    # --- sensing ------------------------------------------------------------
+    def _prime(self, s: State, gen) -> None:
+        for sen, buf in zip(self.sensors, self.buffers):
+            buf.reset(sen.observe(s, gen))
+
+    def _observe(self, s: State, gen) -> dict:
+        """Delayed observations plus their pullback Jacobians.
+
+        The MEASUREMENT is delayed; the Jacobian is evaluated at the current
+        state.  That asymmetry is deliberate and matches how these loops are
+        actually flown: the camera is late, but the vehicle's own pose comes from
+        the IMU at loop rate, so the geometry used to pull image error back into
+        task space is fresh even when the pixels are not.  It is the same
+        dead-reckon-between-updates rule as the skip policy.
+        """
+        out = {}
+        for sen, buf in zip(self.sensors, self.buffers):
+            out[sen.name] = buf.push(sen.observe(s, gen))
+            if self._needs_jac:
+                out[sen.name + "/J"] = sen.jacobian(s)
+        return out
+
+    def _u(self, TH_b, s, goal, obs):
+        return (self.forward_batch(TH_b, s, goal, obs) if self.sensors
+                else self.forward_batch(TH_b, s, goal))
 
     # --- layout ------------------------------------------------------------
     def _expand(self, TH: Tensor, goals: Tensor, seed: int):
@@ -116,6 +160,10 @@ class Rollout:
         s = tree_repeat(s, P)                        # ... reused by every genome
         TH_b = TH.repeat_interleave(E, dim=0)        # index = member * E + episode
         goals_b = goals.repeat(P, 1, 1)
+        if getattr(self.system, "needs_course", False):
+            # geometry and waypoints come from different generators, so a plant
+            # that wants gates ON the route has to be handed the route
+            s = self.system.place_course(s, goals_b)
         # learned-dynamics residual, if the plant declares one
         res_b = self.trainable.residual_slice(TH_b)
         return s, TH_b, goals_b, res_b, P, E
@@ -137,9 +185,16 @@ class Rollout:
         leg_err = torch.zeros(B, task.n_legs, dtype=sysm.dtype, device=sysm.device)
         dead = torch.full((B,), cfg.dead_cost, dtype=sysm.dtype, device=sysm.device)
 
+        # Sensor noise joins common random numbers: one stream per generation,
+        # drawn per episode and tiled across the population.  Without this,
+        # sensor stochasticity becomes fitness-ranking variance and ES is
+        # already variance-limited.
+        sgen = make_gen(seed + 5_701_889)
+        self._prime(s, sgen)
+
         for t in range(T):
             goal = task.goal_at(goals_b, t, T)
-            u = self.forward_batch(TH_b, s, goal)
+            u = self._u(TH_b, s, goal, self._observe(s, sgen))
             s_new = sysm.step(s, u, dt, res_b)
             # crashed vehicles freeze; never integrate a diverged state
             s = tree_where(alive, s_new, s)
@@ -184,10 +239,12 @@ class Rollout:
         s, TH_b, goals_b, res_b, P, E = self._expand(TH, goals, seed)
 
         alive = sysm.alive(s)
+        sgen = make_gen(seed + 5_701_889)
+        self._prime(s, sgen)
         states, gs, us, al = [s], [], [], []
         for t in range(T):
             goal = task.goal_at(goals_b, t, T)
-            u = self.forward_batch(TH_b, s, goal)
+            u = self._u(TH_b, s, goal, self._observe(s, sgen))
             s = tree_where(alive, sysm.step(s, u, dt, res_b), s)
             gs.append(goal)
             us.append(u)

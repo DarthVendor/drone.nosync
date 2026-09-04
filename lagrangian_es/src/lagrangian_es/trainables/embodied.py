@@ -80,7 +80,7 @@ class QuadrotorAgent(EmbodiedAgent):
     normal flight.
     """
 
-    for_systems = ("QuadrotorSE3", "QuadrotorPayload")
+    for_systems = ("QuadrotorSE3", "QuadrotorPayload", "QuadrotorNav")
 
     @classmethod
     def build_terms(cls, system, n_bowls: int = 3, ground_margin: float = 0.35,

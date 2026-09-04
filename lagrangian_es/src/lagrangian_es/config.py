@@ -69,6 +69,7 @@ class Config:
     system: str = "quadrotor"
     trainable: str = "energy_shaping"
     task: str = "waypoint_pair"
+    sensors: tuple = ()           # sensor registry names; () = full-state path
     seed: int = 0
     dtype: str = "float64"
     rollout: RolloutCfg = field(default_factory=RolloutCfg)

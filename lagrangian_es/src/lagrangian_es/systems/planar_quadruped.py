@@ -50,7 +50,7 @@ import torch
 from torch import Tensor
 
 from .base import LagrangianSystem, State
-from .holonomic import ConstraintStack, GroundContact, HolonomicConstraint
+from .holonomic import ConstraintStack, GroundContact
 
 N_LEG = 4
 N_Q = 3 + 2 * N_LEG          # 11
