@@ -203,6 +203,8 @@ def main():
     ap.add_argument("--episodes", type=int, default=4)
     ap.add_argument("--gens", type=int, default=None)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--html", default=None,
+                    help="also write a standalone page using scripts/visualizer.html")
     args = ap.parse_args()
 
     payload = {"robots": [build_one(n, args) for n in args.robots]}
@@ -210,6 +212,11 @@ def main():
     out.write_text(json.dumps(payload, separators=(",", ":")))
     print(f"wrote {out}  ({out.stat().st_size / 1024:.0f} KB, "
           f"{len(payload['robots'])} robots)")
+    if args.html:
+        tpl = pathlib.Path(__file__).resolve().parent / "visualizer.html"
+        page = pathlib.Path(args.html)
+        page.write_text(tpl.read_text().replace("__DATA__", out.read_text()))
+        print(f"wrote {page}  ({page.stat().st_size / 1024:.0f} KB)")
     for r in payload["robots"]:
         e0, e1 = r["eval"]["prior"], r["eval"]["trained"]
         print(f"  {r['label']:36s} err {e0['final_err_mean']:.3f} -> "

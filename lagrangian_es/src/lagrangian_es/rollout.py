@@ -34,7 +34,9 @@ class RolloutResult:
     alive: Tensor               # [B]  survived the whole episode
     leg_err: Tensor             # [B, n_legs]  task-space error at the end of each leg
     final_err: Tensor           # [B]
-    success: Tensor             # [B]  within task tolerance at the end of the last leg
+    success: Tensor             # [B]  reached the final waypoint
+    legs_done: Tensor           # [B]  waypoints reached, arrival gating only
+    finish_frac: Tensor         # [B]  fraction of the episode taken to finish (1 = never)
     saturation: Tensor          # [B]  mean fraction of channels at a bound
     effort: Tensor              # [B]  mean counterforce in the M^-1 metric
     shaping: Tensor             # [B]  mean plant-specific regularizer
@@ -62,7 +64,8 @@ class RolloutResult:
         return RolloutResult(
             fitness=self.fitness[sl], cost=self.cost[ep], alive=self.alive[ep],
             leg_err=self.leg_err[ep], final_err=self.final_err[ep],
-            success=self.success[ep], saturation=self.saturation[ep],
+            success=self.success[ep], legs_done=self.legs_done[ep],
+            finish_frac=self.finish_frac[ep], saturation=self.saturation[ep],
             effort=self.effort[ep], shaping=self.shaping[ep], n_eps=E,
         )
 
@@ -83,6 +86,8 @@ class RolloutResult:
             "final_err": float(self.final_err.mean()),
             "saturation": float(self.saturation.mean()),
             "effort": float(self.effort.mean()),
+            "legs_done": float(self.legs_done.to(torch.float64).mean()),
+            "finish_frac": float(self.finish_frac.mean()),
         }
         for i in range(self.leg_err.shape[1]):
             out[f"leg{chr(ord('A') + i)}_err"] = float(self.leg_err[:, i].mean())
@@ -184,6 +189,9 @@ class Rollout:
         leg_ends = task.leg_end_steps(T)
         leg_err = torch.zeros(B, task.n_legs, dtype=sysm.dtype, device=sysm.device)
         dead = torch.full((B,), cfg.dead_cost, dtype=sysm.dtype, device=sysm.device)
+        arrival = getattr(task, "gating", "time") == "arrival"
+        leg = torch.zeros(B, dtype=torch.long, device=sysm.device)
+        finish = torch.full((B,), float(T), dtype=sysm.dtype, device=sysm.device)
 
         # Sensor noise joins common random numbers: one stream per generation,
         # drawn per episode and tiled across the population.  Without this,
@@ -193,7 +201,8 @@ class Rollout:
         self._prime(s, sgen)
 
         for t in range(T):
-            goal = task.goal_at(goals_b, t, T)
+            goal = task.goal_for_leg(goals_b, leg) if arrival \
+                else task.goal_at(goals_b, t, T)
             u = self._u(TH_b, s, goal, self._observe(s, sgen))
             s_new = sysm.step(s, u, dt, res_b)
             # crashed vehicles freeze; never integrate a diverged state
@@ -211,18 +220,34 @@ class Rollout:
             eff_acc = eff_acc + eff
             shp_acc = shp_acc + shp
 
-            if t in leg_ends:
+            if arrival:
+                # advance only on ARRIVAL, so reaching a waypoint early buys a
+                # longer tail of low cost at the next one -- the incentive that
+                # makes the fastest route the cheapest
+                reached = (err.norm(dim=-1) < task.tol) & alive
+                last = leg >= task.n_legs - 1
+                finish = torch.where(reached & last & (finish >= T),
+                                     torch.full_like(finish, float(t)), finish)
+                leg = torch.where(reached & ~last, leg + 1, leg)
+            elif t in leg_ends:
                 leg_err[:, leg_ends.index(t)] = err.norm(dim=-1)
             alive = alive & sysm.alive(s)
 
-        final_goal = task.goal_at(goals_b, T - 1, T)
+        final_goal = task.goal_for_leg(goals_b, leg) if arrival \
+            else task.goal_at(goals_b, T - 1, T)
+        done = (finish < T) if arrival else task.success(s, final_goal)
+        if arrival:
+            leg_err[:, -1] = (sysm.task_position(s) - final_goal).norm(dim=-1)
         return RolloutResult(
             fitness=cost.view(P, E).mean(dim=1),
             cost=cost,
             alive=alive,
             leg_err=leg_err,
             final_err=(sysm.task_position(s) - final_goal).norm(dim=-1),
-            success=task.success(s, final_goal) & alive,
+            success=(done & alive) if arrival
+                    else (task.success(s, final_goal) & alive),
+            legs_done=leg + done.to(leg.dtype),
+            finish_frac=finish / T,
             saturation=sat / T,
             effort=eff_acc / T,
             shaping=shp_acc / T,
@@ -241,15 +266,24 @@ class Rollout:
         alive = sysm.alive(s)
         sgen = make_gen(seed + 5_701_889)
         self._prime(s, sgen)
+        # the replay has to advance goals exactly as training did, or a trace
+        # shows a different flight from the one that was scored
+        arrival = getattr(task, "gating", "time") == "arrival"
+        leg = torch.zeros(goals_b.shape[0], dtype=torch.long, device=sysm.device)
         states, gs, us, al = [s], [], [], []
         for t in range(T):
-            goal = task.goal_at(goals_b, t, T)
+            goal = task.goal_for_leg(goals_b, leg) if arrival \
+                else task.goal_at(goals_b, t, T)
             u = self._u(TH_b, s, goal, self._observe(s, sgen))
             s = tree_where(alive, sysm.step(s, u, dt, res_b), s)
             gs.append(goal)
             us.append(u)
             al.append(alive)
             states.append(s)
+            if arrival:
+                err = (sysm.task_position(s) - goal).norm(dim=-1)
+                reached = (err < task.tol) & alive
+                leg = torch.where(reached & (leg < task.n_legs - 1), leg + 1, leg)
             alive = alive & sysm.alive(s)
         return Trace(
             states=tree_stack(states),

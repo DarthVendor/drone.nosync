@@ -20,6 +20,16 @@ class Task(ABC):
     n_legs: int = 1
     tol: float = 0.25          # success radius, task-space units
 
+    #: "time"    -- the goal advances on a fixed schedule
+    #: "arrival" -- it advances when the vehicle actually reaches the waypoint
+    #:
+    #: Arrival gating is what makes speed worth anything.  Under a timer the
+    #: vehicle is scored on where it is at pre-set moments, so dawdling to a
+    #: waypoint costs nothing as long as it arrives before the switch; under
+    #: arrival gating, reaching a waypoint early buys a longer tail of low cost
+    #: at the next one, so the fastest route is the cheapest one.
+    gating: str = "time"
+
     def __init__(self, system: LagrangianSystem):
         self.system = system
         self.task_dim = system.task_dim
@@ -30,12 +40,18 @@ class Task(ABC):
 
     @abstractmethod
     def goal_at(self, goals: Tensor, t: int, ep_steps: int) -> Tensor:
-        """Active goal at integration step t.  goals [B, n_legs, task_dim] -> [B, task_dim]."""
+        """Active goal under TIME gating.  [B, n_legs, d] -> [B, d]."""
 
     def leg_end_steps(self, ep_steps: int) -> list:
         """Last step index of each leg -- where per-leg error is measured."""
         n = self.n_legs
         return [(i + 1) * ep_steps // n - 1 for i in range(n)]
+
+    def goal_for_leg(self, goals: Tensor, leg: Tensor) -> Tensor:
+        """Active goal under ARRIVAL gating: whichever leg each episode is on."""
+        idx = leg.clamp(0, self.n_legs - 1)
+        return goals.gather(1, idx[:, None, None].expand(-1, 1, goals.shape[-1])
+                            ).squeeze(1)
 
     def success(self, s: State, goal: Tensor) -> Tensor:
         """[B] bool, for reporting only -- never part of the fitness."""
@@ -43,7 +59,7 @@ class Task(ABC):
 
 
 class WaypointPair(Task):
-    """Takeoff, translate, re-target mid-episode, hover.
+    """Takeoff, translate, re-target, hover.
 
     Leg A holds for t < ep_steps / 2, then the goal jumps to leg B.  The jump is
     the point: it is a step input applied to an already-moving vehicle, which is
@@ -53,8 +69,9 @@ class WaypointPair(Task):
     n_legs = 2
 
     def __init__(self, system, xy: float = 2.0, z_lo: float = 1.0, z_hi: float = 2.5,
-                 tol: float = 0.25):
+                 tol: float = 0.25, gating: str = "arrival"):
         super().__init__(system)
+        self.gating = gating
         if system.task_dim != 3:
             raise ValueError(f"WaypointPair needs task_dim 3, got {system.task_dim}")
         self.xy, self.z_lo, self.z_hi, self.tol = float(xy), float(z_lo), float(z_hi), float(tol)
@@ -144,8 +161,10 @@ class HoopCourse(Task):
     """
 
     def __init__(self, system, n_gates: int = 3, radius: float = 2.0,
-                 z_lo: float = 1.0, z_hi: float = 2.0, tol: float = 0.3):
+                 z_lo: float = 1.0, z_hi: float = 2.0, tol: float = 0.3,
+                 gating: str = "arrival"):
         super().__init__(system)
+        self.gating = gating
         if system.task_dim != 3:
             raise ValueError(f"HoopCourse needs task_dim 3, got {system.task_dim}")
         self.n_legs = int(n_gates)
@@ -181,8 +200,10 @@ class FreeSpaceWaypoints(Task):
 
     def __init__(self, system, n_legs: int = 2, pool: int = 4096,
                  margin: float = 0.40, extent: float = 3.0,
-                 z_range=(1.0, 2.0), tol: float = 0.25, seed: int = 12345):
+                 z_range=(1.0, 2.0), tol: float = 0.25, seed: int = 12345,
+                 gating: str = "arrival"):
         super().__init__(system)
+        self.gating = gating
         self.n_legs = int(n_legs)
         self.tol = float(tol)
         env = getattr(system, "env", None)
