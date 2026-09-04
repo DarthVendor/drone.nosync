@@ -38,8 +38,8 @@ from torch import Tensor
 from .config import Config
 from .metric import identity_preconditioner, physics_metric
 from .operators import (
-    ga_step, mirrored_offspring, rank_weights, recombine, update_sigma,
-    whitened_mutation,
+    ga_step_structured, mirrored_offspring, rank_weights, recombine,
+    update_sigma, whitened_mutation,
 )
 from .rollout import Rollout
 from .systems import make_system
@@ -97,7 +97,8 @@ def _log(rec, verbose, tag):
 # --------------------------------------------------------------------------- #
 # distribution-based ES
 # --------------------------------------------------------------------------- #
-def train_es(cfg, system, trainable, task, callback=None, verbose=False) -> TrainResult:
+def train_es(cfg, system, trainable, task, callback=None, verbose=False,
+             constraints=None) -> TrainResult:
     es, rc = cfg.es, cfg.rollout
     roll = Rollout(system, trainable, task, rc)
     theta = trainable.init()
@@ -114,17 +115,26 @@ def train_es(cfg, system, trainable, task, callback=None, verbose=False) -> Trai
         # reference for the 1/5th rule and a mean-genome learning curve, without
         # spending a second rollout on it.
         res = roll.run(torch.cat([TH, theta[None]], 0), goals, seed=gen_seed(cfg.seed, g, 5))
+        off = res.genome_slice(slice(0, es.pop))
         off_fit, parent_fit = res.fitness[: es.pop], res.fitness[es.pop]
         success_frac = float((off_fit < parent_fit).to(torch.float64).mean())
 
-        theta, elite, elite_fit = recombine(TH, off_fit, es.elite_frac)
+        # Selection acts on the AUGMENTED objective; lambda lives out here, never
+        # in theta, so the metric never sees a coordinate with du/dlambda = 0.
+        cinfo = {}
+        sel_fit = off_fit
+        if constraints is not None and len(constraints):
+            sel_fit = constraints.augment(off_fit, off)
+            cinfo = constraints.update(off)
+
+        theta, elite, elite_fit = recombine(TH, sel_fit, es.elite_frac)
         sigma = update_sigma(sigma, success_frac > es.success_target,
                              es.grow, es.shrink, es.sigma_min, es.sigma_max)
 
         rec = {"gen": g, "fitness_elite": float(elite_fit.mean()),
                "fitness_parent": float(parent_fit), "sigma": sigma,
                "success_frac": success_frac, "n_elite": int(elite.numel()),
-               **res.genome_slice(slice(0, es.pop)).summary(), **minfo,
+               **off.summary(), **minfo, **cinfo,
                **{f"th_{k}": v for k, v in trainable.describe(theta).items()}}
         history.append(rec)
         _log(rec, verbose, "es")
@@ -137,7 +147,8 @@ def train_es(cfg, system, trainable, task, callback=None, verbose=False) -> Trai
 # --------------------------------------------------------------------------- #
 # genetic algorithm over a persistent population
 # --------------------------------------------------------------------------- #
-def train_ga(cfg, system, trainable, task, callback=None, verbose=False) -> TrainResult:
+def train_ga(cfg, system, trainable, task, callback=None, verbose=False,
+             constraints=None) -> TrainResult:
     es, rc = cfg.es, cfg.rollout
     roll = Rollout(system, trainable, task, rc)
     theta0 = trainable.init()
@@ -158,6 +169,10 @@ def train_ga(cfg, system, trainable, task, callback=None, verbose=False) -> Trai
         goals = task.sample(rc.n_eps, make_gen(gen_seed(cfg.seed, g, 1)))
         res = roll.run(TH, goals, seed=gen_seed(cfg.seed, g, 5))
         fit = res.fitness
+        cinfo = {}
+        if constraints is not None and len(constraints):
+            fit = constraints.augment(fit, res)
+            cinfo = constraints.update(res)
 
         # After the first step, slots [0:n_el] are last generation's elites and
         # [n_el:] are its children -- both scored on today's goals, so their
@@ -179,17 +194,19 @@ def train_ga(cfg, system, trainable, task, callback=None, verbose=False) -> Trai
                "fitness_parent": float(fit[order[0]]), "sigma": sigma,
                "success_frac": success_frac, "n_elite": mu,
                "diversity": float(TH.std(dim=0).mean()),
-               **res.summary(), **minfo,
+               **res.summary(), **minfo, **cinfo,
                **{f"th_{k}": v for k, v in trainable.describe(centroid).items()}}
         history.append(rec)
         _log(rec, verbose, "ga")
         if callback is not None:
             callback(rec, TH[order[0]])
 
-        TH, _ = ga_step(TH, fit, sigma, P.P, P.P_inv,
-                        make_gen(gen_seed(cfg.seed, g, 2)), elitism=n_el,
-                        tournament_k=es.tournament_k, crossover_rate=es.crossover_rate,
-                        blx_alpha=es.blx_alpha)
+        TH, _ = ga_step_structured(
+            TH, fit, sigma, P.P, P.P_inv, make_gen(gen_seed(cfg.seed, g, 2)),
+            segments=trainable.segments(), elitism=n_el,
+            tournament_k=es.tournament_k, crossover_rate=es.crossover_rate,
+            blx_alpha=es.blx_alpha, segment_rate=es.segment_rate,
+            mode=es.crossover_mode)
         sigma = update_sigma(sigma, success_frac > es.success_target,
                              es.grow, es.shrink, es.sigma_min, es.sigma_max)
 
@@ -201,10 +218,15 @@ _STRATEGIES = {"es": train_es, "ga": train_ga}
 
 
 def train(cfg: Config, system=None, trainable=None, task=None,
-          callback: Optional[Callable] = None, verbose: bool = False) -> TrainResult:
+          callback: Optional[Callable] = None, verbose: bool = False,
+          constraints=None) -> TrainResult:
+    """`constraints` is an optional `ConstraintSet`.  It is passed here rather
+    than folded into the genome on purpose -- see `constraints.py` for why a
+    multiplier inside theta silently rank-deficits the metric."""
     if system is None or trainable is None or task is None:
         system, trainable, task = build(cfg)
     if cfg.es.strategy not in _STRATEGIES:
         raise KeyError(f"unknown strategy {cfg.es.strategy!r}; "
                        f"expected one of {sorted(_STRATEGIES)}")
-    return _STRATEGIES[cfg.es.strategy](cfg, system, trainable, task, callback, verbose)
+    return _STRATEGIES[cfg.es.strategy](cfg, system, trainable, task, callback,
+                                        verbose, constraints)

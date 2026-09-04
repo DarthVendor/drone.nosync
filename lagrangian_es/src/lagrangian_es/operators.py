@@ -114,3 +114,74 @@ def ga_step(TH: Tensor, fitness: Tensor, sigma: float, P: Tensor, P_inv: Tensor,
     children = torch.where(do_cross[:, None], crossed, TH[pa])
     children = whitened_mutation(children, sigma, P, gen)
     return torch.cat([elites, children], dim=0), order
+
+
+def segment_crossover(A: Tensor, B: Tensor, segments, gen: torch.Generator,
+                      rate: float = 0.5) -> Tensor:
+    """Exchange whole genome segments between paired parents.
+
+    This is the GP-style structural recombination that weight-level crossover
+    cannot provide.  Swapping raw coordinates between two networks is close to
+    meaningless because their weights carry competing conventions -- unit 7 in one
+    parent has nothing to do with unit 7 in the other.  Lagrangian terms have no
+    such convention: each is an independently valid, independently certified
+    contribution to L_d, so a child assembled from either parent's terms is still
+    a well-formed energy-shaping controller.
+
+    Safety here is exactly the composition invariant: because every term
+    preserves nonnegativity and the equilibrium on its own, any conic mixture of
+    terms drawn from two valid parents is itself valid.
+    """
+    n = A.shape[0]
+    segs = list(segments)
+    take_b = torch.rand(n, len(segs), generator=gen, dtype=A.dtype,
+                        device=A.device) < rate
+    out = A.clone()
+    for j, sl in enumerate(segs):
+        m = take_b[:, j: j + 1]
+        out[:, sl] = torch.where(m, B[:, sl], A[:, sl])
+    return out
+
+
+def ga_step_structured(TH: Tensor, fitness: Tensor, sigma: float, P: Tensor,
+                       P_inv: Tensor, gen: torch.Generator, segments,
+                       elitism: int = 2, tournament_k: int = 3,
+                       crossover_rate: float = 0.7, blx_alpha: float = 0.5,
+                       segment_rate: float = 0.5, mode: str = "mixed"):
+    """A GA step that can recombine structurally as well as numerically.
+
+    `mode`:
+      "blx"     -- whitened BLX-alpha only (numeric interpolation)
+      "segment" -- whole-term exchange only (structural)
+      "mixed"   -- half the children each way, which is usually what you want:
+                   BLX refines within a structure, segment swaps explore across
+                   structures, and neither alone does both.
+    """
+    N = TH.shape[0]
+    elitism = max(0, min(int(elitism), N - 2))
+    order = torch.argsort(fitness)
+    elites = TH[order[:elitism]]
+    n_child = N - elitism
+
+    pa = tournament_select(fitness, n_child, tournament_k, gen)
+    pb = tournament_select(fitness, n_child, tournament_k, gen)
+    A, B = TH[pa], TH[pb]
+
+    blx = whitened_crossover(A, B, blx_alpha, P, P_inv, gen)
+    seg = segment_crossover(A, B, segments, gen, rate=segment_rate)
+    if mode == "blx":
+        crossed = blx
+    elif mode == "segment":
+        crossed = seg
+    elif mode == "mixed":
+        use_seg = torch.rand(n_child, 1, generator=gen, dtype=TH.dtype,
+                             device=TH.device) < 0.5
+        crossed = torch.where(use_seg, seg, blx)
+    else:
+        raise ValueError(f"unknown crossover mode {mode!r}")
+
+    do_cross = torch.rand(n_child, generator=gen, dtype=TH.dtype,
+                          device=TH.device) < crossover_rate
+    children = torch.where(do_cross[:, None], crossed, A)
+    children = whitened_mutation(children, sigma, P, gen)
+    return torch.cat([elites, children], dim=0), order

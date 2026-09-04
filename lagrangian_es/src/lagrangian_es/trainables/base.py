@@ -49,6 +49,17 @@ class Trainable(ABC):
         batched or under vmap."""
         return theta[..., : self.policy_dim], theta[..., self.policy_dim :]
 
+    def segments(self):
+        """Crossover-safe blocks of the genome, as slices.
+
+        A trainable whose genome decomposes into independently meaningful units
+        (Lagrangian terms, network layers) exposes them here so that
+        `operators.segment_crossover` can exchange whole units between parents
+        instead of mixing coordinates that only mean something together.
+        Default: the genome is one indivisible block.
+        """
+        return [slice(0, self.dim)]
+
     @abstractmethod
     def init(self) -> Tensor:
         """[dim] physical prior.  Must fly badly, not fail to fly."""

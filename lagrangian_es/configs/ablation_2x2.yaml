@@ -11,7 +11,8 @@ base:
   dtype: float64
   rollout: {n_eps: 8, ep_steps: 250}
   es: {pop: 48, gens: 60, sigma0: 0.15, elite_frac: 0.5, strategy: es,
-       metric_every: 5, metric_states: 96, ridge: 1.0e-3}
+       metric_every: 5, metric_states: 96, ridge: 1.0e-3
+  null_mode: cap}
 
 grid:
   trainable: [energy_shaping, mlp]   # structured vs unstructured

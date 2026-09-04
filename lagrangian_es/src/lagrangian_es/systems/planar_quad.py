@@ -71,6 +71,10 @@ class PlanarQuadrotor(LagrangianSystem):
     def gravity_force(self, s: State) -> Tensor:
         return torch.zeros_like(s["p"]) + self._e2 * self._hover
 
+    def task_mass(self, s: State) -> Tensor:
+        eye = torch.eye(2, dtype=self.dtype, device=self.device)
+        return (self.m * eye).expand(s["p"].shape[:-1] + (2, 2))
+
     def allocator_init(self) -> Tensor:
         return self._t(self.phi0)
 

@@ -165,6 +165,12 @@ class QuadrotorSE3(LagrangianSystem):
         return torch.cat([f[..., None], tau], dim=-1)
 
     # --- task-space accessors -----------------------------------------------
+    def task_mass(self, s: State) -> Tensor:
+        """m I_3 -- translational inertia is isotropic and CONSTANT, so kinetic
+        shaping on this plant is exact rather than an IDA-PBC approximation."""
+        eye = torch.eye(3, dtype=self.dtype, device=self.device)
+        return (self.m * eye).expand(s["p"].shape[:-1] + (3, 3))
+
     def allocator_init(self) -> Tensor:
         """kR = 0.25, kW = 0.10 (used squared) -> an attitude loop barely faster
         than the position loop.  Deliberately marginal: this is what makes the

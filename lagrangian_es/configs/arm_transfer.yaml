@@ -9,4 +9,5 @@ task: joint_pair
 seed: 0
 rollout: {dt: 0.01, ep_steps: 300, n_eps: 8, lambda_e: 0.01, lambda_s: 0.0, dead_cost: 5.0}
 es: {pop: 48, gens: 60, sigma0: 0.15, elite_frac: 0.5, strategy: es,
-     whiten: true, metric_every: 5, metric_states: 96, ridge: 1.0e-3}
+     whiten: true, metric_every: 5, metric_states: 96, ridge: 1.0e-3
+  null_mode: cap}

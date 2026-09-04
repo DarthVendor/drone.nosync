@@ -33,7 +33,17 @@ class RolloutResult:
     final_err: Tensor           # [B]
     success: Tensor             # [B]  within task tolerance at the end of the last leg
     saturation: Tensor          # [B]  mean fraction of channels at a bound
+    effort: Tensor              # [B]  mean counterforce in the M^-1 metric
+    shaping: Tensor             # [B]  mean plant-specific regularizer
     n_eps: int
+
+    def per_genome(self, x: Tensor) -> Tensor:
+        """Aggregate an episode-level [B] quantity to a per-genome [P] mean.
+
+        Episode-level constraints are budgets on a genome's whole behaviour, not
+        on a single episode, so they are always read through this.
+        """
+        return x.view(-1, self.n_eps).mean(dim=1)
 
     def genome_slice(self, sl) -> "RolloutResult":
         """Restrict to a contiguous range of genomes.
@@ -49,7 +59,8 @@ class RolloutResult:
         return RolloutResult(
             fitness=self.fitness[sl], cost=self.cost[ep], alive=self.alive[ep],
             leg_err=self.leg_err[ep], final_err=self.final_err[ep],
-            success=self.success[ep], saturation=self.saturation[ep], n_eps=E,
+            success=self.success[ep], saturation=self.saturation[ep],
+            effort=self.effort[ep], shaping=self.shaping[ep], n_eps=E,
         )
 
     @property
@@ -68,6 +79,7 @@ class RolloutResult:
             "success_rate": self.success_rate,
             "final_err": float(self.final_err.mean()),
             "saturation": float(self.saturation.mean()),
+            "effort": float(self.effort.mean()),
         }
         for i in range(self.leg_err.shape[1]):
             out[f"leg{chr(ord('A') + i)}_err"] = float(self.leg_err[:, i].mean())
@@ -116,6 +128,8 @@ class Rollout:
 
         cost = torch.zeros(B, dtype=sysm.dtype, device=sysm.device)
         sat = torch.zeros(B, dtype=sysm.dtype, device=sysm.device)
+        eff_acc = torch.zeros(B, dtype=sysm.dtype, device=sysm.device)
+        shp_acc = torch.zeros(B, dtype=sysm.dtype, device=sysm.device)
         alive = sysm.alive(s)
         leg_ends = task.leg_end_steps(T)
         leg_err = torch.zeros(B, task.n_legs, dtype=sysm.dtype, device=sysm.device)
@@ -130,9 +144,13 @@ class Rollout:
 
             err = sysm.task_position(s) - goal
             pos = torch.sqrt((err * err).sum(-1) + 1e-2)
-            live = pos + cfg.lambda_e * sysm.effort(u, s) + cfg.lambda_s * sysm.shaping_cost(s)
+            eff = sysm.effort(u, s)
+            shp = sysm.shaping_cost(s)
+            live = pos + cfg.lambda_e * eff + cfg.lambda_s * shp
             cost = cost + torch.where(alive, live, dead) * dt
             sat = sat + sysm.saturation(u, s)
+            eff_acc = eff_acc + eff
+            shp_acc = shp_acc + shp
 
             if t in leg_ends:
                 leg_err[:, leg_ends.index(t)] = err.norm(dim=-1)
@@ -147,6 +165,8 @@ class Rollout:
             final_err=(sysm.task_position(s) - final_goal).norm(dim=-1),
             success=task.success(s, final_goal) & alive,
             saturation=sat / T,
+            effort=eff_acc / T,
+            shaping=shp_acc / T,
             n_eps=E,
         )
 

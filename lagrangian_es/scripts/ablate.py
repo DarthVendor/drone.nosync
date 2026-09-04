@@ -47,6 +47,8 @@ def main():
     ap.add_argument("--strategy", default="es", choices=["es", "ga"])
     ap.add_argument("--sigma0", type=float, default=0.15)
     ap.add_argument("--eval-tasks", type=int, default=192)
+    ap.add_argument("--null-mode", default="cap", choices=["ridge", "cap"])
+    ap.add_argument("--ridge", type=float, default=1e-3)
     args = ap.parse_args()
 
     out = pathlib.Path(args.out)
@@ -67,7 +69,8 @@ def main():
                          seed=seed, rollout=RolloutCfg(n_eps=args.n_eps),
                          es=ESCfg(pop=args.pop, gens=args.gens, sigma0=args.sigma0,
                                   elite_frac=0.5, strategy=args.strategy, whiten=whiten,
-                                  metric_every=5, metric_states=96, ridge=1e-3))
+                                  metric_every=5, metric_states=96, ridge=args.ridge,
+                                  null_mode=args.null_mode))
             system, tr, task = build(cfg)
             t0 = time.time()
             res = train(cfg, system, tr, task)

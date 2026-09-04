@@ -76,6 +76,16 @@ class TwoLinkArm(LagrangianSystem):
         row1 = torch.stack([-m12 / det, m11 / det], dim=-1)
         return torch.stack([row0, row1], dim=-2)
 
+    def task_mass(self, s: State) -> Tensor:
+        """M(q) itself -- task space IS joint space here.  Because this varies,
+        kinetic shaping on the arm omits the Coriolis correction of the IDA-PBC
+        matching conditions and is an approximation; on the quadrotors, where M
+        is constant, the same law is exact."""
+        m11, m12, m22 = self._M(s["q"])
+        row0 = torch.stack([m11, m12], dim=-1)
+        row1 = torch.stack([m12, m22], dim=-1)
+        return torch.stack([row0, row1], dim=-2)
+
     def gravity_force(self, s: State) -> Tensor:
         """G(q): the joint torque that holds the arm against gravity."""
         q = s["q"]

@@ -36,3 +36,4 @@ es:
   metric_every: 5
   metric_states: 96
   ridge: 1.0e-3
+  null_mode: cap

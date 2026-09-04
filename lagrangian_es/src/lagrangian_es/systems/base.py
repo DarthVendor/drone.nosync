@@ -80,6 +80,25 @@ class LagrangianSystem(ABC):
         Must be vmap- and jacrev-safe.
         """
 
+    def task_mass(self, s: State) -> Tensor:
+        """M in TASK coordinates, [..., task_dim, task_dim].
+
+        Distinct from `inv_mass`, which is in generalized-FORCE coordinates: on
+        the quadrotor those are (thrust, torque) and 4-dimensional, while the
+        shaped potential lives in the 3-dimensional task space.  Only kinetic
+        shaping needs this, so the default derives it from `inv_mass` when the
+        two coordinate systems coincide and asks for an override otherwise.
+        """
+        if self.n_force != self.task_dim:
+            raise NotImplementedError(
+                f"{type(self).__name__}: task_dim={self.task_dim} != n_force={self.n_force}; "
+                "override task_mass() to use kinetic shaping on this plant."
+            )
+        Minv = self.inv_mass(s)
+        if not self.dense_mass:
+            Minv = torch.diag_embed(Minv)
+        return torch.linalg.inv(Minv)
+
     def allocator_init(self) -> Tensor:
         """[allocator_dim] prior for the allocator's own genome slots.
 

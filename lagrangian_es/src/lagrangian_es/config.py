@@ -43,12 +43,17 @@ class ESCfg:
     tournament_k: int = 3          # ga: tournament size
     crossover_rate: float = 0.7    # ga: probability a child is a recombination
     blx_alpha: float = 0.5         # ga: BLX-alpha interpolation slack
+    crossover_mode: str = "mixed"  # ga: "blx" | "segment" | "mixed"
+    segment_rate: float = 0.5      # ga: per-segment probability of taking parent B
 
     whiten: bool = True           # False => P = I, the isotropic baseline
     metric_every: int = 5         # generations between metric refreshes
     metric_states: int = 96       # states subsampled per refresh
     ridge: float = 1e-3           # added to normalized eigenvalues
-    null_mode: str = "ridge"      # "ridge" | "cap" -- see metric._precondition
+    null_mode: str = "cap"        # "ridge" | "cap" -- see metric._precondition.
+                                  # "cap" is the default because a small ridge
+                                  # amplifies G's null space and measurably
+                                  # HURTS; see README "What the ablation found".
     metric_sign: float = -1.0     # -1 = G^-1/2 (specified); +1 inverts it
 
 

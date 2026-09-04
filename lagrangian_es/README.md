@@ -94,6 +94,85 @@ Measured over 256 sampled states:
 The caveat is a row in a table rather than a footnote, and running the identical
 ES on the arm is what upgrades the narrow claim to the strong one.
 
+## Composable Lagrangians
+
+A genome does not decode to one fixed potential; it decodes to a **list of terms**
+contributing to a desired Lagrangian `L_d = T_d − V_d`, plus dissipation and
+path constraints:
+
+```
+F_des = g(q) − M·M_d⁻¹ · ( Σᵢ ∇Vᵢ(e, v, x) + K_d·ẋ )
+```
+
+The default list — three `GoalBowl`s and one `DissipationTerm` — reproduces the
+original fixed potential exactly, at the same 39 policy slots. That is the
+degenerate case: `T_d = T`, no constraint terms.
+
+**Why composition is safe.** Lagrangians add and the Euler-Lagrange operator is
+linear in `L`, so a conic combination of nonnegative terms superposes forces,
+`∇(ΣVᵢ) = Σ∇Vᵢ`, and preserves positive-definiteness about the goal. The
+"goal is the closed-loop equilibrium" invariant survives composition for free.
+
+| term | dim (d=3) | contributes | zero at goal |
+|---|---|---|---|
+| `GoalBowl` | 10 | pseudo-Huber `V`, bounded `∇V` | always |
+| `DissipationTerm` | 9 | Rayleigh `R = ½vᵀK_d v` | always |
+| `KineticShaping` | 9 | PSD block of `M_d` | always |
+| `ObstacleBarrier` | 2 | compact repulsion from a sphere | if goal clears it |
+| `JointLimitBarrier` | 2 | compact repulsion from a box | if goal clears it |
+
+**Certificates, not class constants.** Each term publishes what it actually
+promises (`psd`, `zero_at_goal`, `bounded_grad`), and `equilibrium_exact` is the
+*conjunction* of its terms' promises. Adding a barrier that overlaps the goal
+correctly withdraws the equilibrium claim instead of silently falsifying it —
+`test_conformance` reads the property and skips, which is the honest outcome.
+`equilibrium_exact_for(theta, goal)` gives the conditional answer.
+
+**Terms are crossover units.** `segments()` exposes term boundaries so whole
+terms can be swapped GP-style (`operators.segment_crossover`). This is safe
+*precisely because* each term preserves the invariant alone, and it is the
+structural recombination weight-level crossover cannot give you: unit 7 of one
+network has nothing to do with unit 7 of another, whereas a `GoalBowl` means the
+same thing in every genome.
+
+**Kinetic shaping and the constant-M caveat.** With `M_d = M + Σ W_kW_kᵀ` the law
+above has Lyapunov function `E_d = ½ẋᵀM_dẋ + V_d` with `Ė_d = −ẋᵀK_dẋ ≤ 0`. That
+derivation is **exact when M is constant** — which is the case on both quadrotors.
+On the arm, where `M(q)` varies, it drops the Coriolis correction the IDA-PBC
+matching conditions demand, so it is an approximation there. The same
+constant-vs-varying split that bounds the whitening claim bounds this one.
+
+## Constraints act at two levels
+
+**Path level** — a barrier term folded into `V_d`. It changes the commanded force,
+so it lives in `θ` and is whitened by `G` along with everything else.
+
+**Episode level** — attached to fitness, `L(θ,λ) = J(θ) + Σᵢ λᵢ(cᵢ(θ) − budgetᵢ)`.
+These change only selection pressure.
+
+**λ must not go inside θ.** A multiplier affects fitness, not the wrench, so
+`∂u/∂λ = 0` identically and λ contributes zero rows *and columns* to
+`G(θ) = E[(∂u/∂θ)ᵀM⁻¹(∂u/∂θ)]`. Put λ in the genome and the metric is exactly
+singular there, with the ridge silently doing all the work in the very
+coordinates meant to be searched — and it is silent, because the ridge keeps
+`eigh` well posed so nothing errors.
+`test_constraints.py::test_a_multiplier_inside_theta_would_zero_a_block_of_G`
+builds that wrong design on purpose and measures the zero block rather than
+asserting the claim in a comment.
+
+So multipliers are updated by dual ascent in the **outer loop**. Expect
+primal-dual oscillation: the multiplier keeps integrating through the dead time
+in which the population has already complied, overshoots, and rings.
+`PIDMultiplier` (Stooke et al. 2020) is the standard fix — classic dual ascent is
+exactly its integral term, so `kp = kd = 0` recovers it bit-for-bit, and the
+proportional term is what damps the ringing. In the repo's lagged-loop test it
+cuts overshoot from 28% to 15%.
+
+```python
+cs = ConstraintSet([CrashBudget(0.0), SaturationBudget(0.02)], multiplier="pid")
+train(cfg, system, trainable, task, constraints=cs)   # theta's dimension is unchanged
+```
+
 ## Search strategies
 
 Two loops over the same genome and the same whitened variation operator, so the
