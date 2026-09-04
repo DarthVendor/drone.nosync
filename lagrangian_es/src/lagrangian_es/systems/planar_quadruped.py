@@ -432,6 +432,40 @@ class PlanarQuadruped(LagrangianSystem):
     def saturation(self, u: Tensor, s: State) -> Tensor:
         return (u.abs() >= self.tau_max - 1e-6).to(u.dtype).mean(dim=-1)
 
+    def render_spec(self) -> dict:
+        """Trunk box plus eight leg segments, drawn in the sagittal plane.
+
+        The two hip attachment points carry two legs each -- the left/right pairs
+        of the real robot projected onto the plane -- so the near pair is drawn
+        lighter to keep them tellable apart.
+        """
+        bodies = [{"type": "box", "size": [0.50, 0.09], "shade": 1.0}]
+        for k in range(N_LEG):
+            shade = 1.0 if k % 2 == 0 else 0.62      # far pair / near pair
+            bodies.append({"type": "segment", "size": [self.l_thigh, 0.045],
+                           "shade": shade})
+            bodies.append({"type": "segment", "size": [self.l_shank, 0.035],
+                           "shade": shade})
+        return {"dim": 2, "ground": 0.0, "scale": 0.75, "bodies": bodies}
+
+    def render_poses(self, s: State) -> Tensor:
+        """[..., 9, 3] as (x, z, angle).
+
+        Link directions use u(phi) = (sin phi, -cos phi) -- phi = 0 points a leg
+        straight down -- while the renderer draws along (cos a, sin a), so the
+        leg angles are handed over as a = phi - pi/2.  The trunk's long axis is
+        already its body x, so its angle is the pitch unchanged.
+        """
+        q = s["q"]
+        kin = self._kin(q, torch.zeros_like(q))
+        pts, phi = kin["pts"][..., :N_BODY, :], kin["phi"]
+        ang = phi - 0.5 * torch.pi
+        ang = torch.cat([q[..., 2:3], ang[..., 1:]], dim=-1)     # trunk keeps pitch
+        return torch.cat([pts, ang[..., None]], dim=-1)
+
+    def render_extras(self, s: State) -> dict:
+        return {"feet": self.foot_positions(s), "contact": self.contact_forces(s)}
+
     def foot_positions(self, s: State) -> Tensor:
         """[..., 4, 2] -- for visualization and contact diagnostics."""
         return self._points(s["q"])[0][..., N_BODY:, :]

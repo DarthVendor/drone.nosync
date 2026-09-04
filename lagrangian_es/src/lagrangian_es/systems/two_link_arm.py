@@ -123,6 +123,24 @@ class TwoLinkArm(LagrangianSystem):
         return F_des
 
     # --- task space is joint space -----------------------------------------
+    def render_spec(self) -> dict:
+        return {"dim": 2, "ground": None, "scale": self.l1 + 1.0,
+                "bodies": [{"type": "segment", "size": [self.l1, 0.06]},
+                           {"type": "segment", "size": [self.l1, 0.05]}]}
+
+    def render_poses(self, s: State) -> Tensor:
+        q = s["q"]
+        th1 = q[..., 0]
+        th2 = q[..., 0] + q[..., 1]
+        c1, s1 = torch.cos(th1), torch.sin(th1)
+        c2, s2 = torch.cos(th2), torch.sin(th2)
+        p1 = torch.stack([self.lc1 * c1, self.lc1 * s1], dim=-1)
+        elbow = torch.stack([self.l1 * c1, self.l1 * s1], dim=-1)
+        p2 = elbow + torch.stack([self.lc2 * c2, self.lc2 * s2], dim=-1)
+        b1 = torch.cat([p1, th1[..., None]], dim=-1)
+        b2 = torch.cat([p2, th2[..., None]], dim=-1)
+        return torch.stack([b1, b2], dim=-2)                        # [..., 2, 3]
+
     def task_position(self, s: State) -> Tensor:
         return s["q"]
 

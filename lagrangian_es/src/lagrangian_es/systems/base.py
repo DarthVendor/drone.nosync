@@ -201,6 +201,38 @@ class LagrangianSystem(ABC):
         """Plant-specific regularizer, [...].  Default: zeros."""
         return torch.zeros_like(self.task_position(s)[..., 0])
 
+    # --- rendering ----------------------------------------------------------
+    def render_spec(self) -> dict:
+        """Static description of what to draw, plant-agnostic.
+
+        Keys:
+          `dim`     -- 2 or 3, the drawing space
+          `bodies`  -- one entry per rigid body: {type, size, ...}
+                       "quadrotor" (box + arms + rotors), "box", "segment"
+          `ground`  -- height of the ground plane, or None for no ground
+          `scale`   -- a representative length, for camera framing
+
+        The visualizer knows only this vocabulary, so a new plant becomes
+        drawable by describing itself rather than by editing the renderer.
+        """
+        raise NotImplementedError(f"{type(self).__name__} declares no render_spec")
+
+    def render_poses(self, s: State) -> Tensor:
+        """Body poses, [..., n_bodies, K].
+
+        K = 12 in 3-D: position (3) then the rotation matrix row-major (9).
+        K = 3  in 2-D: (x, z, angle), angle measured from +x.
+
+        Goals are drawn by pushing them through `nominal_state` and calling this,
+        so a ghost of the target configuration comes out for free on every plant.
+        """
+        raise NotImplementedError(f"{type(self).__name__} declares no render_poses")
+
+    def render_extras(self, s: State) -> dict:
+        """Optional per-frame overlays, e.g. {"feet": [..., k, 2],
+        "contact": [..., k]}.  Default: nothing."""
+        return {}
+
     # --- diagnostics --------------------------------------------------------
     def saturation(self, u: Tensor, s: State) -> Tensor:
         """Fraction of actuator channels at a bound, [...] in [0, 1].

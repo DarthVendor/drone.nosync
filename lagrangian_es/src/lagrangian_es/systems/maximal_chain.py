@@ -146,6 +146,15 @@ class MaximalChain(LagrangianSystem):
         tri = torch.triu(torch.ones(self.N, self.N, dtype=jt.dtype, device=jt.device))
         return self.g * self.m * (A * tri).sum(dim=-1)
 
+    def render_spec(self) -> dict:
+        return {"dim": 2, "ground": None, "scale": self.N * self.l * 0.6 + 0.6,
+                "bodies": [{"type": "segment", "size": [self.l, 0.06]}
+                           for _ in range(self.N)]}
+
+    def render_poses(self, s: State) -> Tensor:
+        """Maximal coordinates are already (x, z, angle) per body."""
+        return s["q"].reshape(s["q"].shape[:-1] + (self.N, 3))
+
     def allocate(self, F_des: Tensor, s: State, phi: Tensor) -> Tensor:
         return F_des
 

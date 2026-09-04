@@ -179,6 +179,15 @@ class QuadrotorSE3(LagrangianSystem):
         generation-0 prior crash rather than merely track poorly."""
         return self._t(self.phi0)
 
+    def render_spec(self) -> dict:
+        return {"dim": 3, "ground": 0.0, "scale": 1.0,
+                "bodies": [{"type": "quadrotor", "size": [0.17, 0.17, 0.045],
+                            "arm": 0.16, "rotor": 0.055}]}
+
+    def render_poses(self, s: State) -> Tensor:
+        R = s["R"].reshape(s["R"].shape[:-2] + (9,))
+        return torch.cat([s["p"], R], dim=-1).unsqueeze(-2)      # [..., 1, 12]
+
     def task_position(self, s: State) -> Tensor:
         return s["p"]
 

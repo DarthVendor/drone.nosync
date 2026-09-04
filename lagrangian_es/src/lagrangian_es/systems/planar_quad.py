@@ -95,6 +95,13 @@ class PlanarQuadrotor(LagrangianSystem):
         tau = (-kR * err - kW * s["om"]).clamp(-self.tau_max, self.tau_max)
         return torch.cat([f, tau], dim=-1)
 
+    def render_spec(self) -> dict:
+        return {"dim": 2, "ground": 0.0, "scale": 1.0,
+                "bodies": [{"type": "box", "size": [0.30, 0.07]}]}
+
+    def render_poses(self, s: State) -> Tensor:
+        return torch.cat([s["p"], s["th"]], dim=-1).unsqueeze(-2)   # [..., 1, 3]
+
     def task_position(self, s: State) -> Tensor:
         return s["p"]
 
