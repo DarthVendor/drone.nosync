@@ -71,7 +71,7 @@ def _pad3(g: Tensor) -> Tensor:
 
 
 def march(group, origin: Tensor, dirs: Tensor, f: State, max_range: float,
-          steps: int = 28, tol: float = 5e-3):
+          steps: int = 10, tol: float = 5e-3):
     """Sphere marching against a group's own signed distance function.
 
     This is what lets a new primitive be defined by `sdf` alone.  Groups with a
@@ -84,11 +84,17 @@ def march(group, origin: Tensor, dirs: Tensor, f: State, max_range: float,
     measurement, and the safe one, since a barrier built on it cannot become
     confident merely because a beam found nothing.
     """
-    t = torch.zeros(dirs.shape[:-1], dtype=origin.dtype, device=origin.device)
     o = origin[..., None, :]
+    # Start the march at the group's own bounding interval rather than at the ray
+    # origin.  Under vmap there is no early exit, so every ray pays for every
+    # step; concentrating those steps on the span that can actually contain a
+    # surface is what makes a marched primitive affordable next to the closed-form
+    # ones -- 10 steps across a ring's bounding sphere resolve better than 28
+    # across the whole sensor range.
+    t, t_max = group.ray_bounds(origin, dirs, f, max_range)
     for _ in range(steps):
         d = group.sdf(o + t[..., None] * dirs, f, extra=1)
-        t = torch.minimum(t + d.clamp_min(1e-3), torch.full_like(t, max_range))
+        t = torch.minimum(t + d.clamp_min(1e-3), t_max)
     end = o + t[..., None] * dirs
     hit = group.sdf(end, f, extra=1) < tol
     n = group.normal(end, f, extra=1)
@@ -128,6 +134,16 @@ class ObstacleGroup(ABC):
             g.append((self.sdf(p + d, f, extra) - self.sdf(p - d, f, extra)) / (2 * h))
         n = torch.stack(g, dim=-1)
         return n / n.norm(dim=-1, keepdim=True).clamp_min(EPS)
+
+    def ray_bounds(self, origin: Tensor, dirs: Tensor, f: State, max_range: float):
+        """(t_enter, t_exit) bracketing where this group could possibly be hit.
+
+        Default: the whole ray.  A group with compact geometry should narrow it,
+        because the marcher spends its fixed step budget inside this interval.
+        """
+        shp = dirs.shape[:-1]
+        return (torch.zeros(shp, dtype=origin.dtype, device=origin.device),
+                torch.full(shp, max_range, dtype=origin.dtype, device=origin.device))
 
     def raycast(self, origin: Tensor, dirs: Tensor, f: State, max_range: float):
         """(range [..., m], d_range/d_origin [..., m, 3]).

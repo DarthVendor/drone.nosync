@@ -105,7 +105,8 @@ def _log(rec, verbose, tag):
 # distribution-based ES
 # --------------------------------------------------------------------------- #
 def train_es(cfg, system, trainable, task, callback=None, verbose=False,
-             constraints=None, sensors=None, evaluator=None) -> TrainResult:
+             constraints=None, sensors=None, evaluator=None,
+             theta0=None) -> TrainResult:
     es, rc = cfg.es, cfg.rollout
     roll = Rollout(system, trainable, task, rc,
                    sensors if sensors is not None else build_sensors(cfg, system))
@@ -113,7 +114,14 @@ def train_es(cfg, system, trainable, task, callback=None, verbose=False,
     # traces still use the in-process rollout, which is what keeps the whole
     # thing bit-identical either way
     ev = evaluator or roll
-    theta = trainable.init()
+    # A warm start carries a genome in from an earlier curriculum stage.  It only
+    # means anything if the architecture is identical across stages -- the genome
+    # is an opaque vector, so a mismatched dimension is a silent reinterpretation
+    # rather than an error.
+    theta = trainable.init() if theta0 is None else theta0.clone()
+    if theta.shape[-1] != trainable.dim:
+        raise ValueError(f"warm start has {theta.shape[-1]} slots but this "
+                         f"trainable needs {trainable.dim}")
     sigma = es.sigma0
     P = identity_preconditioner(theta.shape[-1], theta.dtype, theta.device)
     history, t0 = [], time.time()
@@ -161,12 +169,16 @@ def train_es(cfg, system, trainable, task, callback=None, verbose=False,
 # genetic algorithm over a persistent population
 # --------------------------------------------------------------------------- #
 def train_ga(cfg, system, trainable, task, callback=None, verbose=False,
-             constraints=None, sensors=None, evaluator=None) -> TrainResult:
+             constraints=None, sensors=None, evaluator=None,
+             theta0=None) -> TrainResult:
     es, rc = cfg.es, cfg.rollout
     roll = Rollout(system, trainable, task, rc,
                    sensors if sensors is not None else build_sensors(cfg, system))
     ev = evaluator or roll
-    theta0 = trainable.init()
+    theta0 = trainable.init() if theta0 is None else theta0.clone()
+    if theta0.shape[-1] != trainable.dim:
+        raise ValueError(f"warm start has {theta0.shape[-1]} slots but this "
+                         f"trainable needs {trainable.dim}")
     sigma = es.sigma0
     P = identity_preconditioner(theta0.shape[-1], theta0.dtype, theta0.device)
 
@@ -234,7 +246,8 @@ _STRATEGIES = {"es": train_es, "ga": train_ga}
 
 def train(cfg: Config, system=None, trainable=None, task=None,
           callback: Optional[Callable] = None, verbose: bool = False,
-          constraints=None, sensors=None, evaluator=None) -> TrainResult:
+          constraints=None, sensors=None, evaluator=None,
+          theta0=None) -> TrainResult:
     """`constraints` is an optional `ConstraintSet`.  It is passed here rather
     than folded into the genome on purpose -- see `constraints.py` for why a
     multiplier inside theta silently rank-deficits the metric."""
@@ -244,4 +257,5 @@ def train(cfg: Config, system=None, trainable=None, task=None,
         raise KeyError(f"unknown strategy {cfg.es.strategy!r}; "
                        f"expected one of {sorted(_STRATEGIES)}")
     return _STRATEGIES[cfg.es.strategy](cfg, system, trainable, task, callback,
-                                        verbose, constraints, sensors, evaluator)
+                                        verbose, constraints, sensors, evaluator,
+                                        theta0)

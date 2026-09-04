@@ -419,6 +419,27 @@ class Hoops(ObstacleGroup):
         return {self._k("c"): c, self._k("a"): f[self._k("a")],
                 self._k("r"): f[self._k("r")], self._k("tilt"): f[self._k("tilt")]}
 
+    def ray_bounds(self, origin, dirs, f, max_range):
+        """Analytic bounding-sphere interval around the rings.
+
+        A torus has no cheap closed-form ray intersection, but its bounding
+        sphere does, and that is enough to tell the marcher where to spend its
+        steps.  Rays that miss every sphere get an empty interval and cost
+        nothing beyond the test.
+        """
+        c, _, r = self._fields(f, 1)
+        rad = (r + self.tube)[..., None, :] if r.dim() == 2 else r + self.tube
+        a = origin[..., None, None, :] - c
+        b = (a * dirs[..., :, None, :]).sum(-1)
+        disc = b * b - ((a * a).sum(-1) - rad * rad)
+        hit = disc > 0
+        root = torch.sqrt(disc.clamp_min(EPS))
+        t0 = torch.where(hit, (-b - root).clamp_min(0.0),
+                         torch.full_like(b, max_range))
+        t1 = torch.where(hit, (-b + root), torch.zeros_like(b))
+        return (t0.min(dim=-1).values.clamp(0.0, max_range),
+                t1.max(dim=-1).values.clamp(0.0, max_range))
+
     def render(self, f):
         return {"kind": "hoops", "c": f[self._k("c")], "a": f[self._k("a")],
                 "r": f[self._k("r")], "tube": self.tube}
