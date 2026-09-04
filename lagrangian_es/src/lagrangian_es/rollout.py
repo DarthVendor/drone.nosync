@@ -118,6 +118,7 @@ class Rollout:
         # 5-20 ms, vision at 30-80 ms, and collapsing them loses the very
         # timescale separation the allocator/potential split depends on.
         self.buffers = [DelayBuffer(s.latency_steps) for s in self.sensors]
+        self._held: dict = {}
         # The pullback Jacobian costs about as much as the projection itself, so
         # it is computed only when some term declares it consumes observations.
         self._needs_jac = any(getattr(t, "uses_obs", False)
@@ -133,10 +134,11 @@ class Rollout:
 
     # --- sensing ------------------------------------------------------------
     def _prime(self, s: State, gen) -> None:
+        self._held = {}
         for sen, buf in zip(self.sensors, self.buffers):
             buf.reset(sen.observe(s, gen))
 
-    def _observe(self, s: State, gen) -> dict:
+    def _observe(self, s: State, gen, step: int = 0) -> dict:
         """Delayed observations plus their pullback Jacobians.
 
         The MEASUREMENT is delayed; the Jacobian is evaluated at the current
@@ -148,9 +150,18 @@ class Rollout:
         """
         out = {}
         for sen, buf in zip(self.sensors, self.buffers):
-            out[sen.name] = buf.push(sen.observe(s, gen))
-            if self._needs_jac:
-                out[sen.name + "/J"] = sen.jacobian(s)
+            k = max(1, int(getattr(sen, "update_every", 1)))
+            if step % k == 0 or sen.name not in self._held:
+                fresh = sen.observe(s, gen)
+                jac = sen.jacobian(s) if self._needs_jac else None
+                self._held[sen.name] = (fresh, jac)
+            else:
+                fresh, jac = self._held[sen.name]
+            # the delay buffer still advances every step, so a strided sensor is
+            # stale by (stride - 1) steps on top of its own latency
+            out[sen.name] = buf.push(fresh)
+            if jac is not None:
+                out[sen.name + "/J"] = jac
         return out
 
     def _u(self, TH_b, s, goal, obs):
@@ -203,7 +214,7 @@ class Rollout:
         for t in range(T):
             goal = task.goal_for_leg(goals_b, leg) if arrival \
                 else task.goal_at(goals_b, t, T)
-            u = self._u(TH_b, s, goal, self._observe(s, sgen))
+            u = self._u(TH_b, s, goal, self._observe(s, sgen, t))
             s_new = sysm.step(s, u, dt, res_b)
             # crashed vehicles freeze; never integrate a diverged state
             s = tree_where(alive, s_new, s)
@@ -274,7 +285,7 @@ class Rollout:
         for t in range(T):
             goal = task.goal_for_leg(goals_b, leg) if arrival \
                 else task.goal_at(goals_b, t, T)
-            u = self._u(TH_b, s, goal, self._observe(s, sgen))
+            u = self._u(TH_b, s, goal, self._observe(s, sgen, t))
             s = tree_where(alive, sysm.step(s, u, dt, res_b), s)
             gs.append(goal)
             us.append(u)

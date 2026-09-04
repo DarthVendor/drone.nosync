@@ -22,6 +22,10 @@ class FullState(Sensor):
     kind = "position_like"
     name = "full_state"
     latency_steps = 0
+    #: Pinned to every step, unlike the physical sensors.  This is the identity
+    #: baseline -- the thing the no-sensor path must reproduce bit-for-bit -- so
+    #: striding it would quietly make it something other than the identity.
+    update_every = 1
 
     def __init__(self, system: LagrangianSystem, latency_steps: int = 0):
         self.system = system
@@ -42,6 +46,7 @@ class FullStateVelocity(Sensor):
 
     kind = "velocity_like"
     name = "full_state_velocity"
+    update_every = 1          # identity baseline; see FullState
 
     def __init__(self, system: LagrangianSystem, latency_steps: int = 0):
         self.system = system

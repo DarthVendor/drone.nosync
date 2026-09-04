@@ -64,6 +64,38 @@ def test_sensor_jacobian_is_finite(sysname, name):
     assert J.shape == (16, sen.obs_dim, system.task_dim)
 
 
+def test_default_stride_is_five_but_the_identity_is_not_strided():
+    """Physical sensors default to a 10 Hz refresh against a 50 Hz loop, which is
+    both realistic and 4-7x cheaper on ray-traced scenes.  `FullState` is pinned
+    to every step because it is the identity baseline the sensor-free path has to
+    reproduce bit-for-bit -- striding it would make it something else."""
+    system = make_system("quadrotor")
+    assert make_sensor("range", make_system("quadrotor_nav")).update_every == 5
+    assert make_sensor("landmark_camera", system).update_every == 5
+    assert make_sensor("noisy_position", system).update_every == 5
+    assert make_sensor("full_state", system).update_every == 1
+    assert make_sensor("full_state_velocity", system).update_every == 1
+
+
+def test_stride_holds_the_last_measurement():
+    """Between refreshes the controller sees the previous reading, not a fresh
+    one -- and that staleness has to actually change the flight, or the stride is
+    not doing anything."""
+    from lagrangian_es.tasks import make_task as _mt
+    system = make_system("quadrotor_nav", environment="pillars")
+    tr = make_trainable("nav_agent", system)
+    task = _mt("waypoint_pair", system, gating="arrival")
+    goals = task.sample(4, make_gen(0))
+    TH = tr.init()[None]
+    out = {}
+    for k in (1, 5):
+        sen = make_sensor("range", system, n_beams=12)
+        sen.update_every = k
+        out[k] = float(Rollout(system, tr, task, RolloutCfg(n_eps=4),
+                               [sen]).run(TH, goals, 3).fitness)
+    assert out[1] != out[5], "striding the sensor changed nothing"
+
+
 def test_range_sensor_needs_an_environment():
     assert not SENSORS["range"].supports(make_system("quadrotor"))
     assert SENSORS["range"].supports(make_system("quadrotor_nav"))

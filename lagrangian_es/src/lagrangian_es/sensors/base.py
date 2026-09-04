@@ -31,6 +31,27 @@ class Sensor(ABC):
 
     obs_dim: int = 0
     latency_steps: int = 0          # measured in SIM STEPS, not seconds
+
+    #: refresh the measurement every N control steps, holding the last reading in
+    #: between.  1 = every step.
+    #:
+    #: This is physical, not only a speed knob: a real camera runs at 30-60 Hz and
+    #: a ToF at 50-200 Hz against a loop that wants 250-500 Hz, so sensing at loop
+    #: rate is the unrealistic case.  A FIXED stride is also safer than the
+    #: difference-triggered skipping the spec describes, because latency stays
+    #: deterministic -- threshold skipping makes it state-dependent (little change
+    #: -> skip -> open-loop drift -> big change -> correction burst), which is a
+    #: limit-cycle generator that fires in hover.
+    #:
+    #: The held value is the last MEASUREMENT, not a dead-reckoned estimate; with
+    #: a large stride that staleness is a real cost the search will trade against
+    #: (fitness degrades 10.31 -> 11.66 going from every step to every tenth).
+    #:
+    #: Default 5.  At dt = 0.02 the control loop is 50 Hz, so this is a 10 Hz
+    #: sensor -- about right for a scanning lidar, and sensing at full loop rate
+    #: was the unphysical case.  It also costs: ray-traced scenes run 4.3x faster
+    #: at N=5, and a hoop course 6.8x faster at N=10.
+    update_every: int = 5
     kind: str = "position_like"     # 'position_like' | 'velocity_like' | 'range'
     name: str = "sensor"
 
@@ -106,7 +127,8 @@ class Sensor(ABC):
 
     def describe(self) -> dict:
         return {"sensor": type(self).__name__, "obs_dim": self.obs_dim,
-                "latency_steps": self.latency_steps, "kind": self.kind}
+                "latency_steps": self.latency_steps, "kind": self.kind,
+                "update_every": self.update_every}
 
     # --- rendering ----------------------------------------------------------
     def render_spec(self) -> Optional[dict]:
