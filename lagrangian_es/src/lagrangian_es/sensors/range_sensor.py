@@ -14,7 +14,7 @@ import torch
 from torch import Tensor
 
 from ..systems.base import State
-from ..systems.environment import EPS
+from ..environments import EPS
 from .base import Sensor
 
 TWO_PI = 2.0 * 3.141592653589793

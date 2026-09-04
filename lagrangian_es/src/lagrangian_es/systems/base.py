@@ -34,6 +34,18 @@ class LagrangianSystem(ABC):
     dtype: torch.dtype = torch.float64
     device: str = "cpu"
 
+    #: names of the task coordinates, for reporting and rendering.  Derived from
+    #: `task_dim` when not overridden -- a name lookup in the exporter silently
+    #: mislabels every plant it has not heard of, and a 3-D task labelled with two
+    #: names loses a whole axis of telemetry.
+    task_labels: tuple = ()
+
+    def labels(self) -> tuple:
+        if self.task_labels:
+            return tuple(self.task_labels)
+        return {1: ("q",), 2: ("x", "z"), 3: ("x", "y", "z")}.get(
+            self.task_dim, tuple(f"q{i + 1}" for i in range(self.task_dim)))
+
     # --- simulation ---------------------------------------------------------
     @abstractmethod
     def reset(self, B: int, gen: torch.Generator) -> State:

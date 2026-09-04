@@ -17,7 +17,7 @@ import torch
 from torch import Tensor
 
 from .base import State
-from .environment import Environment, Hoops, Mixture, make_environment
+from ..environments import Environment, Hoops, Mixture, make_environment
 from .quadrotor import QuadrotorSE3
 
 
@@ -25,7 +25,8 @@ class QuadrotorNav(QuadrotorSE3):
     state_keys = ("p", "v", "R", "om")          # plus the environment's own fields
 
     def __init__(self, environment: str = "pillars",
-                 env: Optional[Environment] = None, goal_margin: float = 0.30, **kw):
+                 env: Optional[Environment] = None, goal_margin: float = 0.30,
+                 free_start: bool = False, **kw):
         super().__init__(**kw)
         self.env = env if env is not None else make_environment(environment)
         self._env_keys: tuple = ()
@@ -37,6 +38,22 @@ class QuadrotorNav(QuadrotorSE3):
         # Always: hoops have to be placed ON the route, and every other group has
         # to be pushed OFF it.  Both need the goals, so both go through the hook.
         self.needs_course = bool(self.env.groups)
+        self.start_pool = None
+        if free_start:
+            self.use_free_start()
+
+    def use_free_start(self, n: int = 2048, margin: float = 0.45,
+                       extent: float = 3.0, z_range=(0.6, 1.6), seed: int = 999):
+        """Start episodes in free space rather than at the origin.
+
+        Needed for imported scenes, where the drawing's origin is very often
+        inside a wall and every episode would begin in collision.
+        """
+        from ..util import make_gen
+        self.start_pool = self.env.free_points(
+            n, make_gen(seed), extent=extent, margin=margin, z_range=z_range,
+            dtype=self.dtype, device=self.device)
+        return self
 
     # --- state carries the scene --------------------------------------------
     def reset(self, B: int, gen: torch.Generator) -> State:
@@ -44,6 +61,11 @@ class QuadrotorNav(QuadrotorSE3):
         field = self.env.sample(B, gen, self.dtype, self.device)
         self._env_keys = tuple(field)
         s.update(field)
+        if self.start_pool is not None:
+            # inside imported geometry the origin is very often a wall
+            idx = torch.randint(self.start_pool.shape[0], (B,), generator=gen)
+            s["p"] = self.start_pool[idx].clone()
+            s["v"] = torch.zeros_like(s["v"])
         return s
 
     def step(self, s: State, u: Tensor, dt: float, params: Tensor = None) -> State:

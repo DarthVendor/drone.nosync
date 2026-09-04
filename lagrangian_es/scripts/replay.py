@@ -176,7 +176,7 @@ def build_one(name, args):
            if k not in ("dim", "ground", "scale", "bodies")},
         "dt": rc.dt * stride, "n_frames": len(range(0, rc.ep_steps + 1, stride)),
         "switch_frac": 1.0 / task.n_legs,
-        "n_legs": task.n_legs, "task_labels": _labels(pre["system"]),
+        "n_legs": task.n_legs, "task_labels": list(system.labels()),
         "tol": tol,
         "runs": {"trained": capture(system, roll, res.theta, goals, 4243, stride,
                                     sensor),
@@ -189,13 +189,6 @@ def build_one(name, args):
         "genome": {"dim": trainable.dim, "policy": trainable.policy_dim,
                    "terms": [t.kind for t in getattr(trainable, "terms", [])]},
     }
-
-
-def _labels(system_name):
-    return {"quadrotor": ["x", "y", "z"],
-            "planar_quad": ["x", "z"],
-            "quadrotor_payload": ["x", "y", "z"],
-            "quadruped": ["x", "height", "pitch"]}.get(system_name, ["q1", "q2"])
 
 
 def main():

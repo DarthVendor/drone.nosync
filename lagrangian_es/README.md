@@ -460,6 +460,20 @@ train(cfg, system, trainable, task, constraints=cs)   # theta's dimension is unc
 
 ## Physical environments
 
+`environments/` is a **separate layer from `systems/`**, and the separation is
+enforced: a plant is a set of equations of motion, a scene is the world those
+equations move through, and `environments/` imports neither `systems/` nor
+anything above it (`test_lint_seam.py::test_environments_never_import_a_robot`).
+So a robot drops into any scene and a scene is reused by any robot.
+
+```
+environments/
+  base.py        ObstacleGroup ABC, Environment, Mixture, the SDF marcher
+  primitives.py  Pillars, Walls, Gate, Hoops
+  cad.py         DXF import -> StaticWalls / StaticPillars
+  __init__.py    registries, presets, mixtures, make_environment, load_dxf
+```
+
 A scene is a **list of obstacle groups**, exactly as a controller is a list of
 Lagrangian terms and a robot is a list of connectors:
 
@@ -505,6 +519,46 @@ different generators, so a gate can only be guaranteed to sit on the route if on
 is derived from the other: `place_course` puts hoop *k* on waypoint *k*, facing
 along the leg that reaches it, keeping the tilt the group already sampled. A gate
 the vehicle is not required to pass through is not a gate.
+
+### Importing CAD drawings
+
+A 2-D DXF floor plan is almost exactly the geometry this already models — the
+obstacle primitives are vertical extrusions, so a plan's walls and columns become
+`StaticWalls` and `StaticPillars` with no approximation beyond extruding upward.
+
+```python
+env = load_dxf("floor.dxf", fit=8.0)          # rescale so the plan spans 8 m
+sys = make_system("quadrotor_nav", env=env, free_start=True)
+task = make_task("free_space", sys, n_legs=2)
+```
+
+| DXF entity | becomes |
+|---|---|
+| `LINE` | one wall segment |
+| `LWPOLYLINE`, `POLYLINE` | a wall segment per span, closed loops included |
+| `CIRCLE` | a pillar |
+| `ARC` | segments along the arc |
+| `INSERT` | recursed into, so blocks are not silently dropped |
+
+`ezdxf` is used when installed, with a built-in ASCII reader covering the same
+entity types otherwise, so importing a plan is never a hard dependency.
+
+`fit` rescales so the drawing's largest dimension spans that many metres — which
+is what lets a plan drawn in millimetres be used without the caller knowing its
+units. Blocks matter more than they look: `INSERT` is everywhere in real drawings,
+and importing them as nothing yields a convincingly empty building.
+
+**Imported geometry never moves.** `clear_points` is a deliberate no-op on the
+static groups: a random obstacle field may be nudged aside to keep a waypoint
+reachable, but a building that dodges the drone is not that building any more. So
+the reverse applies — the *waypoints* move instead:
+
+- `Environment.free_points` rejection-samples positions with a required clearance,
+  and raises with a diagnosis (wrong scale, or a margin wider than every corridor)
+  rather than returning an empty tensor;
+- the `free_space` task draws waypoints from that pool;
+- `free_start=True` starts episodes there too, because a drawing's origin is very
+  often inside a wall and every episode would otherwise begin in collision.
 
 ### Does obstacle navigation generalize?
 

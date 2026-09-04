@@ -32,6 +32,7 @@ class TwoLinkArm(LagrangianSystem):
     allocator_dim = 0        # fully actuated: allocate is the identity
     dense_mass = True        # M(q) is not diagonal, and not constant
     state_keys = ("q", "dq")
+    task_labels = ("q1", "q2")
 
     def __init__(
         self,

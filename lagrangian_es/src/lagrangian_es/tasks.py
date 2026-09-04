@@ -13,7 +13,7 @@ import torch
 from torch import Tensor
 
 from .systems.base import LagrangianSystem, State
-from .util import uniform
+from .util import make_gen, uniform
 
 
 class Task(ABC):
@@ -167,8 +167,43 @@ class HoopCourse(Task):
         return goals[:, leg]
 
 
+class FreeSpaceWaypoints(Task):
+    """Waypoints drawn from the free space of a FIXED scene.
+
+    The counterpart to `place_course`: where a random obstacle field is nudged
+    aside to keep a waypoint reachable, imported geometry stays put and the
+    waypoints move instead -- a building that dodges the drone is not that
+    building any more.
+
+    The pool is precomputed once, because imported geometry is identical across
+    episodes and rejection sampling it per episode would be pure waste.
+    """
+
+    def __init__(self, system, n_legs: int = 2, pool: int = 4096,
+                 margin: float = 0.40, extent: float = 3.0,
+                 z_range=(1.0, 2.0), tol: float = 0.25, seed: int = 12345):
+        super().__init__(system)
+        self.n_legs = int(n_legs)
+        self.tol = float(tol)
+        env = getattr(system, "env", None)
+        if env is None:
+            raise ValueError("FreeSpaceWaypoints needs a plant with an environment")
+        self.pool = env.free_points(int(pool), make_gen(seed), extent=extent,
+                                    margin=margin, z_range=z_range,
+                                    dtype=system.dtype, device=system.device)
+
+    def sample(self, n: int, gen: torch.Generator) -> Tensor:
+        idx = torch.randint(self.pool.shape[0], (n, self.n_legs), generator=gen)
+        return self.pool[idx]
+
+    def goal_at(self, goals: Tensor, t: int, ep_steps: int) -> Tensor:
+        leg = min(t * self.n_legs // ep_steps, self.n_legs - 1)
+        return goals[:, leg]
+
+
 TASKS: Dict[str, Type[Task]] = {
     "base_pose": BasePose,
+    "free_space": FreeSpaceWaypoints,
     "hoop_course": HoopCourse,
     "waypoint_pair": WaypointPair,
     "joint_target": JointTarget,

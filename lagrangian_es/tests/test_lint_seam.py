@@ -48,6 +48,17 @@ def test_generic_modules_stay_plant_agnostic(fname, label, pattern):
     )
 
 
+def test_environments_never_import_a_robot():
+    """The world and the robot stay separable: a plant may be dropped into any
+    scene and a scene reused by any plant, which only holds if the scene layer
+    knows nothing about plants."""
+    for path in (SRC / "environments").glob("*.py"):
+        code = _strip_comments(path.read_text())
+        for forbidden in ("systems", "trainables", "sensors", "rollout"):
+            assert not re.search(rf"\bfrom\s+\.\.{forbidden}\b", code), \
+                f"environments/{path.name} imports from {forbidden}/"
+
+
 def test_systems_never_import_trainables():
     """`systems/` must not depend on `trainables/`; if a cycle appears, the seam
     is in the wrong place."""
@@ -68,8 +79,8 @@ def test_trainables_never_import_upward():
 def test_dependency_order_is_acyclic():
     """Build order: config, util -> systems -> trainables -> tasks -> rollout ->
     metric -> operators -> es -> evaluate -> viz."""
-    order = ["config", "util", "systems", "trainables", "tasks", "rollout",
-             "metric", "operators", "es", "evaluate", "viz"]
+    order = ["config", "util", "environments", "systems", "sensors", "trainables",
+             "tasks", "rollout", "metric", "operators", "es", "evaluate", "viz"]
     rank = {name: i for i, name in enumerate(order)}
     for name, i in rank.items():
         path = SRC / f"{name}.py"

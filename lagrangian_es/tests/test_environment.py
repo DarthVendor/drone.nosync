@@ -8,7 +8,7 @@ from lagrangian_es.config import RolloutCfg
 from lagrangian_es.rollout import Rollout
 from lagrangian_es.sensors import make_sensor
 from lagrangian_es.systems import make_system
-from lagrangian_es.systems.environment import (
+from lagrangian_es.environments import (
     GROUPS, PRESETS, Environment, Hoops, Pillars, Walls, make_environment,
     make_group,
 )
@@ -250,7 +250,7 @@ def test_clearing_is_a_no_op_when_nothing_overlaps():
 def test_gate_inherits_clearance_not_just_geometry():
     """`Gate` borrows `sdf`/`raycast` from `Pillars` by assignment; it originally
     kept the base class's no-op `clear_points` and silently swallowed waypoints."""
-    from lagrangian_es.systems.environment import Gate, Pillars
+    from lagrangian_es.environments import Gate, Pillars
     assert Gate.clear_points is Pillars.clear_points
 
 
@@ -258,7 +258,7 @@ def test_gate_inherits_clearance_not_just_geometry():
 # compositional mixtures
 # --------------------------------------------------------------------------- #
 def test_mixture_activates_the_right_number_of_regimes():
-    from lagrangian_es.systems.environment import MIXTURES
+    from lagrangian_es.environments import MIXTURES
     for name, (lo, hi) in MIXTURES.items():
         env = make_environment(name)
         f = env.sample(512, make_gen(0), DT, "cpu")

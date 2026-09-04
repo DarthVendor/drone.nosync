@@ -1,0 +1,37 @@
+# Flying inside an imported CAD floor plan.
+#
+# The environment is built in code rather than named here, because it comes from
+# a file:
+#
+#   from lagrangian_es.environments import load_dxf
+#   env  = load_dxf("floor.dxf", fit=8.0)
+#   sys  = make_system("quadrotor_nav", env=env, free_start=True)
+#   task = make_task("free_space", sys, n_legs=2, margin=0.4, extent=3.5)
+#
+# `free_start` and the `free_space` task exist because imported geometry does not
+# move: a building cannot be nudged aside to make a waypoint reachable, so both
+# the start pose and the waypoints are drawn from the plan's own free space.
+system: quadrotor_nav
+trainable: energy_shaping
+task: free_space
+sensors: [range]
+seed: 0
+
+rollout:
+  dt: 0.02
+  ep_steps: 250
+  n_eps: 8
+  lambda_e: 0.02
+  lambda_s: 0.20
+  pos_eps: 1.0e-2
+  dead_cost: 5.0
+
+es:
+  pop: 48
+  gens: 100
+  sigma0: 0.15
+  elite_frac: 0.5
+  strategy: ga
+  whiten: true
+  metric_every: 5
+  null_mode: cap

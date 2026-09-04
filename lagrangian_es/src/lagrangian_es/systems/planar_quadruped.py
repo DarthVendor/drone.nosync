@@ -65,6 +65,7 @@ class PlanarQuadruped(LagrangianSystem):
     allocator_dim = 4        # posture kp, kd, wrench ridge, contact sharpness
     dense_mass = True
     state_keys = ("q", "dq", "lam")
+    task_labels = ("x", "height", "pitch")
     n_feet = N_LEG
 
     def __init__(
