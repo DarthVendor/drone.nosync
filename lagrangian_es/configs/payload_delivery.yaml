@@ -1,0 +1,37 @@
+# Quadrotor carrying a slung package on a unilateral cable.
+#
+# The package is an unactuated pendulum hanging off the very body being
+# positioned, so aggressive tracking excites a swing that then drags the vehicle.
+# `lambda_s` scores tilt AND swing: "arrive fast" and "arrive with the package
+# still" are different objectives, and the shaping weight is what says so.
+#
+# dt is 0.008 rather than the bare drone's 0.02 because the cable constraint and
+# the ~1.35 s pendulum both want resolving; ep_steps is raised to match so the
+# episode is still the 5 s the waypoint task needs.  Halving dt without raising
+# ep_steps silently turns a 5 s task into a 1 s one, which nothing can track.
+system: quadrotor_payload
+trainable: quadrotor_agent
+task: waypoint_pair
+seed: 0
+dtype: float64
+
+rollout:
+  dt: 0.008
+  ep_steps: 625          # 5.0 s
+  n_eps: 8
+  lambda_e: 0.02
+  lambda_s: 0.08         # tilt + swing
+  pos_eps: 1.0e-2
+  dead_cost: 5.0
+
+es:
+  pop: 48
+  gens: 60
+  sigma0: 0.15
+  elite_frac: 0.5
+  strategy: ga
+  whiten: true
+  metric_every: 5
+  metric_states: 96
+  ridge: 1.0e-3
+  null_mode: cap

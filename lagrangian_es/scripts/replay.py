@@ -39,6 +39,11 @@ PRESETS = {
                                    lambda_s=0.05, lambda_r=0.05, pos_eps=1e-6,
                                    dead_cost=3.0),
                       gens=40, pop=32, stride=2),
+    "quadrotor_payload": dict(system="quadrotor_payload", trainable="quadrotor_agent",
+                             task="waypoint_pair", label="Quadrotor + slung package",
+                             rollout=dict(dt=0.008, ep_steps=625, n_eps=8,
+                                          lambda_s=0.08),
+                             gens=60, pop=48, stride=3),
     "two_link_arm": dict(system="two_link_arm", trainable="arm_agent",
                          task="joint_pair", label="Two-link arm (minimal coords)",
                          rollout=dict(dt=0.01, ep_steps=300, n_eps=8, lambda_e=0.01,
@@ -46,7 +51,7 @@ PRESETS = {
                          gens=40, pop=48, stride=1),
     "maximal_chain": dict(system="maximal_chain", trainable="arm_agent",
                           task="joint_pair", label="Two-link chain (maximal coords)",
-                          rollout=dict(dt=0.002, ep_steps=400, n_eps=8, lambda_e=0.01,
+                          rollout=dict(dt=0.005, ep_steps=600, n_eps=8, lambda_e=0.01,
                                        lambda_s=0.0, pos_eps=1e-4),
                           gens=40, pop=48, stride=2),
 }
@@ -60,6 +65,7 @@ def capture(system, roll, theta, goals, seed, stride=1):
     tr = roll.trace(theta[None], goals, seed)
     T, B = tr.goals.shape[0], tr.goals.shape[1]
     poses = system.render_poses(tr.states)                    # [T+1, B, nb, K]
+    task = system.task_position(tr.states)                    # [T+1, B, task_dim]
     extras = system.render_extras(tr.states)
     sel = list(range(0, T + 1, stride))
     alive_sel = [min(i, T - 1) for i in sel]
@@ -68,6 +74,7 @@ def capture(system, roll, theta, goals, seed, stride=1):
         ghost = system.render_poses(
             system.nominal_state(goals[b], torch.zeros_like(goals[b])))
         rec = {"pose": _r(poses[sel, b]),
+               "task": _r(task[sel, b], 4),
                "alive": [int(tr.alive[i, b]) for i in alive_sel],
                "goal_pose": _r(ghost),
                "goal_task": _r(goals[b], 4)}
@@ -92,7 +99,7 @@ def build_one(name, args):
     res = train(cfg, system, trainable, task)
     theta0 = trainable.init()
 
-    tol = 0.25 if pre["system"] == "quadrotor" else 0.05
+    tol = 0.25 if pre["system"].startswith("quadrotor") else 0.05
     ev_t = evaluate(system, trainable, task, res.theta, rc, n_tasks=128, tol=tol)
     ev_0 = evaluate(system, trainable, task, theta0, rc, n_tasks=128, tol=tol)
 
@@ -105,6 +112,10 @@ def build_one(name, args):
         "system": pre["system"], "trainable": pre["trainable"], "task": pre["task"],
         "dim": spec["dim"], "ground": spec["ground"], "scale": spec["scale"],
         "bodies": spec["bodies"],
+        # optional keys a plant may add (e.g. "cables"); copied generically so a
+        # new render hint does not need an exporter edit
+        **{k: v for k, v in spec.items()
+           if k not in ("dim", "ground", "scale", "bodies")},
         "dt": rc.dt * stride, "n_frames": len(range(0, rc.ep_steps + 1, stride)),
         "switch_frac": 0.5 if task.n_legs > 1 else 1.0,
         "n_legs": task.n_legs, "task_labels": _labels(pre["system"]),
@@ -122,6 +133,7 @@ def build_one(name, args):
 def _labels(system_name):
     return {"quadrotor": ["x", "y", "z"],
             "planar_quad": ["x", "z"],
+            "quadrotor_payload": ["x", "y", "z"],
             "quadruped": ["x", "height", "pitch"]}.get(system_name, ["q1", "q2"])
 
 

@@ -314,13 +314,59 @@ model and can only learn a correction on top of it.
   measures it. This is why `null_mode="cap"` is the default: it treats an
   uninformative direction isotropically instead of amplifying it by `ridge^(-1/2)`.
 
+## Connection joints: attaching things to robots
+
+Packages, tools and tethers are attached through the same constraint layer. A
+connector joins an attachment point on a carrier to a payload body on the shared
+generalized velocity `w = [v | ω | v_load]`, contributing rows to one KKT solve —
+so **adding a package is a change of constraints, not a change of dynamics code**.
+
+| connector | rows | kind | rest offset |
+|---|---|---|---|
+| `RigidLink` | 3 | bilateral weld | at the attachment |
+| `Cable` | 1 | **unilateral** — taut only | hangs at length L |
+| `SpringCable` | 0 | compliant force, no multiplier | hangs at length L |
+
+The unilateral case is the interesting one, and it is the same machinery as foot
+contact for the same reason: **a rope pulls but cannot push**, so its multiplier
+must be one-signed. A bilateral distance constraint would hold the package *up*
+when slack — not a small modelling error but a different machine. Activation is a
+smooth function of slack, so the rope engages continuously at the moment it snaps
+taut, which matters because `allocate` is differentiated through it.
+
+```python
+sys = make_system("quadrotor_payload", connector="cable",
+                  payload_mass=0.15, cable_length=0.45)
+```
+
+Verified in `test_connectors.py`: a taut cable holds **0.45000 m** exactly with
+the drone at **1.00000 m**; a `SpringCable` stretches by `mg/k` to within 2e-4; a
+weld sits at 0.00000; a slack rope lets the package fall freely instead of
+pushing it; and free fall with a swinging package conserves energy to **0.15%**,
+confirming the constraint is workless.
+
+Two details that bite if you skip them:
+
+- **`rest_offset`.** Each connector declares where its payload sits at rest, so
+  `reset` and `nominal_state` start *on* the constraint manifold. Hanging a
+  welded payload at cable length instead violates the weld by 0.43 m at t=0, and
+  Baumgarte then yanks it into place — visibly jolting the carrier.
+- **`gravity_force` returns `(m_drone + Σm_load)·g`.** A controller compensating
+  only its own mass sags under the package from the first timestep, and would
+  spend the entire search rediscovering a constant it was never given.
+
+A slung load is also a genuinely hard control problem — an unactuated pendulum
+hanging off the body you are trying to position — which is why `shaping_cost`
+scores tilt *and* swing: "arrive fast" and "arrive with the package still" are
+different objectives.
+
 ## Constraints act at three levels
 
 Putting it together, the same idea appears three times and the distinctions matter:
 
 | level | where λ lives | how λ is obtained | in θ? |
 |---|---|---|---|
-| **dynamics** | KKT system (`holonomic.py`) | *solved* — algebraic consequence of `c(q)=0` | no |
+| **dynamics** | KKT system (`holonomic.py`, `connectors.py`) | *solved* — algebraic consequence of `c(q)=0` | no |
 | **path** | barrier term in `V_d` | no multiplier; soft, in the potential | **yes** |
 | **episode** | fitness (`constraints.py`) | *ascended* — dual step in the outer loop | no |
 

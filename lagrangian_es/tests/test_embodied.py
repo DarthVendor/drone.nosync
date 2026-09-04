@@ -88,16 +88,20 @@ def test_envelope_barrier_withdraws_only_the_unconditional_claim(sysname, agent)
     tr = make_trainable(agent, system)
     assert tr.equilibrium_exact is False
     theta = tr.init()
-    # a goal in the middle of the envelope keeps the claim
-    if sysname == "quadrotor":
-        safe = torch.tensor([0.0, 0.0, 2.0], dtype=DT)
-    elif sysname == "planar_quad":
-        safe = torch.tensor([0.0, 2.0], dtype=DT)
-    elif sysname == "quadruped":
-        safe = torch.tensor([0.0, system.stand_height, 0.0], dtype=DT)
-    else:
-        safe = torch.zeros(system.task_dim, dtype=DT)
-    assert tr.equilibrium_exact_for(theta, safe) is True
+    # Ask the barrier where its own interior is, rather than tabulating a safe
+    # goal per plant.  Note the resting pose is NOT automatically clear: the
+    # drone sits 0.45 m above its floor with a 0.35 m barrier margin, so takeoff
+    # legitimately happens inside the barrier -- that is what it is for.
+    bar = tr.terms[-1]
+    sl = tr.term_slices(theta)[-1]
+    margin = float(bar._margin(sl[..., 1]))
+    lo = torch.tensor(bar.lo_t, dtype=DT)
+    hi = torch.tensor(bar.hi_t, dtype=DT)
+    rest = system.task_position(system.reset(1, make_gen(0)))[0]
+    safe = torch.max(torch.min(rest, hi - 2 * margin), lo + 2 * margin)
+    assert tr.equilibrium_exact_for(theta, safe) is True, (
+        f"{sysname}: goal {safe.tolist()} should clear "
+        f"lo={bar.lo_t} hi={bar.hi_t} margin={margin:.3f}")
 
 
 def test_quadrotor_agent_ground_barrier_is_inert_in_normal_flight():
