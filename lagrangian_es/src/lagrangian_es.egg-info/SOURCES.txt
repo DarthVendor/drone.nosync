@@ -1,0 +1,13 @@
+pyproject.toml
+src/lagrangian_es/__init__.py
+src/lagrangian_es/config.py
+src/lagrangian_es/util.py
+src/lagrangian_es.egg-info/PKG-INFO
+src/lagrangian_es.egg-info/SOURCES.txt
+src/lagrangian_es.egg-info/dependency_links.txt
+src/lagrangian_es.egg-info/requires.txt
+src/lagrangian_es.egg-info/top_level.txt
+src/lagrangian_es/systems/__init__.py
+src/lagrangian_es/systems/base.py
+src/lagrangian_es/systems/quadrotor.py
+src/lagrangian_es/systems/so3.py

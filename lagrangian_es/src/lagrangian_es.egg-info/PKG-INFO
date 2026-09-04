@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: lagrangian-es
+Version: 0.2.0
+Summary: Physics-whitened evolution strategies for underactuated control
+Requires-Python: >=3.10
+Requires-Dist: torch>=2.2
+Requires-Dist: matplotlib
+Requires-Dist: pyyaml
+Requires-Dist: pytest

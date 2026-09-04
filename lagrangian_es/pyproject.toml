@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lagrangian-es"
+version = "0.2.0"
+description = "Physics-whitened evolution strategies for underactuated control"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.2", "matplotlib", "pyyaml", "pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
