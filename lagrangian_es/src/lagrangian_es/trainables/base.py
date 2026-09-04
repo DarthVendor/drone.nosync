@@ -42,12 +42,27 @@ class Trainable(ABC):
 
     @property
     def dim(self) -> int:
-        return self.policy_dim + self.system.allocator_dim
+        return (self.policy_dim + self.system.allocator_dim
+                + self.system.residual_dim)
+
+    def residual_slice(self, theta: Tensor):
+        """The learned-dynamics tail of the genome, or None if the plant has none.
+
+        Note what this implies for the metric: residual parameters change the
+        PLANT, not the controller map, so du/dtheta is zero on them exactly as it
+        is for an episode-level multiplier.  They contribute a zero block to G.
+        With `null_mode="cap"` that block is treated isotropically, which is the
+        right default; with a small ridge it would instead be amplified.
+        """
+        r = self.system.residual_dim
+        return theta[..., -r:] if r else None
 
     def split(self, theta: Tensor):
         """(policy slice, allocator slice).  Trailing-dim indexed, so it works
         batched or under vmap."""
-        return theta[..., : self.policy_dim], theta[..., self.policy_dim :]
+        a = self.system.allocator_dim
+        return (theta[..., : self.policy_dim],
+                theta[..., self.policy_dim : self.policy_dim + a])
 
     def segments(self):
         """Crossover-safe blocks of the genome, as slices.

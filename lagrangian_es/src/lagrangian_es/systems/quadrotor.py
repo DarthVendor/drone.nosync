@@ -81,8 +81,10 @@ class QuadrotorSE3(LagrangianSystem):
         R = rodrigues(self.reset_att_noise * torch.randn(B, 3, **kw))
         return {"p": p, "v": v, "R": R, "om": om}
 
-    def step(self, s: State, u: Tensor, dt: float) -> State:
-        """Semi-implicit Euler on SE(3).  Pure: builds a fresh dict."""
+    def step(self, s: State, u: Tensor, dt: float, params: Tensor = None) -> State:
+        """Semi-implicit Euler on SE(3).  Pure: builds a fresh dict.
+
+        `params` is unused: this plant declares no learned residual."""
         f = u[..., 0].clamp(self.f_min, self.f_max)          # safety clamp; the
         tau = u[..., 1:4].clamp(-self.tau_max, self.tau_max)  # allocator clamps too
 

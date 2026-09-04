@@ -34,13 +34,15 @@ class FixedPD(Trainable):
         ]
         if self.system.allocator_dim:
             parts.append(self.system.allocator_init())
+        if self.system.residual_dim:
+            parts.append(self.system.residual_init())
         return torch.cat(parts, dim=0)
 
     def forward(self, theta: Tensor, s: State, goal: Tensor) -> Tensor:
         sysm = self.system
         kp = theta[..., : self.d] ** 2
         kd = theta[..., self.d : 2 * self.d] ** 2
-        phi = theta[..., self.policy_dim :]
+        _, phi = self.split(theta)
         e = sysm.task_position(s) - goal
         F_des = sysm.gravity_force(s) - kp * e - kd * sysm.task_velocity(s)
         return sysm.allocate(F_des, s, phi)

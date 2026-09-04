@@ -97,7 +97,42 @@ class JointPair(JointTarget):
         return goals[:, 0] if t < ep_steps // 2 else goals[:, 1]
 
 
+class BasePose(Task):
+    """Floating-base pose targets for a legged robot: (x, height, pitch).
+
+    Squat, shift and lean while keeping the feet planted -- a balance task rather
+    than a locomotion one.  The mid-episode re-target is the same structure as
+    `WaypointPair`: a step input applied to an already-moving multi-body system,
+    which is where a controller that merely reaches the first pose falls apart.
+
+    Not walking.  Gaits need a contact schedule and swing-leg tracking on top of
+    this, which is a separate piece of machinery -- see README, "What the
+    quadruped does and does not do".
+    """
+
+    n_legs = 2
+
+    def __init__(self, system, x_range: float = 0.08, z_lo: float = 0.28,
+                 z_hi: float = 0.40, pitch: float = 0.12, tol: float = 0.03):
+        super().__init__(system)
+        if system.task_dim != 3:
+            raise ValueError(f"BasePose needs task_dim 3, got {system.task_dim}")
+        self.x_range, self.z_lo, self.z_hi = float(x_range), float(z_lo), float(z_hi)
+        self.pitch, self.tol = float(pitch), float(tol)
+
+    def sample(self, n: int, gen: torch.Generator) -> Tensor:
+        kw = dict(gen=gen, dtype=self.system.dtype, device=self.system.device)
+        x = uniform((n, self.n_legs, 1), -self.x_range, self.x_range, **kw)
+        z = uniform((n, self.n_legs, 1), self.z_lo, self.z_hi, **kw)
+        th = uniform((n, self.n_legs, 1), -self.pitch, self.pitch, **kw)
+        return torch.cat([x, z, th], dim=-1)
+
+    def goal_at(self, goals: Tensor, t: int, ep_steps: int) -> Tensor:
+        return goals[:, 0] if t < ep_steps // 2 else goals[:, 1]
+
+
 TASKS: Dict[str, Type[Task]] = {
+    "base_pose": BasePose,
     "waypoint_pair": WaypointPair,
     "joint_target": JointTarget,
     "joint_pair": JointPair,

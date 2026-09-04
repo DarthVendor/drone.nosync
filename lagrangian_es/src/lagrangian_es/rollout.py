@@ -116,14 +116,16 @@ class Rollout:
         s = tree_repeat(s, P)                        # ... reused by every genome
         TH_b = TH.repeat_interleave(E, dim=0)        # index = member * E + episode
         goals_b = goals.repeat(P, 1, 1)
-        return s, TH_b, goals_b, P, E
+        # learned-dynamics residual, if the plant declares one
+        res_b = self.trainable.residual_slice(TH_b)
+        return s, TH_b, goals_b, res_b, P, E
 
     # --- the hot path ------------------------------------------------------
     @torch.no_grad()
     def run(self, TH: Tensor, goals: Tensor, seed: int) -> RolloutResult:
         sysm, task, cfg = self.system, self.task, self.cfg
         T, dt = cfg.ep_steps, cfg.dt
-        s, TH_b, goals_b, P, E = self._expand(TH, goals, seed)
+        s, TH_b, goals_b, res_b, P, E = self._expand(TH, goals, seed)
         B = P * E
 
         cost = torch.zeros(B, dtype=sysm.dtype, device=sysm.device)
@@ -138,15 +140,17 @@ class Rollout:
         for t in range(T):
             goal = task.goal_at(goals_b, t, T)
             u = self.forward_batch(TH_b, s, goal)
-            s_new = sysm.step(s, u, dt)
+            s_new = sysm.step(s, u, dt, res_b)
             # crashed vehicles freeze; never integrate a diverged state
             s = tree_where(alive, s_new, s)
 
             err = sysm.task_position(s) - goal
-            pos = torch.sqrt((err * err).sum(-1) + 1e-2)
+            pos = torch.sqrt((err * err).sum(-1) + cfg.pos_eps)
             eff = sysm.effort(u, s)
             shp = sysm.shaping_cost(s)
             live = pos + cfg.lambda_e * eff + cfg.lambda_s * shp
+            if res_b is not None:
+                live = live + cfg.lambda_r * sysm.residual_penalty(res_b)
             cost = cost + torch.where(alive, live, dead) * dt
             sat = sat + sysm.saturation(u, s)
             eff_acc = eff_acc + eff
@@ -177,14 +181,14 @@ class Rollout:
         path allocates no trace buffers."""
         sysm, task, cfg = self.system, self.task, self.cfg
         T, dt = cfg.ep_steps, cfg.dt
-        s, TH_b, goals_b, P, E = self._expand(TH, goals, seed)
+        s, TH_b, goals_b, res_b, P, E = self._expand(TH, goals, seed)
 
         alive = sysm.alive(s)
         states, gs, us, al = [s], [], [], []
         for t in range(T):
             goal = task.goal_at(goals_b, t, T)
             u = self.forward_batch(TH_b, s, goal)
-            s = tree_where(alive, sysm.step(s, u, dt), s)
+            s = tree_where(alive, sysm.step(s, u, dt, res_b), s)
             gs.append(goal)
             us.append(u)
             al.append(alive)

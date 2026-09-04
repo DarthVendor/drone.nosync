@@ -75,7 +75,7 @@ class MLPPolicy(Trainable):
         return (g("W1", (self.n_in, self.h)), g("b1", (self.h,)),
                 g("W2", (self.h, self.h)), g("b2", (self.h,)),
                 g("W3", (self.h, self.d)), g("b3", (self.d,)),
-                theta[..., self.policy_dim:])
+                self.split(theta)[1])
 
     def init(self) -> Tensor:
         """Small random weights: the net starts near zero output, so the initial
@@ -92,6 +92,8 @@ class MLPPolicy(Trainable):
         flat = torch.cat(parts, dim=0)
         if self.system.allocator_dim:
             flat = torch.cat([flat, self.system.allocator_init()], dim=0)
+        if self.system.residual_dim:
+            flat = torch.cat([flat, self.system.residual_init()], dim=0)
         return flat
 
     def forward(self, theta: Tensor, s: State, goal: Tensor) -> Tensor:

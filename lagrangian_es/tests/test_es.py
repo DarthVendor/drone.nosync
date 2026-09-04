@@ -182,7 +182,8 @@ def test_common_random_numbers_within_a_generation():
     system, tr, task = build(cfg)
     roll = Rollout(system, tr, task, cfg.rollout)
     goals = task.sample(3, make_gen(2))
-    s, TH_b, goals_b, P, E = roll._expand(torch.zeros(4, tr.dim, dtype=DT), goals, 7)
+    s, TH_b, goals_b, res_b, P, E = roll._expand(
+        torch.zeros(4, tr.dim, dtype=DT), goals, 7)
     assert P == 4 and E == 3
     for k, v in s.items():
         base = v[:E]

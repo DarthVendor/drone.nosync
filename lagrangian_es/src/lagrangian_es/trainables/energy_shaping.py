@@ -49,12 +49,20 @@ class EnergyShaping(Trainable):
         terms: Optional[Sequence[LagrangianTerm]] = None,
         n_bowls: int = 3,
         w0: float = 1.0,
-        a0: float = 1.0,
-        d0: float = 1.2,
+        a0: float = None,
+        d0: float = None,
     ):
         super().__init__(system)
         self.d = int(system.task_dim)
         if terms is None:
+            # Size the prior to the plant: stiffness sum_k w^2 A^T A = n_bowls*a0^2
+            # should match the system's suggested m*omega_n^2, and damping should
+            # give a mildly underdamped closed loop (zeta ~ 0.6).
+            K = float(system.potential_scale())
+            if a0 is None:
+                a0 = (K / max(n_bowls, 1)) ** 0.5
+            if d0 is None:
+                d0 = float(system.damping_scale()) ** 0.5   # K_d = D D^T = d0^2 I
             terms = [GoalBowl(self.d, w0=w0, a0=a0) for _ in range(n_bowls)]
             terms = list(terms) + [DissipationTerm(self.d, d0=d0)]
         self.terms: List[LagrangianTerm] = list(terms)
@@ -86,14 +94,19 @@ class EnergyShaping(Trainable):
         would not.
         """
         segs = [slice(a, b) for a, b in self._bounds]
-        if self.system.allocator_dim:
-            segs.append(slice(self.policy_dim, self.dim))
+        a = self.system.allocator_dim
+        if a:
+            segs.append(slice(self.policy_dim, self.policy_dim + a))
+        if self.system.residual_dim:
+            segs.append(slice(self.policy_dim + a, self.dim))
         return segs
 
     def init(self) -> Tensor:
         parts = [t.init(self.dtype, self.device) for t in self.terms]
         if self.system.allocator_dim:
             parts.append(self.system.allocator_init())
+        if self.system.residual_dim:
+            parts.append(self.system.residual_init())
         return torch.cat(parts, dim=0)
 
     # --- what the composition promises --------------------------------------
@@ -195,7 +208,8 @@ class EnergyShaping(Trainable):
             bracket = torch.einsum("...ij,...j->...i", A.transpose(-1, -2), bracket)
 
         F_des = sysm.gravity_force(s) - bracket
-        return sysm.allocate(F_des, s, theta[..., self.policy_dim:])
+        _, phi = self.split(theta)
+        return sysm.allocate(F_des, s, phi)
 
     # --- reporting ----------------------------------------------------------
     def describe(self, theta: Tensor) -> dict:
@@ -210,7 +224,7 @@ class EnergyShaping(Trainable):
                        K_aniso=float(ks[-1] / ks[0].clamp_min(1e-12)),
                        Kd_min=float(kd[0]), Kd_max=float(kd[-1]),
                        n_terms=len(self.terms))
-            phi = theta[..., self.policy_dim:]
+            _, phi = self.split(theta)
             if phi.numel() >= 6:
                 out["kR"] = float((phi[:3] ** 2).mean())
                 out["kW"] = float((phi[3:6] ** 2).mean())

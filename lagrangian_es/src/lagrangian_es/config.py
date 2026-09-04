@@ -18,6 +18,11 @@ class RolloutCfg:
     n_eps: int = 2                # episodes per genome; shared across population
     lambda_e: float = 0.02        # effort weight
     lambda_s: float = 0.10        # plant-specific shaping weight
+    lambda_r: float = 0.05        # learned-residual regularizer weight
+    pos_eps: float = 1e-2         # smoothing floor in sqrt(|e|^2 + eps).
+                                  # MUST be << the task's error scale: at 1e-2
+                                  # a plant with 0.1 m errors has a nearly flat
+                                  # objective (0.100 -> 0.141 across the task).
     dead_cost: float = 5.0        # per-second cost accrued by a crashed vehicle
 
 

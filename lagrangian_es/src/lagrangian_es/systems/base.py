@@ -27,6 +27,7 @@ class LagrangianSystem(ABC):
     n_force: int = 0          # dim of the generalized force u
     task_dim: int = 0         # dim of the space the shaped potential lives on
     allocator_dim: int = 0    # genome slots the allocator needs (0 if fully actuated)
+    residual_dim: int = 0     # genome slots for a LEARNED DYNAMICS residual (0 = none)
     dense_mass: bool = False  # False => inv_mass returns [..., n_force] (diagonal)
     state_keys: tuple = ()    # documentation only; nothing downstream reads it
 
@@ -39,8 +40,13 @@ class LagrangianSystem(ABC):
         """Initial state batch of size B, drawn from `gen`."""
 
     @abstractmethod
-    def step(self, s: State, u: Tensor, dt: float) -> State:
-        """One integration step.  Pure -- must not mutate `s`.  u: [..., n_force]."""
+    def step(self, s: State, u: Tensor, dt: float, params: Tensor = None) -> State:
+        """One integration step.  Pure -- must not mutate `s`.  u: [..., n_force].
+
+        `params` [..., residual_dim] carries the learned dynamics residual when the
+        plant declares one.  It is passed in rather than stored so `step` stays
+        pure, and it is ignored by plants with `residual_dim == 0`.
+        """
 
     @abstractmethod
     def alive(self, s: State) -> Tensor:
@@ -98,6 +104,49 @@ class LagrangianSystem(ABC):
         if not self.dense_mass:
             Minv = torch.diag_embed(Minv)
         return torch.linalg.inv(Minv)
+
+    def residual_init(self) -> Tensor:
+        """[residual_dim] prior for the learned residual.
+
+        Should start at the value that makes the residual IDENTICALLY ZERO, so a
+        hybrid model begins as the pure constraint model and learns only the
+        correction on top of it.
+        """
+        return torch.zeros(self.residual_dim, dtype=self.dtype, device=self.device)
+
+    def residual_penalty(self, params: Tensor) -> Tensor:
+        """Regularizer on the learned residual, [...].
+
+        Co-evolving plant parameters against the controller's own reward is
+        reward hacking unless something holds the plant honest: left free, the
+        residual will happily invent forces that make the task easier.  This
+        penalty is the minimum safeguard; identifying the residual against
+        reference data is the real answer.  See README, "Hybrid contact".
+        """
+        if params is None or self.residual_dim == 0:
+            return torch.zeros((), dtype=self.dtype, device=self.device)
+        return (params * params).sum(dim=-1)
+
+    def potential_scale(self) -> float:
+        """Suggested closed-loop stiffness for the shaped potential, m*omega_n^2.
+
+        The system owns this for the same reason it owns the allocator prior: a
+        stiffness sized for one plant's mass is meaningless on another's, and a
+        prior that is three orders of magnitude too soft does not "fly badly", it
+        fails to respond at all.  Default 3.0 reproduces the quadrotor's
+        calibration (0.5 kg at omega_n ~ 2.4 rad/s).
+        """
+        return 3.0
+
+    def damping_scale(self) -> float:
+        """Suggested closed-loop damping K_d for the shaped potential.
+
+        Returned directly rather than derived from a damping ratio, so a plant's
+        calibration is exact rather than reconstructed: the quadrotor's 1.44 is a
+        measured prototype value and the whole benchmark's difficulty is pinned to
+        it.  Roughly 2*zeta*sqrt(K*m) with zeta ~ 0.6.
+        """
+        return 1.44
 
     def allocator_init(self) -> Tensor:
         """[allocator_dim] prior for the allocator's own genome slots.

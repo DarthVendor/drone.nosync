@@ -142,7 +142,119 @@ On the arm, where `M(q)` varies, it drops the Coriolis correction the IDA-PBC
 matching conditions demand, so it is an approximation there. The same
 constant-vs-varying split that bounds the whitening claim bounds this one.
 
-## Constraints act at two levels
+## Multi-body robots: the quadruped
+
+`PlanarQuadruped` is a sagittal-plane "robot dog": a floating trunk plus four
+two-link legs.
+
+```
+q = [x, z, pitch,  (hip, knee) x 4]     11 coordinates, only 8 actuated
+```
+
+Three things make it qualitatively harder than the drone, and all three are what
+the abstractions were built for:
+
+| | quadrotor | quadruped |
+|---|---|---|
+| `M(q)` | constant in the body frame | dense, 11x11, strongly configuration-dependent |
+| unactuated DOF | 1 (thrust direction) | 3 — the base has **no actuators at all** |
+| contact | none | four feet, made and broken |
+
+Dynamics are assembled in closed form, not by autograd: for a planar tree every
+body's absolute angle is a fixed linear function of `q`, so `M`, the bias force
+and every Jacobian follow analytically. That matters for the central claim —
+nothing in the plant is ever handed to autograd, so the search stays gradient-free
+with respect to the dynamics.
+
+## Coupling through Lagrange constraints
+
+Coupling is expressed as constraints on the Lagrangian rather than penalty forces
+bolted onto it. For `c(q) = 0`,
+
+```
+[  M   -Jᵀ ] [ q̈ ]   [ Sᵀτ - b            ]
+[  J    E  ] [ λ ] = [ -J̇q̇ - Baumgarte   ]
+```
+
+and **λ is the coupling force**. The ground reaction is a multiplier, not a
+spring constant's side effect — `contact_forces(s)` returns it directly.
+
+Two terms earn their place on the second row. `E` is a compliance block: four
+feet on flat ground over-determine a planar base, so the *hard* system is
+genuinely rank-deficient and would fail without it. Baumgarte stabilization pulls
+position drift back, since enforcing a constraint at the acceleration level
+otherwise integrates error forever. Unilateral rows are gated by a smooth
+activation that scales the compliance, so a foot **releases continuously rather
+than switching** — continuity matters because `allocate` is jacrev'd through
+touchdown.
+
+`holonomic.py` carries the couplings minimal coordinates cannot express: contact,
+closed loops, and deliberate joint couplings (`JointCoupling`, e.g. binding
+diagonal legs into a trot).
+
+### Both coordinate formulations
+
+Joint coupling between links needs no constraint in minimal coordinates — the
+joints are already implicit in `q`. `MaximalChain` does it the other way: each
+link carries its own `(x, z, θ)` and the joints *are* pin-joint constraints. Same
+physics, and the comparison makes a point the project needs:
+
+| | minimal (`TwoLinkArm`) | maximal (`MaximalChain`) |
+|---|---|---|
+| `M` | dense, configuration-dependent | **constant**, block-diagonal |
+| velocity-product terms | Coriolis + centrifugal | **none** — each link is a free body |
+| coupling | implicit in the coordinates | 2N constraint rows |
+
+Measured agreement between the two independent implementations: gravity torques
+to **3.6e-15**, constrained inverse inertia to **8.9e-9**.
+
+So *"M(q) varies"* is a statement about **coordinates**, not about physics. The
+invariant object is the constrained inverse inertia
+`P = M⁻¹ − M⁻¹Jᵀ(JM⁻¹Jᵀ)⁻¹JM⁻¹`, which is what a generalized force actually sees.
+Its relative spread across configurations is **1.1331 in both formulations** —
+identical. That is the quantity the mechanical metric should be built from.
+
+### Hybrid contact: constraint + learned residual
+
+The constraint layer gets the physics approximately right for free, but it *is*
+an approximation, in four identifiable ways: finite compliance, Baumgarte
+position drift, friction lagged by one step, and no impact law at touchdown.
+Those errors are systematic and state-dependent — exactly what a small learned
+penalty absorbs well, and exactly what a multiplier cannot, since the multiplier
+is pinned by the constraint it enforces.
+
+So the two are complementary. Enable with `learned_contact=True`; the plant then
+declares `residual_dim = 4`, the genome grows by four slots, and the residual is
+initialized at **exactly zero** so the hybrid *starts* as the pure constraint
+model and can only learn a correction on top of it.
+
+**Two caveats, both structural rather than stylistic:**
+
+- Co-evolving plant parameters against the controller's own reward is reward
+  hacking. Left free, the residual will invent forces that make the task easier.
+  `residual_penalty` (weight `lambda_r`) is the minimum safeguard; identifying the
+  residual against reference data is the real answer.
+- Residual parameters change the **plant**, not the controller map, so
+  `∂u/∂θ = 0` on them — they contribute a zero block to `G`, exactly as an
+  episode-level multiplier would. `test_residual_params_form_a_zero_block_in_G`
+  measures it. This is why `null_mode="cap"` is the default: it treats an
+  uninformative direction isotropically instead of amplifying it by `ridge^(-1/2)`.
+
+## Constraints act at three levels
+
+Putting it together, the same idea appears three times and the distinctions matter:
+
+| level | where λ lives | how λ is obtained | in θ? |
+|---|---|---|---|
+| **dynamics** | KKT system (`holonomic.py`) | *solved* — algebraic consequence of `c(q)=0` | no |
+| **path** | barrier term in `V_d` | no multiplier; soft, in the potential | **yes** |
+| **episode** | fitness (`constraints.py`) | *ascended* — dual step in the outer loop | no |
+
+Only the path-level constraint belongs in the genome, because only it changes the
+commanded force. The other two are searched by nothing and solved or ascended
+instead.
+
+### The two multiplier levels in detail
 
 **Path level** — a barrier term folded into `V_d`. It changes the commanded force,
 so it lives in `θ` and is whitened by `G` along with everything else.

@@ -1,0 +1,36 @@
+# Planar quadruped: balance and pose tracking with constraint-based contact.
+#
+# NOT locomotion.  Gaits need a contact schedule and swing-leg tracking on top of
+# this; see README, "What the quadruped does and does not do".
+#
+# Note the cost weights.  `pos_eps` is 1e-6 rather than the drone's 1e-2: the
+# smoothing floor must be far below the task's error scale, and at 1e-2 a plant
+# with 0.1 m errors has a nearly flat objective (0.100 -> 0.141 across the whole
+# task), which no amount of search will fix.
+system: quadruped
+trainable: energy_shaping
+task: base_pose
+seed: 0
+dtype: float64
+
+rollout:
+  dt: 0.002
+  ep_steps: 500
+  n_eps: 4
+  lambda_e: 2.0e-4
+  lambda_s: 0.05
+  lambda_r: 0.05          # regularizes the learned contact residual
+  pos_eps: 1.0e-6
+  dead_cost: 3.0
+
+es:
+  pop: 32
+  gens: 40
+  sigma0: 0.15
+  elite_frac: 0.5
+  strategy: ga
+  whiten: true
+  metric_every: 5
+  metric_states: 96
+  ridge: 1.0e-3
+  null_mode: cap

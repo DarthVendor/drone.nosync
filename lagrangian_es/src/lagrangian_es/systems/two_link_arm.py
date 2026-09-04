@@ -105,7 +105,7 @@ class TwoLinkArm(LagrangianSystem):
         return {"q": self.reset_noise * torch.randn(B, 2, **kw),
                 "dq": self.reset_noise * torch.randn(B, 2, **kw)}
 
-    def step(self, s: State, u: Tensor, dt: float) -> State:
+    def step(self, s: State, u: Tensor, dt: float, params: Tensor = None) -> State:
         tau = u.clamp(-self.tau_max, self.tau_max)
         q, dq = s["q"], s["dq"]
         rhs = tau - self._coriolis(q, dq) - self.gravity_force(s)

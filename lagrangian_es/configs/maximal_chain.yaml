@@ -1,0 +1,13 @@
+# The same two-link chain as arm_transfer.yaml, in MAXIMAL coordinates with the
+# joints enforced as pin-joint Lagrange constraints.  Running both is the point:
+# M is dense and configuration-dependent in one and constant in the other, while
+# the constrained inverse inertia -- what the metric is actually built from --
+# is identical.
+system: maximal_chain
+trainable: energy_shaping
+task: joint_pair
+seed: 0
+rollout: {dt: 0.002, ep_steps: 400, n_eps: 8, lambda_e: 0.01, lambda_s: 0.0,
+          pos_eps: 1.0e-4, dead_cost: 5.0}
+es: {pop: 48, gens: 60, sigma0: 0.15, elite_frac: 0.5, strategy: es,
+     whiten: true, metric_every: 5, metric_states: 96, ridge: 1.0e-3, null_mode: cap}

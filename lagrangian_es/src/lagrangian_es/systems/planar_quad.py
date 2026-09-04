@@ -47,7 +47,7 @@ class PlanarQuadrotor(LagrangianSystem):
                 "th": self.reset_noise * torch.randn(B, 1, **kw),
                 "om": self.reset_noise * torch.randn(B, 1, **kw)}
 
-    def step(self, s: State, u: Tensor, dt: float) -> State:
+    def step(self, s: State, u: Tensor, dt: float, params: Tensor = None) -> State:
         f = u[..., 0:1].clamp(self.f_min, self.f_max)
         tau = u[..., 1:2].clamp(-self.tau_max, self.tau_max)
         th = s["th"]
