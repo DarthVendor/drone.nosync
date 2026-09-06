@@ -101,6 +101,51 @@ class Trace:
     goals: Tensor               # [T, B, task_dim]
     us: Tensor                  # [T, B, n_force]
     alive: Tensor               # [T, B] -- alive *entering* each step
+    legs: Tensor                # [T, B] -- which waypoint was the target.
+                                # Under arrival gating this advances on ARRIVAL,
+                                # so a replay cannot infer it from the frame
+                                # index: two episodes of the same length sit on
+                                # different legs at the same instant, and a
+                                # crashed one never advances again.
+
+
+class ChargeMemory:
+    """Ring buffer of world-frame sensor returns.
+
+    Fixed shape and a step index that never depends on tensor values, so it stays
+    vmap-safe.  Misses are written too, carrying weight zero: dropping them
+    instead would make the write length depend on the data and break the shape.
+    """
+
+    def __init__(self, slots: int = 96):
+        self.slots = int(slots)
+        self.p: Optional[Tensor] = None
+        self.w: Optional[Tensor] = None
+        self.i = 0
+
+    def reset(self) -> None:
+        self.p, self.w, self.i = None, None, 0
+
+    def write(self, hit: Tensor, seen: Tensor) -> None:
+        B, n, d = hit.shape
+        # a strided sensor hands back a held reading whose batch may be narrower
+        # than the state's; the weights must line up with the points
+        if seen.shape[0] != B:
+            seen = seen.expand(B, *seen.shape[1:])
+        if self.p is None or self.p.shape[0] != B:
+            self.p = torch.zeros(B, self.slots, d, dtype=hit.dtype,
+                                 device=hit.device)
+            self.w = torch.zeros(B, self.slots, dtype=hit.dtype,
+                                 device=hit.device)
+            self.i = 0
+        idx = (torch.arange(n, device=hit.device) + self.i) % self.slots
+        # out-of-place: the buffer is read inside the vmapped controller map
+        self.p = self.p.index_copy(1, idx, hit)
+        self.w = self.w.index_copy(1, idx, seen)
+        self.i = (self.i + n) % self.slots
+
+    def read(self):
+        return self.p, self.w
 
 
 class Rollout:
@@ -123,6 +168,15 @@ class Rollout:
         # it is computed only when some term declares it consumes observations.
         self._needs_jac = any(getattr(t, "uses_obs", False)
                               for t in getattr(trainable, "terms", ()))
+        # A harmonic obstacle field needs its charges FIXED in the world frame.
+        # Body-fixed beams re-aim as the vehicle moves, so a potential written as
+        # a function of range is a field of sliding sources and is not harmonic
+        # (measured: lap V = 69.4 sliding vs 0.004 frozen, same beams).  Freezing
+        # them is the whole fix, so the memory lives here.
+        self._needs_charges = any(getattr(t, "needs_charges", False)
+                                  for t in getattr(trainable, "terms", ()))
+        self.charge_mem = ChargeMemory(cfg.charge_slots) if self._needs_charges \
+            else None
         for sen in self.sensors:
             sen.crn_group = cfg.n_eps          # noise shared across the population
         # in_dims: every batch entry carries its own genome, state, goal (and obs).
@@ -135,6 +189,8 @@ class Rollout:
     # --- sensing ------------------------------------------------------------
     def _prime(self, s: State, gen) -> None:
         self._held = {}
+        if self.charge_mem is not None:
+            self.charge_mem.reset()
         for sen, buf in zip(self.sensors, self.buffers):
             buf.reset(sen.observe(s, gen))
 
@@ -162,6 +218,16 @@ class Rollout:
             out[sen.name] = buf.push(fresh)
             if jac is not None:
                 out[sen.name + "/J"] = jac
+                if self.charge_mem is not None and sen.kind == "range":
+                    # J = d(range)/d(x) = -beam direction, so the return landed at
+                    # x + d*u = x - d*J.  Recorded in WORLD coordinates and kept,
+                    # which is what makes the resulting field harmonic.
+                    x = self.system.task_position(s)
+                    hit = x[..., None, :] - jac * fresh[..., None]
+                    seen = (fresh < sen.max_range * 0.98).to(fresh.dtype)
+                    self.charge_mem.write(hit, seen)
+        if self.charge_mem is not None:
+            out["charges"], out["charge_w"] = self.charge_mem.read()
         return out
 
     def _u(self, TH_b, s, goal, obs):
@@ -203,6 +269,18 @@ class Rollout:
         arrival = getattr(task, "gating", "time") == "arrival"
         leg = torch.zeros(B, dtype=torch.long, device=sysm.device)
         finish = torch.full((B,), float(T), dtype=sysm.dtype, device=sysm.device)
+        # The final leg never advances `leg`, so its arrival test keeps firing for
+        # every step the vehicle sits inside tol -- paying the bonus per step
+        # would make hovering on the goal an unbounded reward.  Credit it once.
+        paid_last = torch.zeros(B, dtype=torch.bool, device=sysm.device)
+        credits = torch.zeros(B, dtype=sysm.dtype, device=sysm.device)
+        frozen_dead = cfg.dead_mode == "frozen"
+        forfeit_dead = cfg.dead_mode == "forfeit"
+        # what the episode owed before it moved: a crash is charged this, so the
+        # progress it made is handed back and dying late buys nothing
+        start_err = torch.sqrt(
+            ((sysm.task_position(s) - task.goal_for_leg(goals_b, leg))
+             ** 2).sum(-1) + cfg.pos_eps) if forfeit_dead else None
 
         # Sensor noise joins common random numbers: one stream per generation,
         # drawn per episode and tiled across the population.  Without this,
@@ -226,10 +304,17 @@ class Rollout:
             live = pos + cfg.lambda_e * eff + cfg.lambda_s * shp
             if res_b is not None:
                 live = live + cfg.lambda_r * sysm.residual_penalty(res_b)
-            cost = cost + torch.where(alive, live, dead) * dt
-            sat = sat + sysm.saturation(u, s)
-            eff_acc = eff_acc + eff
-            shp_acc = shp_acc + shp
+            # in-place: this runs under no_grad, and the accumulators were each
+            # allocating a fresh [B] tensor on every one of 250 steps
+            # A dead vehicle is frozen at its crash site, so under "frozen" it
+            # keeps paying the position term from there and needs no constant of
+            # its own.  Effort and shaping are dropped: it is not actuating.
+            charge = (pos if frozen_dead
+                      else start_err if forfeit_dead else dead)
+            cost.add_(torch.where(alive, live, charge), alpha=dt)
+            sat.add_(sysm.saturation(u, s))
+            eff_acc.add_(eff)
+            shp_acc.add_(shp)
 
             if arrival:
                 # advance only on ARRIVAL, so reaching a waypoint early buys a
@@ -239,6 +324,12 @@ class Rollout:
                 last = leg >= task.n_legs - 1
                 finish = torch.where(reached & last & (finish >= T),
                                      torch.full_like(finish, float(t)), finish)
+                if cfg.goal_bonus:
+                    # An intermediate leg can only be credited once because
+                    # reaching it advances `leg`; the last one needs `paid_last`.
+                    hit = (reached & ~last) | (reached & last & ~paid_last)
+                    credits.add_(hit.to(sysm.dtype))
+                    paid_last = paid_last | (reached & last)
                 leg = torch.where(reached & ~last, leg + 1, leg)
             elif t in leg_ends:
                 leg_err[:, leg_ends.index(t)] = err.norm(dim=-1)
@@ -246,6 +337,13 @@ class Rollout:
 
         final_goal = task.goal_for_leg(goals_b, leg) if arrival \
             else task.goal_at(goals_b, T - 1, T)
+        # Bonus is paid at the END, and only to survivors.  Crediting it on
+        # contact instead would make "touch the goal, then crash" score almost as
+        # well as completing the task -- fitness would improve while `success`,
+        # which requires being alive, fell.  An objective that disagrees with the
+        # metric it is judged by reads exactly like a plateau.
+        if cfg.goal_bonus:
+            cost.sub_(credits * alive.to(sysm.dtype), alpha=cfg.goal_bonus)
         done = (finish < T) if arrival else task.success(s, final_goal)
         if arrival:
             leg_err[:, -1] = (sysm.task_position(s) - final_goal).norm(dim=-1)
@@ -281,7 +379,7 @@ class Rollout:
         # shows a different flight from the one that was scored
         arrival = getattr(task, "gating", "time") == "arrival"
         leg = torch.zeros(goals_b.shape[0], dtype=torch.long, device=sysm.device)
-        states, gs, us, al = [s], [], [], []
+        states, gs, us, al, lg = [s], [], [], [], []
         for t in range(T):
             goal = task.goal_for_leg(goals_b, leg) if arrival \
                 else task.goal_at(goals_b, t, T)
@@ -290,6 +388,7 @@ class Rollout:
             gs.append(goal)
             us.append(u)
             al.append(alive)
+            lg.append(leg.clone())
             states.append(s)
             if arrival:
                 err = (sysm.task_position(s) - goal).norm(dim=-1)
@@ -301,6 +400,7 @@ class Rollout:
             goals=torch.stack(gs),
             us=torch.stack(us),
             alive=torch.stack(al),
+            legs=torch.stack(lg),
         )
 
 

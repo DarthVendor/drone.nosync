@@ -159,3 +159,49 @@ def test_arm_metric_is_state_dependent_but_quadrotor_metric_is_not():
     assert float(spread) > 0.1, "arm M^-1 should vary substantially with configuration"
     cond = arm.mass_condition(sa)
     assert float(cond.max() / cond.min()) > 3.0
+
+
+def test_metric_sees_sensor_consuming_terms():
+    """G must be built from the SAME map the rollout flies.
+
+    `trainable.forward` takes `obs` when sensors are present.  Differentiating it
+    without them is not a harmless simplification: every sensor term returns zero,
+    so all of its slots are EXACTLY null in G and the preconditioner extrapolates
+    over them.  Measured with `obs` withheld, a 499-slot learned genome gave an
+    effective rank of 6 -- the allocator alone.
+    """
+    import torch
+    from lagrangian_es.config import Config, ESCfg, RolloutCfg
+    from lagrangian_es.es import build, build_sensors
+    from lagrangian_es.metric import physics_metric
+    from lagrangian_es.rollout import Rollout
+    from lagrangian_es.trainables import make_trainable
+    from lagrangian_es.trainables.sensor_terms import RangeBarrier
+    from lagrangian_es.trainables.terms import DissipationTerm, GoalBowl
+    from lagrangian_es.util import make_gen
+
+    cfg = Config(system="quadrotor_nav", trainable="energy_shaping",
+                 task="waypoint_pair", environment="pillars", sensors=("range",),
+                 gating="arrival", rollout=RolloutCfg(n_eps=2),
+                 es=ESCfg(pop=4, gens=1))
+    system, _, task = build(cfg)
+    sens = build_sensors(cfg, system)
+    d = system.task_dim
+    # a genome whose ONLY non-allocator slots need obs, so the failure is stark
+    tr = make_trainable(cfg.trainable, system,
+                        terms=[GoalBowl(d), DissipationTerm(d),
+                               RangeBarrier(d, "range", 12, w0=1.2)])
+    roll = Rollout(system, tr, task, cfg.rollout, sens)
+    goals = task.sample(cfg.rollout.n_eps, make_gen(1))
+    m = physics_metric(system, tr, tr.init(), goals, cfg.rollout, 7,
+                       n_states=128, ridge=1e-3, null_mode="cap", roll=roll)
+
+    # the barrier owns the 3 slots just before the allocator
+    off = sum(t.dim for t in tr.terms[:-1])
+    bar = slice(off, off + tr.terms[-1].dim)
+    block = m.G[bar, bar]
+    assert float(block.abs().max()) > 1e-12, \
+        "G is blind to the range barrier: obs was not passed to forward()"
+    lam = m.eigs / m.eigs.max().clamp_min(1e-300)
+    assert int((lam > 1e-8).sum()) > (tr.dim - tr.policy_dim), \
+        "effective rank no larger than the allocator alone"

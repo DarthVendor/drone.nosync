@@ -172,3 +172,45 @@ def test_payload_covers_every_overlay(payload):
     for need in ("landmark_camera", "range", "obstacles", "cable", "feet",
                  "dim2", "dim3"):
         assert need in kinds, f"no case exercises {need}"
+
+
+def test_trace_legs_advance_on_arrival_not_on_a_timer():
+    """The replay's target ghost is driven by Trace.legs.
+
+    If it were derived from the frame index instead, every episode would switch
+    target at the same instant regardless of what it did -- a fast run would be
+    shown chasing a gate it already cleared, and a crashed one would keep
+    advancing through a course it is no longer flying.
+    """
+    import torch
+    from lagrangian_es.config import RolloutCfg
+    from lagrangian_es.rollout import Rollout
+    from lagrangian_es.systems import make_system
+    from lagrangian_es.tasks import make_task
+    from lagrangian_es.trainables import make_trainable
+    from lagrangian_es.util import make_gen
+
+    system = make_system("quadrotor", dtype=torch.float64)
+    tr = make_trainable("energy_shaping", system)
+    task = make_task("waypoint_pair", system, gating="arrival")
+    cfg = RolloutCfg(ep_steps=250)
+    roll = Rollout(system, tr, task, cfg)
+    goals = task.sample(32, make_gen(2))
+    t = roll.trace(tr.init()[None], goals, 5)
+
+    legs = t.legs                                   # [T, B]
+    assert legs.shape == (cfg.ep_steps, 32)
+    assert int(legs.min()) == 0 and int(legs.max()) <= task.n_legs - 1
+    assert torch.all(legs[1:] >= legs[:-1]), "leg must never go backwards"
+
+    # the point of the test: episodes switch at DIFFERENT frames
+    def first_switch(b):
+        nz = (legs[:, b] > 0).nonzero()
+        return int(nz[0]) if nz.numel() else -1
+
+    sw = [first_switch(b) for b in range(32)]
+    advanced = [x for x in sw if x >= 0]
+    assert advanced, "no episode ever reached a waypoint; test is vacuous"
+    assert len(set(advanced)) > 1, (
+        f"every episode switched at the same frame {advanced[:5]} -- "
+        "legs are on a timer, not on arrival")

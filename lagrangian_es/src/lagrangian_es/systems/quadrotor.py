@@ -70,6 +70,16 @@ class QuadrotorSE3(LagrangianSystem):
         self._e3 = self._t([0.0, 0.0, 1.0])
         self._e1 = self._t([1.0, 0.0, 0.0])
         self._hover = self.m * self.g
+        # Folded out of the hot loop.  Each of these was a fresh tensor op every
+        # step of every rollout; individually trivial, but the loop is dispatch
+        # bound, so the count is what costs.
+        self._g_vec = self._e3 * self.g                 # was rebuilt per step
+        self._grav_wrench = self._e3 * self._hover      # was rebuilt per call
+        self._inv_m = 1.0 / self.m                      # divide -> multiply
+        self._inv_J = 1.0 / self.Jvec
+        self._p_max2 = self.p_max ** 2                  # compare squares, no sqrt
+        self._v_max2 = self.v_max ** 2
+        self._om_max2 = self.om_max ** 2
 
     # --- simulation ---------------------------------------------------------
     def reset(self, B: int, gen: torch.Generator) -> State:
@@ -90,30 +100,32 @@ class QuadrotorSE3(LagrangianSystem):
 
         R, om = s["R"], s["om"]
         b3 = R[..., :, 2]                                     # body z in world
-        acc = b3 * (f / self.m)[..., None] - self._e3 * self.g
+        acc = b3 * (f * self._inv_m)[..., None] - self._g_vec
         v = s["v"] + dt * acc
         p = s["p"] + dt * v
 
         Jom = om * self.Jvec
-        om_dot = (tau - torch.cross(om, Jom, dim=-1)) / self.Jvec
+        om_dot = (tau - torch.cross(om, Jom, dim=-1)) * self._inv_J
         om_new = om + dt * om_dot
         R_new = R @ rodrigues(om_new * dt)
         return {"p": p, "v": v, "R": R_new, "om": om_new}
 
     def alive(self, s: State) -> Tensor:
+        """Liveness, with the redundant work removed.
+
+        The explicit `isfinite` checks on p, v and om were doing nothing the
+        bounds were not already doing: a NaN or Inf component makes the squared
+        norm NaN or Inf, and every comparison against it is False.  Only R needs
+        one, because no bound is placed on it.  Squared norms also drop three
+        square roots per step.
+        """
         p, v, om, R = s["p"], s["v"], s["om"], s["R"]
-        finite = (
-            torch.isfinite(p).all(-1)
-            & torch.isfinite(v).all(-1)
-            & torch.isfinite(om).all(-1)
-            & torch.isfinite(R).all(-1).all(-1)
-        )
         return (
-            finite
+            torch.isfinite(R).flatten(-2).all(-1)
             & (p[..., 2] > self.z_floor)
-            & (p.norm(dim=-1) < self.p_max)
-            & (v.norm(dim=-1) < self.v_max)
-            & (om.norm(dim=-1) < self.om_max)
+            & ((p * p).sum(-1) < self._p_max2)
+            & ((v * v).sum(-1) < self._v_max2)
+            & ((om * om).sum(-1) < self._om_max2)
         )
 
     # --- mechanics ----------------------------------------------------------
@@ -130,7 +142,7 @@ class QuadrotorSE3(LagrangianSystem):
 
     def gravity_force(self, s: State) -> Tensor:
         """m g e3 -- the world-frame force that holds the vehicle up."""
-        return torch.zeros_like(s["p"]) + self._e3 * self._hover
+        return torch.zeros_like(s["p"]) + self._grav_wrench
 
     # --- the underactuation seam --------------------------------------------
     def allocate(self, F_des: Tensor, s: State, phi: Tensor) -> Tensor:

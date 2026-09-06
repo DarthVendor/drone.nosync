@@ -155,8 +155,21 @@ def physics_metric(
     gen = make_gen(seed + 999_331)
     s_sub, goal_sub, u_sub = _subsample(trace, n_states, gen)
 
-    # 2. differentiate the CONTROLLER MAP ALONE -- never the integrator
-    Jac = vmap(jacrev(trainable.forward), in_dims=(None, 0, 0))(theta, s_sub, goal_sub)
+    # 2. differentiate the CONTROLLER MAP ALONE -- never the integrator.
+    #    Sensor-consuming terms need `obs`, and differentiating without it is not
+    #    a harmless simplification: those terms return zero, so every slot they
+    #    own is EXACTLY null in G.  Measured before this was passed, a 499-slot
+    #    learned genome gave an effective rank of 6 -- the allocator alone -- and
+    #    the preconditioner was extrapolating over the other 493 directions.
+    if roll.sensors:
+        ogen = make_gen(seed + 4_115_237)
+        roll._prime(s_sub, ogen)
+        obs_sub = roll._observe(s_sub, ogen, 0)
+        Jac = vmap(jacrev(trainable.forward),
+                   in_dims=(None, 0, 0, 0))(theta, s_sub, goal_sub, obs_sub)
+    else:
+        Jac = vmap(jacrev(trainable.forward),
+                   in_dims=(None, 0, 0))(theta, s_sub, goal_sub)
     if not torch.isfinite(Jac).all():
         Jac = torch.nan_to_num(Jac, nan=0.0, posinf=0.0, neginf=0.0)
 

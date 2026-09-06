@@ -256,10 +256,18 @@ function goalPose(k, leg){
   for (let b=0;b<nb;b++) out.push(a.slice(off+b*kk, off+(b+1)*kk));
   return out;
 }
-// legs are evenly spaced, so this generalizes past the two-waypoint case to a
-// full course of gates
-const legOf = f => R.n_legs <= 1 ? 0
-  : Math.min(R.n_legs - 1, Math.floor(f * R.n_legs / R.n_frames));
+// Which waypoint is the target at this frame.  Under arrival gating the goal
+// advances when the drone REACHES one, so this cannot be derived from the frame
+// index: a fast episode is already on gate 3 while a slow one is still on gate 1,
+// and a crashed one stays on whichever it died chasing.  The exporter ships the
+// real per-frame value; the even-spacing formula survives only as a fallback for
+// time-gated payloads that carry no `leg` array.
+function legOf(k, f){
+  if (R.n_legs <= 1) return 0;
+  const a = run(k).leg;
+  if (a) return a[Math.min(f, a.length - 1)];
+  return Math.min(R.n_legs - 1, Math.floor(f * R.n_legs / R.n_frames));
+}
 function taskAt(k, f){
   const d = R.task_labels.length, a = run(k).task;
   const o = Math.min(f, R.n_frames-1)*d;
@@ -682,7 +690,8 @@ function render(){
   for(const k of keys) trail(k, frame, k==="trained"?PAL.accent:PAL.warn);
   let sp=[];
   if (showGhost){
-    const gp=goalPose(keys[keys.length-1], legOf(frame));
+    const gk=keys[keys.length-1];
+    const gp=goalPose(gk, legOf(gk, frame));
     sp=sp.concat(bodyShapes(gp, PAL.tgt, 0.24, true));
   }
   sp=sp.concat(obstacleSprites(keys[keys.length-1]));
@@ -702,7 +711,7 @@ function render(){
 const $ = id => document.getElementById(id);
 function updateHUD(){
   const key = mode==="prior" ? "prior" : "trained";
-  const leg = legOf(frame);
+  const leg = legOf(key, frame);
   const t = taskAt(key, frame), g = goalTask(key, leg);
   let err=0; for(let i=0;i<t.length;i++) err += (t[i]-g[i])**2;
   err = Math.sqrt(err);

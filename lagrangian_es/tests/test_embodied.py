@@ -158,3 +158,31 @@ def test_agent_segments_cover_the_whole_genome(sysname, agent):
     covered = sum(s.stop - s.start for s in segs)
     assert covered == tr.dim
     assert segs[0].start == 0 and segs[-1].stop == tr.dim
+
+
+def test_nav_agent_carries_both_a_position_barrier_and_a_closing_damper():
+    """Obstacle avoidance needs a term of each kind, structurally.
+
+    Stopping takes `v^2 / 2a` of room, so a POTENTIAL -- force from position
+    alone -- gives a fixed `a` and can only arrest an approach from
+    `v <= sqrt(2 a d)`.  The barrier here manages about 2.3 m/s while collisions
+    happen at 3.09 m/s, and raising its gain to cover that wrecks navigation.
+    Only a Rayleigh term sees velocity, so dropping either one leaves a gap that
+    no amount of tuning on the other closes.
+    """
+    from lagrangian_es.systems import make_system
+    system = make_system("quadrotor_nav", environment="pillars")
+    kinds = [t.kind for t in make_trainable("nav_agent", system).terms]
+    assert "range_barrier" in kinds
+    assert "range_damper" in kinds
+    # the damper must be the dissipative one and the barrier the potential one
+    terms = {t.kind: t for t in make_trainable("nav_agent", system).terms}
+    assert terms["range_damper"].certificate(None).get("dissipative") is True
+    assert terms["range_barrier"].certificate(None).get("dissipative") is None
+
+
+def test_nav_agent_damper_can_be_turned_off_for_ablation():
+    from lagrangian_es.systems import make_system
+    system = make_system("quadrotor_nav", environment="pillars")
+    tr = make_trainable("nav_agent", system, damper=False)
+    assert "range_damper" not in [t.kind for t in tr.terms]

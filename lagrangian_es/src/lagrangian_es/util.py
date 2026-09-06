@@ -31,12 +31,24 @@ def tree_where(mask: Tensor, a: State, b: State) -> State:
     """
     if mask.dtype != torch.bool:
         raise TypeError(f"tree_where expects a bool mask, got {mask.dtype}")
+    # Whole-batch shortcuts.  Early in an episode nothing has crashed and late in
+    # a bad one nothing is left, so most calls are a no-op that still allocates a
+    # `torch.where` per leaf.  Both branches return the operand itself, which is
+    # numerically what the elementwise select would have produced.
+    n_true = int(mask.sum())
+    if n_true == mask.numel():
+        return a
+    if n_true == 0:
+        return b
     out: State = {}
+    views: dict = {}                     # one reshaped mask per leaf rank
     for k, va in a.items():
         vb = b[k]
         if va.shape != vb.shape:
             raise ValueError(f"tree_where shape mismatch on '{k}': {va.shape} vs {vb.shape}")
-        m = mask.reshape(mask.shape + (1,) * (va.ndim - mask.ndim))
+        m = views.get(va.ndim)
+        if m is None:
+            m = views[va.ndim] = mask.reshape(mask.shape + (1,) * (va.ndim - mask.ndim))
         out[k] = torch.where(m, va, vb)
     return out
 

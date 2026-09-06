@@ -289,3 +289,47 @@ def test_inactive_regimes_are_out_of_play():
     per = torch.stack([g.sdf(p, f) for g in env.groups], dim=-1)
     parked = per > 100.0
     assert int(parked.sum(-1).min()) >= len(env.groups) - 1
+
+
+# --- proximity shaping: the only smooth obstacle signal in the objective -----
+def test_proximity_penalty_meets_dead_cost_at_the_collision_boundary():
+    """Weighted proximity rate at zero clearance must MEET `dead_cost`.
+
+    The term's whole job is to turn the collision cliff into a slope.  If the
+    rate at zero clearance is below `dead_cost` the objective still steps at the
+    boundary and the search sees no gradient exactly where it needs one -- which
+    is not hypothetical: at the original gain of 2.0 this term carried 0.07% of
+    the episode cost against 58% for the crash it anticipates, and the
+    population's cheapest route under that objective was to stop moving.
+    """
+    cfg = RolloutCfg(lambda_s=0.2)          # the curriculum's shaping weight
+    sysm = make_system("quadrotor_nav", environment="pillars", dtype=DT)
+    rate = cfg.lambda_s * sysm.prox_gain * sysm.prox_band ** 2
+    assert rate == pytest.approx(cfg.dead_cost, rel=0.05)
+
+
+def test_course_band_leaves_a_centred_hoop_pass_unpenalized():
+    """A gate is meant to be flown through, so the band must fit inside it.
+
+    The torus SDF at the centre of a hoop is `radius - tube`, so a band wider
+    than that charges for passing a gate correctly -- the course settings must
+    stay under it while keeping the boundary match above.
+    """
+    h = Hoops()
+    centre_clearance = h.radius - h.tube
+    sysm = make_system("quadrotor_nav", environment="hoop_course", dtype=DT,
+                       prox_gain=200.0, prox_band=0.35)
+    assert sysm.prox_band < centre_clearance
+    assert 0.2 * sysm.prox_gain * sysm.prox_band ** 2 == pytest.approx(5.0, rel=0.05)
+
+
+def test_proximity_penalty_is_zero_in_the_clear_and_grows_approaching_geometry():
+    sysm = make_system("quadrotor_nav", environment="pillars", dtype=DT)
+    s = sysm.reset(64, make_gen(0))
+    far = dict(s)
+    # clearance() reads position, so move the batch rather than stub the method.
+    # Pillars are vertical columns, so the move has to be LATERAL -- climbing
+    # away from one never clears it.
+    far["p"] = s["p"] + torch.tensor([500.0, 500.0, 0.0], dtype=DT)
+    lo = sysm.shaping_cost(far) - (1.0 - far["R"][..., 2, 2])
+    assert torch.allclose(lo, torch.zeros_like(lo), atol=1e-12)

@@ -30,6 +30,7 @@ Two conditions hold by construction here, and both are asserted in tests:
 """
 from __future__ import annotations
 
+import math
 import torch
 from torch import Tensor
 
@@ -238,37 +239,110 @@ class RangeBarrier(SensorPotential):
     kind = "range_barrier"
 
     def __init__(self, d: int, sensor_name: str, n_beams: int, w0: float = 1.0,
-                 safe0: float = 0.45, margin0: float = 0.9, **kw):
+                 safe0: float = 0.45, margin0: float = 0.9,
+                 safe_lo: float = 0.05, safe_hi: float = 1.50,
+                 margin_lo: float = 0.10, margin_hi: float = 2.00,
+                 mode: str = "bump", d_min: float = 0.12,
+                 floor: float = 0.02, **kw):
         super().__init__(d, sensor_name, **kw)
         self.n_beams = int(n_beams)
         self.w0, self.safe0, self.margin0 = float(w0), float(safe0), float(margin0)
+        self.safe_lo, self.safe_hi = float(safe_lo), float(safe_hi)
+        self.margin_lo, self.margin_hi = float(margin_lo), float(margin_hi)
+        if mode not in ("bump", "log"):
+            raise ValueError(f"unknown RangeBarrier mode {mode!r}")
+        self.mode = mode
+        self.d_min, self.floor = float(d_min), float(floor)
 
     @property
     def dim(self) -> int:
         return 3
 
+    @staticmethod
+    def _unsquash(v, lo, hi):
+        t = min(max((v - lo) / (hi - lo), 1e-4), 1.0 - 1e-4)
+        return math.log(t / (1.0 - t))
+
     def init(self, dtype=torch.float64, device="cpu") -> Tensor:
-        return torch.tensor([self.w0, self.safe0 ** 0.5, self.margin0 ** 0.5],
-                            dtype=dtype, device=device)
+        return torch.tensor(
+            [self.w0,
+             self._unsquash(self.safe0, self.safe_lo, self.safe_hi),
+             self._unsquash(self.margin0, self.margin_lo, self.margin_hi)],
+            dtype=dtype, device=device)
 
     def _params(self, theta):
         w2 = theta[..., 0] ** 2
-        safe = theta[..., 1] ** 2 + 0.05
-        margin = theta[..., 2] ** 2 + 0.05
+        # BOUNDED, via a squash.  Unbounded, `safe` and `margin` are a free
+        # "switch me off" direction: once safe exceeds the sensor's max range
+        # every beam has m < 0, the bump is constant, its gradient vanishes, and
+        # the term stops influencing u at all.  Its parameters are then
+        # fitness-flat, and BLX-alpha extrapolation walks them off to infinity --
+        # which is exactly what happened, ending at safe = 2.8e29 with the range
+        # sensor contributing nothing to the commanded force.
+        safe = self.safe_lo + (self.safe_hi - self.safe_lo) * torch.sigmoid(theta[..., 1])
+        margin = (self.margin_lo
+                  + (self.margin_hi - self.margin_lo) * torch.sigmoid(theta[..., 2]))
         return w2, safe, margin
 
     def _bump(self, m):
-        u = (1.0 - m.clamp_min(0.0)).clamp(0.0, 1.0)
-        return u * u * u, -3.0 * u * u * (m >= 0).to(m.dtype)
+        """Cubic bump on [0, 1], continued LINEARLY below 0.
+
+        The cubic alone is flat for m < 0 -- i.e. the repulsion switches off
+        inside the safe radius, exactly where a collision is imminent.  The
+        linear continuation keeps the gradient pinned at its maximum there
+        instead of dropping to zero, so the force stays bounded (|dpsi/dm| <= 3,
+        which is what the certificate needs) without ever vanishing in the danger
+        zone.  C1 at m = 0: value 1, slope -3 on both sides.
+        """
+        mc = m.clamp(0.0, 1.0)
+        u = 1.0 - mc
+        below = (-m).clamp_min(0.0)          # depth inside `safe`, 0 outside
+        return u * u * u + 3.0 * below, -3.0 * u * u
+
+    def _wall(self, obs, safe):
+        """Hard-wall barrier: -log((d - d_min) / (safe - d_min)).
+
+        A real wall is an INFINITE potential, and that buys two things a bounded
+        bump cannot.  The sublevel set the episode starts in never reaches the
+        obstacle, so contact is excluded by the geometry of V rather than merely
+        made expensive; and because the resulting force is purely NORMAL, the
+        goal pull's tangential component survives untouched and the vehicle
+        SLIDES along the obstacle instead of stalling against it.  That sliding is
+        the steering a radial repulsion could never produce.
+
+        It is infinite only in continuous time.  At dt = 0.02 and 4 m/s the
+        vehicle covers 8 cm per step and can step straight through the wall, so
+        the argument is floored -- large but finite, and honest about it.  Note
+        also that `obs` is BEAM RANGE, so the invariance is with respect to what
+        the sensor sees; between beams there is nothing holding the vehicle out.
+        """
+        span = (safe[..., None] - self.d_min).clamp_min(1e-6)
+        z = ((obs - self.d_min) / span).clamp(self.floor, 1.0)
+        # SHIFTED log: -ln z + (z - 1).  Both the value and the slope vanish at
+        # z = 1, so the barrier meets open space smoothly instead of with the
+        # kink a bare -ln z leaves at the edge of its support.
+        inside = (obs < safe[..., None]).to(obs.dtype)
+        psi = inside * (-torch.log(z) + (z - 1.0))
+        # Saturates at the floor rather than switching off there.  Clamping z is
+        # unavoidable -- the vehicle can step through the wall in one dt -- but
+        # the push must stay at its maximum once inside, not vanish, or tunnelling
+        # through leaves nothing pushing back out.
+        d = inside * (1.0 - 1.0 / z) / span
+        return psi, d
 
     def raw_potential(self, theta, obs):
         w2, safe, margin = self._params(theta)
-        m = (obs - safe[..., None]) / margin[..., None]
-        psi, _ = self._bump(m)
+        if self.mode == "log":
+            psi, _ = self._wall(obs, safe)
+        else:
+            psi, _ = self._bump((obs - safe[..., None]) / margin[..., None])
         return w2 * psi.mean(-1)
 
     def raw_grad(self, theta, obs):
         w2, safe, margin = self._params(theta)
+        if self.mode == "log":
+            _, d = self._wall(obs, safe)
+            return w2[..., None] * d / self.n_beams
         m = (obs - safe[..., None]) / margin[..., None]
         _, d = self._bump(m)
         return w2[..., None] * d / margin[..., None] / self.n_beams
@@ -277,3 +351,139 @@ class RangeBarrier(SensorPotential):
         w2, safe, margin = self._params(theta)
         return {"rng_w2": float(w2), "rng_safe": float(safe),
                 "rng_margin": float(margin)}
+
+    def certificate(self, theta, goal=None):
+        c = super().certificate(theta, goal)
+        # the wall's gradient is bounded only by the floor, not by O(1)
+        c["bounded_grad"] = self.mode != "log"
+        c["mode"] = self.mode
+        return c
+
+
+class RangeDamper(SensorPotential):
+    """Dissipation that bites on CLOSING motion toward what the beams see.
+
+    Why a potential cannot do this job
+    ----------------------------------
+    Stopping needs `v^2 / 2a` of room.  A potential supplies a force that depends
+    only on POSITION, so its deceleration `a(d)` is fixed and it can only stop an
+    approach from `v <= sqrt(2 a d)`.  Measured on the pillar field: the barrier
+    delivers about 2 m/s^2 over 1.35 m of support, good for 2.3 m/s, while 100%
+    of deaths are obstacle contact at a mean of 3.09 m/s.  Turning the gain up
+    fixes the speed limit and breaks everything else -- at high gain the field
+    deflects so hard that reach collapses to 0.21.  The missing dependence is on
+    velocity, and in a Lagrangian that is a Rayleigh term, not a potential.
+
+    The construction
+    ----------------
+        R(v) = 1/2 * sum_i k_i * relu(-J_i . v)^2 ,   k_i = c * g(d_i)
+
+    `J_i = d(range_i)/dx` points AWAY from what beam i sees, so `J_i . v` is the
+    rate of change of that range and `relu(-J_i . v)` is the closing speed, zero
+    when receding.  The force is `-dR/dv = sum_i k_i relu(-J_i . v) J_i`, which:
+
+      * is strictly dissipative -- `dR/dv . v = sum k relu(...)^2 >= 0` -- so
+        `H = T + V_d` is still non-increasing and the certificate is untouched;
+      * vanishes on receding motion, so it never pushes the vehicle along;
+      * damps ONLY the closing component, leaving tangential motion free, so it
+        slows an approach without preventing going around;
+      * scales with speed, so the achievable deceleration grows with the speed
+        that needs killing instead of being fixed by geometry.
+
+    Genome: [strength_raw, reach_raw].  Both bounded, for the reason the
+    barrier's are: an unbounded activation range is a fitness-flat switch-me-off
+    direction once it exceeds the scene.
+
+    Only the EXCESS speed is damped
+    -------------------------------
+    A damper keyed on distance alone brakes whenever anything is within reach,
+    and in a field of six pillars that is nearly always -- it pays a toll on
+    every episode to rescue the ~17% that would have hit something.  Priced on
+    the pillar field that trade is a net loss: the safe policy scores 3.9703
+    against the crashing one's 3.7952, so selection correctly dismantles it, and
+    600 generations drove the strength from 120 to 6.
+
+    So the damping keys on the SAFE SPEED for the distance in hand,
+
+        v_safe(d) = sqrt(2 * a * d)
+
+    and resists only `relu(v_close - v_safe)`.  Inside the envelope -- cruising
+    past a pillar, however close -- the term is exactly zero and costs nothing.
+    It engages only when the approach could no longer be stopped in the distance
+    remaining, which is the situation it exists for.  Compact support falls out
+    for free: far away `v_safe` is large and nothing triggers.
+
+    Genome: [strength_raw, decel_raw] -- how hard to resist, and the deceleration
+    the envelope assumes it can command.  Both bounded, and `accel_hi` tightly:
+    a LARGE assumed deceleration widens `v_safe` until the term never fires, so a
+    loose upper bound is just another switch-me-off direction.  Given the run at
+    accel_hi = 20, two of three seeds pinned it at 19.98 and 19.68 and lost reach
+    (0.676, 0.688) while the seed that kept 2.20 scored 0.828.  The envelope must
+    assume what the plant can ACTUALLY deliver, and measured over the approach to
+    a crash this one is saturated 59% of the time with its realised force 49 deg
+    off the demand -- so the honest value is small.
+    """
+
+    kind = "range_damper"
+
+    def __init__(self, d: int, sensor_name: str, n_beams: int, c0: float = 200.0,
+                 accel0: float = 2.0, accel_lo: float = 0.5,
+                 accel_hi: float = 6.0, **kw):
+        super().__init__(d, sensor_name, **kw)
+        self.n_beams = int(n_beams)
+        self.c0, self.accel0 = float(c0), float(accel0)
+        self.accel_lo, self.accel_hi = float(accel_lo), float(accel_hi)
+
+    @property
+    def dim(self) -> int:
+        return 2
+
+    def init(self, dtype=torch.float64, device="cpu") -> Tensor:
+        t = min(max((self.accel0 - self.accel_lo)
+                    / (self.accel_hi - self.accel_lo), 1e-4), 1.0 - 1e-4)
+        return torch.tensor([self.c0 ** 0.5, math.log(t / (1.0 - t))],
+                            dtype=dtype, device=device)
+
+    def _params(self, theta):
+        c = theta[..., 0] ** 2
+        accel = (self.accel_lo + (self.accel_hi - self.accel_lo)
+                 * torch.sigmoid(theta[..., 1]))
+        return c, accel
+
+    def _v_safe(self, z, accel):
+        """Speed the remaining distance can still absorb, sqrt(2 a d)."""
+        return (2.0 * accel[..., None] * z.clamp_min(0.0)).clamp_min(0.0).sqrt()
+
+    # The parent's potential/grad machinery is for V(obs); this is R(v, obs), so
+    # both are overridden rather than reusing raw_potential/raw_grad.
+    def raw_potential(self, theta, obs):
+        return torch.zeros_like(obs[..., 0])
+
+    def raw_grad(self, theta, obs):
+        return torch.zeros_like(obs)
+
+    def potential(self, theta, e, v, x, obs=None):
+        return torch.zeros_like(e[..., 0])
+
+    def grad_potential(self, theta, e, v, x, obs=None):
+        z, J = self._read(obs)
+        if z is None or J is None:
+            return torch.zeros_like(e)
+        c, accel = self._params(theta)
+        close = torch.einsum("...od,...d->...o", J, v).neg().clamp_min(0.0)
+        # only the part of the approach the remaining distance cannot absorb
+        excess = (close - self._v_safe(z, accel)).clamp_min(0.0)
+        k = c[..., None] / self.n_beams
+        # dR/dv = -sum_i k_i * excess_i * J_i ; the caller subtracts it, so the
+        # applied force is +sum_i k_i excess_i J_i -- opposing the approach
+        dRdv = -torch.einsum("...o,...od->...d", k * excess, J)
+        return goal_gate(e, self.r_goal, self.gate_width)[..., None] * dRdv
+
+    def certificate(self, theta, goal=None):
+        return {"kind": self.kind, "psd": True, "zero_at_goal": True,
+                "bounded_grad": False,     # grows with closing speed, by design
+                "dissipative": True, "sensor": self.sensor_name}
+
+    def describe(self, theta):
+        c, accel = self._params(theta)
+        return {"dmp_c": float(c), "dmp_accel": float(accel)}

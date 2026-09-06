@@ -99,6 +99,9 @@ def capture(system, roll, theta, goals, seed, stride=1, sensor=None):
         rec = {"pose": _r(poses[sel, b]),
                "task": _r(task[sel, b], 4),
                "alive": [int(tr.alive[i, b]) for i in alive_sel],
+               # per-frame target index, so the ghost advances when the drone
+               # actually reaches a waypoint rather than on a timer
+               "leg": [int(tr.legs[i, b]) for i in alive_sel],
                "goal_pose": _r(ghost),
                "goal_task": _r(goals[b], 4)}
         for k, v in extras.items():

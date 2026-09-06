@@ -69,6 +69,7 @@ def build(cfg: Config):
     """(system, trainable, task) from names -- one place, so scripts agree."""
     dt = torch_dtype(cfg.dtype)
     kw = {"environment": cfg.environment} if cfg.environment else {}
+    kw.update(dict(cfg.system_kw))
     system = make_system(cfg.system, dtype=dt, **kw)
     trainable = make_trainable(cfg.trainable, system)
     task = make_task(cfg.task, system, gating=cfg.gating)

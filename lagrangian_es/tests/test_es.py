@@ -199,3 +199,132 @@ def test_acceptance_helper_reads_the_section_6_criteria():
     bad = {"legB_err": 0.30, "success_rate": 0.9, "crash_rate": 0.0}
     assert accepts(good)["ALL"] is True
     assert accepts(bad)["ALL"] is False
+
+
+# --- goal bonus -------------------------------------------------------------
+def _bonus_costs(bonus, tol_scale=1.0):
+    """Per-episode cost for one genome, with and without the arrival bonus."""
+    from lagrangian_es.rollout import Rollout
+    from lagrangian_es.systems import make_system
+    from lagrangian_es.tasks import make_task
+    from lagrangian_es.trainables import make_trainable
+
+    system = make_system("quadrotor", dtype=DT)
+    tr = make_trainable("energy_shaping", system)
+    task = make_task("waypoint_pair", system, gating="arrival")
+    task.tol = task.tol * tol_scale
+    th = tr.init()[None].expand(4, -1).contiguous()
+    goals = task.sample(4 * 4, make_gen(2))
+    out = []
+    for b in (0.0, bonus):
+        cfg = RolloutCfg(n_eps=4, ep_steps=250, goal_bonus=b)
+        out.append(Rollout(system, tr, task, cfg).run(th, goals, 3).cost)
+    return out[0], out[1], task.n_legs
+
+
+def test_goal_bonus_is_credited_once_per_waypoint_not_once_per_step():
+    """The final leg never advances `leg`, so its arrival test fires on EVERY
+    step the vehicle sits inside tol.  Paying the bonus per step would turn
+    hovering on the goal into an unbounded reward and the objective would stop
+    meaning anything -- the saving must be an integer multiple of the bonus, at
+    most one per leg.
+    """
+    bonus = 10.0
+    base, with_bonus, n_legs = _bonus_costs(bonus)
+    saved = base - with_bonus
+    assert torch.all(saved >= -1e-9)
+    assert torch.all(saved <= n_legs * bonus + 1e-9)
+    k = saved / bonus
+    assert torch.allclose(k, k.round(), atol=1e-9), f"non-integer credits: {k}"
+    # non-vacuity: a run that never reaches a goal would satisfy all of the
+    # above trivially, so require the full credit range to be exercised
+    counts = set(k.round().long().tolist())
+    assert counts == {0, 1, 2}, f"credit path not exercised: {counts}"
+
+
+def test_goal_bonus_scales_the_saving_linearly():
+    """Two bonuses, same trajectories: the credit count cannot depend on the
+    bonus size, so the saving must scale exactly with it."""
+    b1, w1, _ = _bonus_costs(10.0)
+    b2, w2, _ = _bonus_costs(40.0)
+    assert torch.allclose(b1, b2)                       # same rollout either way
+    assert torch.allclose((b1 - w1) * 4.0, b2 - w2, atol=1e-9)
+
+
+def test_goal_bonus_defaults_off_and_leaves_the_objective_untouched():
+    base, same, _ = _bonus_costs(0.0)
+    assert torch.equal(base, same)
+
+
+# --- dead_mode --------------------------------------------------------------
+def _dead_mode_costs(mode, dead_cost, theta_scale=0.0):
+    """Cost per episode under one dead_mode.  theta_scale=0 gives a controller
+    that emits nothing, so the batch falls and dies -- the case that matters."""
+    from lagrangian_es.rollout import Rollout
+    from lagrangian_es.systems import make_system
+    from lagrangian_es.tasks import make_task
+    from lagrangian_es.trainables import make_trainable
+
+    system = make_system("quadrotor", dtype=DT)
+    tr = make_trainable("energy_shaping", system)
+    task = make_task("waypoint_pair", system, gating="arrival")
+    th = (tr.init() * theta_scale)[None].expand(4, -1).contiguous()
+    cfg = RolloutCfg(n_eps=4, ep_steps=120, dead_mode=mode, dead_cost=dead_cost,
+                     lambda_e=0.0, lambda_s=0.0)
+    r = Rollout(system, tr, task, cfg).run(th, task.sample(16, make_gen(2)), 5)
+    return r.cost, r.alive
+
+
+def test_frozen_dead_mode_ignores_dead_cost_entirely():
+    """`dead_cost` is the free parameter being removed, so frozen mode must not
+    read it -- otherwise the tuning problem is still there, just hidden."""
+    c_lo, alive = _dead_mode_costs("frozen", 0.5)
+    c_hi, _ = _dead_mode_costs("frozen", 500.0)
+    assert not bool(alive.all()), "test is vacuous unless something dies"
+    assert torch.allclose(c_lo, c_hi), "frozen mode still depends on dead_cost"
+
+
+def test_dead_modes_agree_exactly_on_episodes_that_survived():
+    """The modes may only differ where a vehicle actually died; a survivor's
+    cost is the same integral either way."""
+    # a scaled-up genome keeps the whole batch alive, which makes the second
+    # half of this test vacuous; the zero genome leaves ~6% dead
+    c_const, alive = _dead_mode_costs("constant", 5.0)
+    c_frozen, alive2 = _dead_mode_costs("frozen", 5.0)
+    assert torch.equal(alive, alive2)
+    assert alive.any() and not alive.all(), "need both outcomes present"
+    assert torch.allclose(c_const[alive], c_frozen[alive])
+    assert not torch.allclose(c_const[~alive], c_frozen[~alive])
+
+
+def test_dead_mode_constant_is_the_default_and_unchanged():
+    assert RolloutCfg().dead_mode == "constant"
+    assert RolloutCfg().goal_bonus == 0.0
+
+
+def test_sigma_fixed_point_is_set_by_grow_shrink_not_by_success_target():
+    """sigma is stationary where p*ln(grow) + (1-p)*ln(shrink) == 0.
+
+    The config names a 0.20 trigger, but that is only the threshold the hit rate
+    is compared against -- the balance point is 0.343 for the default
+    multipliers.  Anyone retuning grow/shrink moves it, so pin the behaviour:
+    driving the rule at the predicted rate must leave sigma where it started.
+    """
+    import math
+    from lagrangian_es.config import ESCfg
+    es = ESCfg()
+    p = math.log(1 / es.shrink) / math.log(es.grow / es.shrink)
+    assert p == pytest.approx(0.343, abs=0.005)
+
+    def walk(rate, n=4000):
+        sigma, hits = 0.05, 0
+        for i in range(n):
+            improved = (hits + 1) / (i + 1) <= rate     # drive at exactly `rate`
+            hits += improved
+            sigma = update_sigma(sigma, improved, es.grow, es.shrink,
+                                 es.sigma_min, es.sigma_max)
+        return sigma
+
+    assert walk(p) == pytest.approx(0.05, rel=0.25)     # stationary at the balance
+    assert walk(p - 0.15) < 0.05 * 0.2                  # below it, sigma decays
+    assert walk(p + 0.15) > 0.05 * 5.0                  # above it, sigma grows
