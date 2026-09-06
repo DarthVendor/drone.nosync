@@ -91,6 +91,10 @@ def march(group, origin: Tensor, dirs: Tensor, f: State, max_range: float,
     # surface is what makes a marched primitive affordable next to the closed-form
     # ones -- 10 steps across a ring's bounding sphere resolve better than 28
     # across the whole sensor range.
+    # Restrict the geometry ONCE, then march against the smaller set: the sdf is
+    # evaluated `steps` times per ray, so culling inside the loop would pay for
+    # the selection every step instead of once.
+    f = group.local_field(origin, f, max_range)
     t, t_max = group.ray_bounds(origin, dirs, f, max_range)
     for _ in range(steps):
         d = group.sdf(o + t[..., None] * dirs, f, extra=1)
@@ -145,6 +149,15 @@ class ObstacleGroup(ABC):
         return (torch.zeros(shp, dtype=origin.dtype, device=origin.device),
                 torch.full(shp, max_range, dtype=origin.dtype, device=origin.device))
 
+    #: sphere-march iterations for groups without a closed form.  10 is not
+    #: enough: measured against a 64-step reference, 10 leaves 5.8% of box hits
+    #: and 9.4% of hoop hits wrong by more than 0.1 m, with a p99 of 4-5 m -- a
+    #: sensor that lies on about one ray in eleven, on exactly the scenes that
+    #: fail.  24 brings the p99 to 0.044 m.  Cost is steps x rays x obstacles and
+    #: does NOT depend on max_range, because vmap forbids an early exit, so this
+    #: is the only dial that trades accuracy for time.
+    march_steps: int = 24
+
     def raycast(self, origin: Tensor, dirs: Tensor, f: State, max_range: float):
         """(range [..., m], d_range/d_origin [..., m, 3]).
 
@@ -162,7 +175,8 @@ class ObstacleGroup(ABC):
         the surface normal n; a ray that misses reports `max_range` with zero
         gradient, the honest derivative of a clamped measurement.
         """
-        return march(self, origin, dirs, f, max_range)
+        return march(self, origin, dirs, f, max_range,
+                     steps=self.march_steps)
 
     def near_indices(self, origin: Tensor, f: State, k: int, key_c: str,
                      reach: float):
@@ -205,6 +219,21 @@ class ObstacleGroup(ABC):
         """
         return torch.zeros(origin.shape[:-1], dtype=origin.dtype,
                            device=origin.device)
+
+    def local_field(self, origin: Tensor, f: State, reach: float) -> State:
+        """`f` restricted to the obstacles near `origin`, or `f` unchanged.
+
+        The marcher evaluates `sdf` once per step per ray, and an sdf that takes
+        a min over EVERY obstacle makes the cost steps x rays x all-objects.
+        Culling only the closed-form `raycast` left that path untouched, so a
+        large world still paid for all of it.  Restricting the geometry ONCE per
+        raycast and reusing it for every step makes it steps x rays x loaded.
+
+        Same exactness condition as the raycast cull: sound while the kept count
+        covers everything within `reach`, since nothing beyond that can be the
+        nearest surface to any point on a ray of that length.
+        """
+        return f
 
     def deactivate(self, f: State, off: Tensor) -> State:
         """Park this group's geometry wherever `off` [...] is True.

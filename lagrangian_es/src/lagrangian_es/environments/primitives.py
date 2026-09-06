@@ -111,6 +111,18 @@ class Pillars(ObstacleGroup):
         d = (origin[..., None, :2] - c).norm(dim=-1) - r
         return (d < reach).to(origin.dtype).sum(-1)
 
+    def local_field(self, origin, f, reach):
+        k = getattr(self, "cull_k", 0)
+        if not k or f[self._k("c")].shape[-2] <= k:
+            return f
+        idx, _ = self.near_indices(origin, f, k, self._k("c"),
+                                   reach + getattr(self, "r_hi", 0.0))
+        out = dict(f)
+        out[self._k("c")] = f[self._k("c")].gather(
+            -2, idx[..., None].expand(idx.shape + (2,)))
+        out[self._k("r")] = f[self._k("r")].gather(-1, idx)
+        return out
+
     def clear_points(self, f, pts, margin):
         """Push each pillar radially off any waypoint it covers.
 
@@ -168,12 +180,13 @@ class Boxes(ObstacleGroup):
     def __init__(self, n: int = 4, key: str = "boxes", extent: float = 2.4,
                  half_lo: float = 0.16, half_hi: float = 0.42,
                  h_lo: float = 0.7, h_hi: float = 2.0,
-                 keep_clear: float = 0.65):
+                 keep_clear: float = 0.65, cull_k: int = 0):
         self.n, self.key = int(n), key
         self.extent = float(extent)
         self.half_lo, self.half_hi = float(half_lo), float(half_hi)
         self.h_lo, self.h_hi = float(h_lo), float(h_hi)
         self.keep_clear = float(keep_clear)
+        self.cull_k = int(cull_k)
 
     def sample(self, B, gen, dtype, device):
         kw = dict(generator=gen, dtype=dtype, device=device)
@@ -242,6 +255,24 @@ class Boxes(ObstacleGroup):
             c = c + unit * worst.clamp_min(0.0)[..., None]
         c = _evict(c, _circle_violates(c, r, p2, margin))
         return {self._k("c"): c, self._k("h"): h, self._k("a"): a}
+
+    def chunk_occupancy(self, origin, f, reach):
+        c, h = f[self._k("c")], f[self._k("h")]
+        d = (origin[..., None, :2] - c).norm(dim=-1) - h[..., :2].norm(dim=-1)
+        return (d < reach).to(origin.dtype).sum(-1)
+
+    def local_field(self, origin, f, reach):
+        if not self.cull_k or f[self._k("c")].shape[-2] <= self.cull_k:
+            return f
+        idx, _ = self.near_indices(origin, f, self.cull_k, self._k("c"),
+                                   reach + self.half_hi * 1.5)
+        out = dict(f)
+        out[self._k("c")] = f[self._k("c")].gather(
+            -2, idx[..., None].expand(idx.shape + (2,)))
+        out[self._k("h")] = f[self._k("h")].gather(
+            -2, idx[..., None].expand(idx.shape + (3,)))
+        out[self._k("a")] = f[self._k("a")].gather(-1, idx)
+        return out
 
     def render(self, f):
         return {"kind": "boxes", "c": f[self._k("c")], "h": f[self._k("h")],
