@@ -411,3 +411,74 @@ def make_term(kind: str, d: int, **kw) -> LagrangianTerm:
     if kind not in TERMS:
         raise KeyError(f"unknown term {kind!r}; registered: {sorted(TERMS)}")
     return TERMS[kind](d, **kw)
+
+
+class StandoffBowl(LagrangianTerm):
+    """A bowl whose minimum is a SPHERE of radius r0, not a point.
+
+        V = w (||e|| - r0)^2
+
+    Every other potential here pulls the vehicle onto its goal, which is right
+    for a waypoint and wrong for an observation: you cannot watch something you
+    are standing on, and occlusion is meaningless at zero range.  This term makes
+    the equilibrium a standoff shell instead, leaving the vehicle free to slide
+    around it -- which is the freedom an occlusion cost then uses, since getting a
+    blocked line of sight back requires MOVING and the shell is where it may move.
+
+    The certificate changes shape honestly.  `zero_at_goal` is False: the goal is
+    not the equilibrium and was never meant to be, the shell is.  V is still PSD,
+    and its gradient still vanishes on the equilibrium set, so the closed loop is
+    still an energy-shaping system -- it just settles on a surface rather than at
+    a point.
+
+    Genome: [weight_raw, radius_raw], the radius bounded so the search cannot
+    push the shell out past the scene and make the term inert.
+    """
+
+    kind = "standoff_bowl"
+
+    def __init__(self, d: int, w0: float = 1.0, r0: float = 1.8,
+                 r_lo: float = 0.6, r_hi: float = 3.2):
+        super().__init__(d)
+        self.w0, self.r0 = float(w0), float(r0)
+        self.r_lo, self.r_hi = float(r_lo), float(r_hi)
+
+    @property
+    def dim(self) -> int:
+        return 2
+
+    def init(self, dtype=torch.float64, device="cpu") -> Tensor:
+        import math
+        t = min(max((self.r0 - self.r_lo) / (self.r_hi - self.r_lo), 1e-4),
+                1.0 - 1e-4)
+        return torch.tensor([self.w0 ** 0.5, math.log(t / (1.0 - t))],
+                            dtype=dtype, device=device)
+
+    def _params(self, theta):
+        w = theta[..., 0] ** 2
+        r = self.r_lo + (self.r_hi - self.r_lo) * torch.sigmoid(theta[..., 1])
+        return w, r
+
+    def potential(self, theta, e, v, x):
+        w, r0 = self._params(theta)
+        n = e.norm(dim=-1)
+        d = n - r0
+        return w * d * d
+
+    def grad_potential(self, theta, e, v, x):
+        w, r0 = self._params(theta)
+        n = e.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        d = n - r0[..., None]
+        return 2.0 * w[..., None] * d * (e / n)
+
+    def certificate(self, theta, goal=None):
+        w, r0 = self._params(theta)
+        return {"kind": self.kind, "psd": True,
+                # the equilibrium is the shell ||e|| = r0, not e = 0, and saying
+                # otherwise would be a false claim about the closed loop
+                "zero_at_goal": False, "bounded_grad": False,
+                "equilibrium": "sphere", "radius": float(r0)}
+
+    def describe(self, theta):
+        w, r0 = self._params(theta)
+        return {"sto_w": float(w), "sto_r": float(r0)}

@@ -246,3 +246,96 @@ def make_task(name: str, system: LagrangianSystem, **kw) -> Task:
     if name not in TASKS:
         raise KeyError(f"unknown task {name!r}; registered: {sorted(TASKS)}")
     return TASKS[name](system, **kw)
+
+
+class ObserveTarget(Task):
+    """Hold a vantage point on a target that obstacles can hide.
+
+    The waypoint tasks ask the vehicle to REACH a point, and occlusion resolves
+    itself on arrival -- you cannot be blocked from somewhere you are standing.
+    This one asks it to WATCH a point from a standoff, which is a different
+    problem: no heading sees through a pillar, so when the line is blocked the
+    only remedy is to move somewhere else.
+
+    That makes it the task where a camera earns its place.  `sight_cost` is
+    fixed by turning and `visibility` only by repositioning, so the two together
+    ask for something a pure waypoint controller never has to do -- give up the
+    direct route and fly around to where the target can actually be seen.
+
+    Success is deliberately a conjunction of all three: inside the standoff
+    band, line of sight clear, and pointed at it.  Any two without the third is
+    not an observation.
+    """
+
+    n_legs = 1
+
+    def __init__(self, system, xy: float = 2.2, z_lo: float = 0.9, z_hi: float = 2.2,
+                 r_near: float = 1.2, r_far: float = 3.0, tol: float = 0.25,
+                 look_tol: float = 0.6, r_min: float = 1.9,
+                 gating: str = "time"):
+        super().__init__(system)
+        self.gating = gating
+        if system.task_dim != 3:
+            raise ValueError(f"ObserveTarget needs task_dim 3, got {system.task_dim}")
+        self.xy, self.z_lo, self.z_hi = float(xy), float(z_lo), float(z_hi)
+        self.r_near, self.r_far = float(r_near), float(r_far)
+        self.tol, self.look_tol = float(tol), float(look_tol)
+        self.r_min = float(r_min)
+
+    def sample(self, n: int, gen: torch.Generator) -> Tensor:
+        """Targets pushed out to at least `r_min` from where the vehicle starts.
+
+        An occluder placed ON the start-to-target line needs room at both ends,
+        and a short leg has none -- those episodes fall back to a scattered
+        occluder and the opening view is clear, which is exactly the case the
+        task is not about.  Enforcing a minimum leg took reliably-obscured starts
+        from 62% to over 90%.
+        """
+        kw = dict(gen=gen, dtype=self.system.dtype, device=self.system.device)
+        xy = uniform((n, self.n_legs, 2), -self.xy, self.xy, **kw)
+        r = xy.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        xy = xy * (self.r_min / r).clamp_min(1.0)
+        z = uniform((n, self.n_legs, 1), self.z_lo, self.z_hi, **kw)
+        return torch.cat([xy, z], dim=-1)
+
+    def goal_at(self, goals: Tensor, t: int, ep_steps: int) -> Tensor:
+        return goals[:, 0]
+
+    def success(self, s: State, goal: Tensor) -> Tensor:
+        p = self.system.task_position(s)
+        r = (p - goal).norm(dim=-1)
+        in_band = (r > self.r_near) & (r < self.r_far)
+        seen = self.system.visibility(s, goal) > 0.5
+        aimed = self.system.sight_cost(s, goal) < self.look_tol
+        return in_band & seen & aimed
+
+register_task("observe")(ObserveTarget)
+
+
+class AcquireThenReach(ObserveTarget):
+    """Line the camera up first, then fly in.
+
+    A waypoint task rewards arriving however you got there, so a controller that
+    charges blind is scored the same as one that looked first.  Here the target
+    starts hidden behind an obstacle, and credit needs BOTH: the vehicle has to
+    establish line of sight at some point, and then reach the target.
+
+    The ordering is not enforced by the scoring -- it falls out of the geometry.
+    Sight has to come first because the only way to lose it is to be behind
+    something, and the only way to regain it is to move; once the vehicle is at
+    the target it trivially sees it, so a "reached" episode that never acquired
+    is one that flew in blind. `acquired` is carried in the rollout rather than
+    recomputed at the end for exactly that reason: it is a claim about the whole
+    trajectory, not about its last frame.
+    """
+
+    def __init__(self, system, tol: float = 0.3, **kw):
+        kw.setdefault("gating", "time")
+        super().__init__(system, tol=tol, **kw)
+
+    def success(self, s: State, goal: Tensor) -> Tensor:
+        reached = (self.system.task_position(s) - goal).norm(dim=-1) < self.tol
+        return reached & (self.system.visibility(s, goal) > 0.5)
+
+
+register_task("acquire_then_reach")(AcquireThenReach)

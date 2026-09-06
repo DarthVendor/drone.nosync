@@ -86,10 +86,18 @@ class LagrangianSystem(ABC):
 
     # --- the underactuation seam --------------------------------------------
     @abstractmethod
-    def allocate(self, F_des: Tensor, s: State, phi: Tensor) -> Tensor:
+    def allocate(self, F_des: Tensor, s: State, phi: Tensor,
+                 goal: Optional[Tensor] = None) -> Tensor:
         """Map a desired task-space force [..., task_dim] onto a realizable
         generalized force [..., n_force], given allocator params phi
         [..., allocator_dim].
+
+        `goal` is optional and most plants ignore it.  It is here because an
+        underactuated plant may have a genuinely FREE degree of freedom left over
+        once the desired force is realised -- a quadrotor's heading, say -- and
+        choosing it well can need to know what the mission is aiming at.  A
+        heading cue derived from velocity or from the force demand vanishes at
+        hover; a bearing to the target does not.
 
         Fully actuated: identity, `allocator_dim = 0`.
         Quadrotor: thrust along body-z plus a geometric SO(3) attitude loop whose
@@ -208,6 +216,27 @@ class LagrangianSystem(ABC):
         if self.dense_mass:
             return torch.einsum("...i,...ij,...j->...", du, Minv, du)
         return (du * Minv * du).sum(dim=-1)
+
+    def visibility(self, s: State, goal: Tensor) -> Tensor:
+        """1 where the straight line to `goal` is clear, 0 where it is blocked.
+
+        Default 1: a plant with no geometry can always see its target.  Plants
+        that own an environment override it, and the distinction matters for
+        active perception -- pointing the camera at a target is worthless if a
+        pillar is in the way, and the only remedy is to MOVE.
+        """
+        return torch.ones_like(self.task_position(s)[..., 0])
+
+    def sight_cost(self, s: State, goal: Tensor) -> Tensor:
+        """How badly the vehicle is looking AWAY from `goal`, [...]. >= 0.
+
+        Zero for a plant with no meaningful heading.  It is separate from
+        `shaping_cost` because it needs the goal, and separate from the potential
+        because heading is not a task-space coordinate -- on a quadrotor it is a
+        free degree of freedom the allocator picks, so this is the only place a
+        preference over it can enter.
+        """
+        return torch.zeros_like(self.task_position(s)[..., 0])
 
     def shaping_cost(self, s: State) -> Tensor:
         """Plant-specific regularizer, [...].  Default: zeros."""

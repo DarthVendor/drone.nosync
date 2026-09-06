@@ -334,7 +334,8 @@ class PlanarQuadruped(LagrangianSystem):
         """Exactly zero: the hybrid starts as the pure constraint model."""
         return torch.zeros(self.residual_dim, dtype=self.dtype, device=self.device)
 
-    def allocate(self, F_des: Tensor, s: State, phi: Tensor) -> Tensor:
+    def allocate(self, F_des: Tensor, s: State, phi: Tensor,
+                 goal=None) -> Tensor:
         """Distribute a desired base wrench onto joint torques through the feet.
 
         This is the underactuation seam at its most literal: the base has no

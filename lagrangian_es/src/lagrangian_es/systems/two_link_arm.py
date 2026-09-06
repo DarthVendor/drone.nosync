@@ -120,7 +120,8 @@ class TwoLinkArm(LagrangianSystem):
                 & (dq.norm(dim=-1) < self.dq_max) & (q.abs().amax(-1) < 50.0))
 
     # --- fully actuated: the allocator seam collapses ------------------------
-    def allocate(self, F_des: Tensor, s: State, phi: Tensor) -> Tensor:
+    def allocate(self, F_des: Tensor, s: State, phi: Tensor,
+                 goal=None) -> Tensor:
         return F_des
 
     # --- task space is joint space -----------------------------------------

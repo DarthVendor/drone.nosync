@@ -210,7 +210,7 @@ class EnergyShaping(Trainable):
 
         F_des = sysm.gravity_force(s) - bracket
         _, phi = self.split(theta)
-        return sysm.allocate(F_des, s, phi)
+        return sysm.allocate(F_des, s, phi, goal)
 
     # --- reporting ----------------------------------------------------------
     def describe(self, theta: Tensor) -> dict:

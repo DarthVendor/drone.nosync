@@ -72,7 +72,9 @@ def build(cfg: Config):
     kw.update(dict(cfg.system_kw))
     system = make_system(cfg.system, dtype=dt, **kw)
     trainable = make_trainable(cfg.trainable, system)
-    task = make_task(cfg.task, system, gating=cfg.gating)
+    tkw = dict(cfg.task_kw)
+    tkw.setdefault("gating", cfg.gating)
+    task = make_task(cfg.task, system, **tkw)
     return system, trainable, task
 
 

@@ -10,6 +10,7 @@ from typing import Callable, Dict, Type
 from .base import DelayBuffer, Sensor
 from .full_state import FullState, FullStateVelocity, NoisyPosition
 from .landmarks import LandmarkCamera
+from .depth_camera import DepthCamera
 from .range_sensor import RangeSensor
 from .lens import LENSES, DoubleSphere, Pinhole, make_lens
 
@@ -37,8 +38,9 @@ register_sensor("full_state_velocity")(FullStateVelocity)
 register_sensor("noisy_position")(NoisyPosition)
 register_sensor("landmark_camera")(LandmarkCamera)
 register_sensor("range")(RangeSensor)
+register_sensor("depth_camera")(DepthCamera)
 
 __all__ = ["Sensor", "DelayBuffer", "FullState", "FullStateVelocity",
            "NoisyPosition", "LandmarkCamera", "RangeSensor", "Pinhole", "DoubleSphere",
            "make_lens", "LENSES",
-           "SENSORS", "register_sensor", "make_sensor"]
+           "DepthCamera", "SENSORS", "register_sensor", "make_sensor"]

@@ -10,6 +10,8 @@ built on this cannot become confident just because a beam missed.
 """
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import Tensor
 
@@ -34,12 +36,18 @@ class RangeSensor(Sensor):
     name = "range"
     update_every = 1
 
-    def __init__(self, system, n_beams: int = 24, max_range: float = 4.0,
+    def __init__(self, system, n_beams: int = 24, max_range: float = 6.0,
                  spread: float = TWO_PI, sigma: float = 0.02,
-                 latency_steps: int = 1):
+                 latency_steps: int = 1, elevations: tuple = (0.0,)):
         self.system = system
         self.n_beams = int(n_beams)
-        self.obs_dim = self.n_beams
+        # A purely horizontal fan is blind to anything off its own altitude.
+        # That is fine for extruded obstacles like pillars and walls, and
+        # wrong for anything with vertical structure -- a flat hoop's ring can
+        # be entirely invisible.  `elevations` tilts extra fans out of plane;
+        # the default keeps the single horizontal ring.
+        self.elevations = tuple(float(e) for e in elevations)
+        self.obs_dim = self.n_beams * len(self.elevations)
         self.max_range = float(max_range)
         self.spread = float(spread)
         self.sigma = float(sigma)
@@ -57,10 +65,13 @@ class RangeSensor(Sensor):
         yaw = self._yaw(s)
         k = torch.arange(self.n_beams, dtype=yaw.dtype, device=yaw.device)
         off = (k / self.n_beams - 0.5) * self.spread
-        ang = yaw[..., None] + off
-        # horizontal beams, but 3-D: obstacles may have height structure
-        return torch.stack([torch.cos(ang), torch.sin(ang),
-                            torch.zeros_like(ang)], dim=-1)
+        ang = yaw[..., None] + off                      # [..., n_beams]
+        out = []
+        for el in self.elevations:
+            ce, se = math.cos(el), math.sin(el)
+            out.append(torch.stack([torch.cos(ang) * ce, torch.sin(ang) * ce,
+                                    torch.full_like(ang, se)], dim=-1))
+        return torch.cat(out, dim=-2)                   # [..., n_beams*n_elev, 3]
 
     def observe(self, s: State, gen: torch.Generator) -> Tensor:
         rng, _ = self.system.raycast(s, self._dirs(s), self.max_range)

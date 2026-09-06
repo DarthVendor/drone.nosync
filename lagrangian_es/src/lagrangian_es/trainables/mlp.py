@@ -106,7 +106,7 @@ class MLPPolicy(Trainable):
         x = torch.tanh(torch.einsum("...i,...ij->...j", x, W2) + b2)
         out = torch.einsum("...i,...ij->...j", x, W3) + b3
         F_des = sysm.gravity_force(s) + self.out_scale * out
-        return sysm.allocate(F_des, s, phi)
+        return sysm.allocate(F_des, s, phi, goal)
 
     def describe(self, theta: Tensor) -> dict:
         with torch.no_grad():

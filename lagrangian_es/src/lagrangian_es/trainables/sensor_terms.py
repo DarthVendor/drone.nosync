@@ -450,6 +450,18 @@ class RangeDamper(SensorPotential):
                  * torch.sigmoid(theta[..., 1]))
         return c, accel
 
+    @staticmethod
+    def _soft_hinge(x, s: float = 0.25):
+        """max(x, 0) with the corner rounded over ~`s` m/s.
+
+        NOT shifted to vanish at x = 0.  Subtracting the offset would make the
+        hinge NEGATIVE below the threshold, and a negative excess flips the sign
+        of the force -- the term would accelerate an approach it is there to
+        arrest.  Unshifted it is >= 0 everywhere, decays like s^2/(4|x|) inside
+        the envelope (0.015 at 1 m/s under it) and tends to x above it.
+        """
+        return 0.5 * (x + torch.sqrt(x * x + s * s))
+
     def _v_safe(self, z, accel):
         """Speed the remaining distance can still absorb, sqrt(2 a d)."""
         return (2.0 * accel[..., None] * z.clamp_min(0.0)).clamp_min(0.0).sqrt()
@@ -471,8 +483,21 @@ class RangeDamper(SensorPotential):
             return torch.zeros_like(e)
         c, accel = self._params(theta)
         close = torch.einsum("...od,...d->...o", J, v).neg().clamp_min(0.0)
-        # only the part of the approach the remaining distance cannot absorb
-        excess = (close - self._v_safe(z, accel)).clamp_min(0.0)
+        # Only the part of the approach the remaining distance cannot absorb --
+        # and hinged SMOOTHLY.  A hard relu switches at the threshold, so a beam
+        # hovering near `v_safe` toggles the force on and off every step and the
+        # vehicle is shaken: measured, the damper accounted for 10.7 rad of
+        # accumulated heading change against 6.2 rad without it, over a path whose
+        # detour was only 1.07x direct.  The route was never the problem; the
+        # chatter was.
+        # Capped at the closing speed itself.  The smooth hinge leaves a small
+        # positive residual below the threshold, and with `close` at zero that
+        # residual still produces a force -- which on a RECEDING beam points
+        # along the motion and ADDS energy (measured +1.09 of power before this
+        # cap).  Dissipativity is the whole justification for the term, so it has
+        # to hold exactly, not almost.
+        excess = torch.minimum(self._soft_hinge(close - self._v_safe(z, accel)),
+                               close)
         k = c[..., None] / self.n_beams
         # dR/dv = -sum_i k_i * excess_i * J_i ; the caller subtracts it, so the
         # applied force is +sum_i k_i excess_i J_i -- opposing the approach

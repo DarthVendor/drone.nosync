@@ -155,7 +155,8 @@ class MaximalChain(LagrangianSystem):
         """Maximal coordinates are already (x, z, angle) per body."""
         return s["q"].reshape(s["q"].shape[:-1] + (self.N, 3))
 
-    def allocate(self, F_des: Tensor, s: State, phi: Tensor) -> Tensor:
+    def allocate(self, F_des: Tensor, s: State, phi: Tensor,
+                 goal=None) -> Tensor:
         return F_des
 
     def task_position(self, s: State) -> Tensor:

@@ -10,9 +10,10 @@ from __future__ import annotations
 from .base import (
     EPS, Environment, Mixture, ObstacleGroup, State, march,
 )
-from .primitives import Gate, Hoops, Pillars, Walls
+from .primitives import Boxes, Gate, Hoops, Pillars, Walls
 
-GROUPS = {"pillars": Pillars, "walls": Walls, "gate": Gate, "hoops": Hoops}
+GROUPS = {"pillars": Pillars, "walls": Walls, "gate": Gate,
+          "hoops": Hoops, "boxes": Boxes}
 
 #: named scenes -- each is just a list of groups, so a new one is one line
 PRESETS = {
@@ -23,6 +24,20 @@ PRESETS = {
     "slalom":   lambda: [Pillars(n=4, extent=1.8, r_lo=0.26, r_hi=0.40)],
     "gate":     lambda: [Gate()],
     "walls":    lambda: [Walls(n=2)],
+    # Blocks rather than columns: a box has FACES, so its shadow has a definite
+    # width that changes with bearing and a corner that sharply recovers the
+    # view.  Finite height too, so a vantage can be found by going over as well
+    # as around -- which a horizontal beam fan cannot see and a camera can.
+    "boxes":    lambda: [Boxes(n=4)],
+    "blocks":   lambda: [Boxes(n=6, half_lo=0.20, half_hi=0.50, extent=2.6)],
+    "box_field": lambda: [Boxes(n=4), Pillars(n=3, r_lo=0.16, r_hi=0.26)],
+    # Larger arenas.  Obstacle counts scale with AREA, not with extent, so the
+    # density stays comparable and "bigger" means more room to manoeuvre rather
+    # than a sparser and quietly easier task.
+    "pillars_large": lambda: [Pillars(n=20, extent=5.0)],
+    "boxes_large":   lambda: [Boxes(n=14, extent=4.8)],
+    "box_field_large": lambda: [Boxes(n=10, extent=4.8),
+                                Pillars(n=8, extent=5.0, r_lo=0.16, r_hi=0.30)],
     "cluttered": lambda: [Pillars(n=5), Walls(n=2, length=1.3)],
     "gate_forest": lambda: [Gate(), Pillars(n=5, r_lo=0.14, r_hi=0.24)],
     "hoops":         lambda: [Hoops(n=2)],

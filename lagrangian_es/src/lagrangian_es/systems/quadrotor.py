@@ -23,7 +23,7 @@ from .so3 import rodrigues, vee
 class QuadrotorSE3(LagrangianSystem):
     n_force = 4
     task_dim = 3
-    allocator_dim = 6          # kR [3], kW [3]
+    allocator_dim = 6          # kR [3], kW [3]; +3 under yaw_mode='learned'
     dense_mass = False
     state_keys = ("p", "v", "R", "om")
 
@@ -35,6 +35,15 @@ class QuadrotorSE3(LagrangianSystem):
         thrust_ratio: float = 2.2,     # f_max / (m g)
         tau_max: float = 0.30,
         phi0: tuple = (0.25, 0.25, 0.25, 0.10, 0.10, 0.10),   # kR, kW priors
+        # "world_x" pins the heading to a compass bearing; "learned" hands yaw
+        # to the genome, which is free on this plant -- thrust is along body z,
+        # so rotating about it does not disturb position tracking at all.
+        yaw_mode: str = "world_x",
+        # below this speed the heading holds a fixed bearing rather than chasing
+        # a direction estimated from near-zero velocity
+        yaw_speed_gate: float = 0.6,
+        # how far the heading reference may lead the current heading (rad)
+        yaw_slew: float = 0.25,
         # --- reset distribution
         reset_z: float = 0.5,
         reset_pos_noise: float = 0.05,
@@ -56,6 +65,21 @@ class QuadrotorSE3(LagrangianSystem):
         self.f_max = float(thrust_ratio) * self.m * self.g
         self.f_min = 0.0
         self.tau_max = float(tau_max)
+        if yaw_mode not in ("world_x", "learned"):
+            raise ValueError(f"unknown yaw_mode {yaw_mode!r}")
+        self.yaw_mode = yaw_mode
+        self.yaw_speed_gate = float(yaw_speed_gate)
+        self.yaw_slew = float(yaw_slew)
+        if yaw_mode == "learned":
+            # three extra slots: where to LOOK.  Yaw is the one degree of freedom
+            # a quadrotor has for free -- thrust acts along body z, so rotating
+            # about it costs nothing in position tracking -- and pinning it to a
+            # compass bearing throws that away.  Measured under `world_x`, the
+            # body's forward axis sits 90.2 deg off the direction of travel and
+            # the path lies inside an 80 deg field of view only 10% of the time,
+            # so a body-mounted camera watches everything except where the
+            # vehicle is going.
+            self.allocator_dim = 9
         self.phi0 = tuple(phi0)
 
         self.reset_z = float(reset_z)
@@ -145,7 +169,8 @@ class QuadrotorSE3(LagrangianSystem):
         return torch.zeros_like(s["p"]) + self._grav_wrench
 
     # --- the underactuation seam --------------------------------------------
-    def allocate(self, F_des: Tensor, s: State, phi: Tensor) -> Tensor:
+    def allocate(self, F_des: Tensor, s: State, phi: Tensor,
+                 goal: Optional[Tensor] = None) -> Tensor:
         """Thrust along body z + a geometric SO(3) attitude loop.
 
         `phi` = (kR [3], kW [3]) raw; gains are used squared so they stay positive
@@ -161,9 +186,63 @@ class QuadrotorSE3(LagrangianSystem):
         b3 = R[..., :, 2]
         f = (F_des * b3).sum(dim=-1).clamp(self.f_min, self.f_max)
 
-        # --- desired attitude: body z along F_des, yaw pinned to world x ------
+        # --- desired attitude: body z along F_des, then choose where to LOOK --
         b3d = F_des / F_des.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        b1c = torch.zeros_like(b3d) + self._e1
+        if self.yaw_mode == "learned":
+            # A heading blended from three horizontal cues, all available here:
+            #   travel   where the vehicle is going now
+            #   demand   where it is being accelerated -- i.e. where it is about
+            #            to go, which is the ANTICIPATORY term
+            #   lateral  travel rotated 90 deg, so the search can bias the look
+            #            off-axis and scan into a turn before entering it
+            w = phi[..., 6:9]
+            vxy = torch.cat([s["v"][..., :2],
+                             torch.zeros_like(s["v"][..., 2:])], dim=-1)
+            sp0 = vxy.norm(dim=-1, keepdim=True)
+            vh = vxy / sp0.clamp_min(1e-6)
+            # TRAVEL faded out by speed: a direction estimated from millimetres
+            # per second is well defined and meaningless, and chasing it spins
+            # the heading.  Faded here rather than gating the whole blend, so the
+            # other cues survive at hover -- which is the case that matters when
+            # the job is to hold station and keep something in view.
+            vgate = (sp0 / self.yaw_speed_gate).clamp(0.0, 1.0)
+            # BEARING to the target: the only cue still defined at rest, and the
+            # one that means "keep it in sight".
+            if goal is not None:
+                gxy = torch.cat([goal[..., :2] - s["p"][..., :2],
+                                 torch.zeros_like(s["v"][..., 2:])], dim=-1)
+                gh = gxy / gxy.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            else:
+                gh = torch.zeros_like(vh) + self._e1
+            lat = torch.stack([-vh[..., 1], vh[..., 0],
+                               torch.zeros_like(vh[..., 2])], dim=-1)
+            look = (w[..., 0:1] * gh + w[..., 1:2] * (vgate * vh)
+                    + w[..., 2:3] * (vgate * lat))
+            n = look.norm(dim=-1, keepdim=True)
+            look = look / n.clamp_min(1e-6)
+            # Blend back to a FIXED bearing at low speed.  `vh` is a normalised
+            # direction, so it is well defined but meaningless when barely
+            # moving: it swings through large angles for millimetre-per-second
+            # motion, the yaw reference spins, the attitude loop chases it and the
+            # vehicle tumbles.  Measured with the guard keyed on the blend's norm
+            # instead of on SPEED -- which is 1 for any nonzero v, so it never
+            # fired -- the prior crashed 95% of episodes.
+            # Cap how far the heading reference may sit from the CURRENT heading.
+            # The attitude loop drives one combined SO(3) error, so a yaw
+            # reference that keeps moving never lets it settle: measured
+            # unclamped, tilt rose 4.7x (0.038 -> 0.178) and torque saturated
+            # 23% of steps against 13%, while the gyroscopic coupling it was
+            # blamed on stayed negligible (0.006 of a 0.30 N.m budget).  Bounding
+            # the yaw error bounds its share of the torque, so pointing the camera
+            # cannot outbid keeping the vehicle upright.
+            cur = torch.atan2(R[..., 1, 0], R[..., 0, 0])
+            des = torch.atan2(look[..., 1], look[..., 0])
+            dpsi = torch.atan2(torch.sin(des - cur), torch.cos(des - cur))
+            psi = cur + dpsi.clamp(-self.yaw_slew, self.yaw_slew)
+            b1c = torch.stack([torch.cos(psi), torch.sin(psi),
+                               torch.zeros_like(psi)], dim=-1)
+        else:
+            b1c = torch.zeros_like(b3d) + self._e1
         b2d = torch.cross(b3d, b1c, dim=-1)
         b2d = b2d / b2d.norm(dim=-1, keepdim=True).clamp_min(1e-6)
         b1d = torch.cross(b2d, b3d, dim=-1)
@@ -188,8 +267,19 @@ class QuadrotorSE3(LagrangianSystem):
     def allocator_init(self) -> Tensor:
         """kR = 0.25, kW = 0.10 (used squared) -> an attitude loop barely faster
         than the position loop.  Deliberately marginal: this is what makes the
-        generation-0 prior crash rather than merely track poorly."""
-        return self._t(self.phi0)
+        generation-0 prior crash rather than merely track poorly.
+
+        Under `yaw_mode="learned"` the prior points straight at the target
+        (1, 0, 0) -- the cue that survives at hover -- and the search is free to
+        move weight onto travel (look where you are going) or lateral (scan into
+        the turn) instead.
+        """
+        phi = self._t(self.phi0)
+        if self.yaw_mode == "learned":
+            extra = torch.tensor([1.0, 0.0, 0.0], dtype=self.dtype,
+                                 device=self.device)   # look AT the target
+            phi = torch.cat([phi, extra])
+        return phi
 
     def camera_pose(self, s: State):
         return s["p"], s["R"]
@@ -234,6 +324,24 @@ class QuadrotorSE3(LagrangianSystem):
     def shaping_cost(self, s: State) -> Tensor:
         """Tilt penalty: 1 - R[2,2], zero when level, 2 when inverted."""
         return 1.0 - s["R"][..., 2, 2]
+
+    def sight_cost(self, s: State, goal: Tensor) -> Tensor:
+        """1 - cos(angle) between body +x and the horizontal bearing to `goal`.
+
+        0 looking straight at it, 1 broadside, 2 looking away.  Body +x is where
+        a nose-mounted camera points, so this is the term that makes keeping the
+        target in view worth something -- and yaw is free on this plant, so
+        satisfying it costs nothing in tracking.  Degenerate directly overhead,
+        where the horizontal bearing is undefined; the floored norm leaves the
+        cost near zero there rather than swinging the heading around.
+        """
+        d = goal[..., :2] - s["p"][..., :2]
+        n = d.norm(dim=-1, keepdim=True)
+        dh = d / n.clamp_min(1e-6)
+        fwd = s["R"][..., :2, 0]
+        cos = (fwd * dh).sum(-1)
+        gate = (n[..., 0] / 0.25).clamp(0.0, 1.0)      # ignore when almost on top
+        return gate * (1.0 - cos)
 
     # --- diagnostics --------------------------------------------------------
     def saturation(self, u: Tensor, s: State) -> Tensor:

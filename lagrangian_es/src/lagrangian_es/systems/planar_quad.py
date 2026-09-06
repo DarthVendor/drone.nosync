@@ -78,7 +78,8 @@ class PlanarQuadrotor(LagrangianSystem):
     def allocator_init(self) -> Tensor:
         return self._t(self.phi0)
 
-    def allocate(self, F_des: Tensor, s: State, phi: Tensor) -> Tensor:
+    def allocate(self, F_des: Tensor, s: State, phi: Tensor,
+                 goal=None) -> Tensor:
         """Thrust along body z, plus a scalar attitude loop.
 
         The angle error is wrapped with atan2(sin d, cos d) rather than a modulo:

@@ -109,6 +109,112 @@ class Pillars(ObstacleGroup):
                 "c": f[self._k("c")], "r": f[self._k("r")]}
 
 
+class Boxes(ObstacleGroup):
+    """Upright rectangular blocks, yaw-rotated, with finite height.
+
+    A cylinder's shadow has no edges -- its silhouette is the same from every
+    bearing, so the boundary between seeing a target and not seeing it is soft
+    and featureless.  A box has FACES: the shadow it casts has a definite width
+    that changes with viewing angle, and stepping past a corner recovers the view
+    sharply.  For an occlusion task that is the difference between a gradient
+    that merely exists and one that says something.
+
+    Finite height also matters, unlike `Pillars` which extrude forever.  A block
+    can be looked over as well as around, so the vantage problem is genuinely
+    three-dimensional -- which is the case a horizontal beam fan cannot see and a
+    forward camera can.
+
+    Only `sdf` is implemented: the base class sphere-marches it, which is the
+    whole point of that abstraction.  The exact box SDF is the standard one,
+    q = |p| - h with distance ||max(q,0)|| + min(max(q), 0) -- correct both
+    outside and inside, so the marcher never steps through a face.
+    """
+
+    kind = "boxes"
+
+    def __init__(self, n: int = 4, key: str = "boxes", extent: float = 2.4,
+                 half_lo: float = 0.16, half_hi: float = 0.42,
+                 h_lo: float = 0.7, h_hi: float = 2.0,
+                 keep_clear: float = 0.65):
+        self.n, self.key = int(n), key
+        self.extent = float(extent)
+        self.half_lo, self.half_hi = float(half_lo), float(half_hi)
+        self.h_lo, self.h_hi = float(h_lo), float(h_hi)
+        self.keep_clear = float(keep_clear)
+
+    def sample(self, B, gen, dtype, device):
+        kw = dict(generator=gen, dtype=dtype, device=device)
+        c = (torch.rand(B, self.n, 2, **kw) * 2.0 - 1.0) * self.extent
+        d = c.norm(dim=-1, keepdim=True).clamp_min(EPS)
+        c = c * (self.keep_clear / d).clamp_min(1.0)
+        hx = self.half_lo + (self.half_hi - self.half_lo) * torch.rand(B, self.n, **kw)
+        hy = self.half_lo + (self.half_hi - self.half_lo) * torch.rand(B, self.n, **kw)
+        hz = self.h_lo + (self.h_hi - self.h_lo) * torch.rand(B, self.n, **kw)
+        ang = torch.rand(B, self.n, **kw) * 3.141592653589793
+        return {self._k("c"): c, self._k("h"): torch.stack([hx, hy, hz], -1),
+                self._k("a"): ang}
+
+    def sdf(self, p, f, extra: int = 0):
+        c, h, a = f[self._k("c")], f[self._k("h")], f[self._k("a")]
+        for _ in range(extra):
+            c, h, a = c.unsqueeze(-3), h.unsqueeze(-3), a.unsqueeze(-2)
+        d = p[..., None, :2] - c                       # into each box's frame
+        ca, sa = torch.cos(a), torch.sin(a)
+        lx = d[..., 0] * ca + d[..., 1] * sa
+        ly = -d[..., 0] * sa + d[..., 1] * ca
+        # boxes stand on the floor, so the vertical extent runs 0..h_z
+        lz = p[..., None, 2] - 0.5 * h[..., 2]
+        q = torch.stack([lx.abs() - h[..., 0], ly.abs() - h[..., 1],
+                         lz.abs() - 0.5 * h[..., 2]], dim=-1)
+        outside = q.clamp_min(0.0).norm(dim=-1)
+        inside = q.max(dim=-1).values.clamp_max(0.0)
+        return (outside + inside).min(dim=-1).values
+
+    def ray_bounds(self, origin, dirs, f, max_range):
+        """Bracket on the group's bounding sphere, so the marcher spends its
+        step budget where the boxes actually are."""
+        c, h = f[self._k("c")], f[self._k("h")]
+        rad = h.norm(dim=-1).max(dim=-1).values + 1e-3          # [...]
+        ctr = c.mean(dim=-2)
+        span = (c - ctr[..., None, :]).norm(dim=-1).max(dim=-1).values + rad
+        a = origin[..., :2] - ctr
+        t_mid = -(a[..., None, :] * dirs[..., :2]).sum(-1)
+        half = span[..., None]
+        lo = (t_mid - half).clamp_min(0.0)
+        hi = (t_mid + half).clamp(0.0, max_range)
+        return lo, torch.maximum(hi, lo)
+
+    def clear_points(self, f, pts, margin):
+        """Push each box off any waypoint it covers, along the shortest escape.
+
+        Uses the box's own bounding radius rather than a face-exact test: the
+        margin only has to guarantee free space, and over-clearing by the corner
+        distance is the safe direction to be wrong in.
+        """
+        c, h, a = f[self._k("c")].clone(), f[self._k("h")], f[self._k("a")]
+        r = h[..., :2].norm(dim=-1)                    # bounding radius in plan
+        p2 = pts[..., :2]
+        for _ in range(6):
+            delta = c[..., :, None, :] - p2[..., None, :, :]
+            dist = delta.norm(dim=-1)
+            need = r[..., :, None] + margin
+            viol = need - dist
+            worst, idx = viol.max(dim=-1)
+            take = idx[..., None, None].expand(idx.shape + (1, 2))
+            dsel = delta.gather(-2, take).squeeze(-2)
+            nrm = dsel.norm(dim=-1, keepdim=True)
+            fallback = torch.zeros_like(dsel)
+            fallback[..., 0] = 1.0
+            unit = torch.where(nrm > EPS, dsel / nrm.clamp_min(EPS), fallback)
+            c = c + unit * worst.clamp_min(0.0)[..., None]
+        c = _evict(c, _circle_violates(c, r, p2, margin))
+        return {self._k("c"): c, self._k("h"): h, self._k("a"): a}
+
+    def render(self, f):
+        return {"kind": "boxes", "c": f[self._k("c")], "h": f[self._k("h")],
+                "a": f[self._k("a")]}
+
+
 class Walls(ObstacleGroup):
     """Finite vertical wall segments, with thickness."""
 

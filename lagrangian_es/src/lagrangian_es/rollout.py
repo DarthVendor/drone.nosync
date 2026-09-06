@@ -273,6 +273,11 @@ class Rollout:
         # every step the vehicle sits inside tol -- paying the bonus per step
         # would make hovering on the goal an unbounded reward.  Credit it once.
         paid_last = torch.zeros(B, dtype=torch.bool, device=sysm.device)
+        # `arrived` freezes an episode that has finished the course, exactly as
+        # `alive` freezes one that crashed.  Once nothing is still flying the
+        # remaining steps cannot change any accumulator, so the loop can leave.
+        arrived = torch.zeros(B, dtype=torch.bool, device=sysm.device)
+        stop_early = bool(cfg.stop_on_arrival) and arrival
         credits = torch.zeros(B, dtype=sysm.dtype, device=sysm.device)
         frozen_dead = cfg.dead_mode == "frozen"
         forfeit_dead = cfg.dead_mode == "forfeit"
@@ -295,13 +300,17 @@ class Rollout:
             u = self._u(TH_b, s, goal, self._observe(s, sgen, t))
             s_new = sysm.step(s, u, dt, res_b)
             # crashed vehicles freeze; never integrate a diverged state
-            s = tree_where(alive, s_new, s)
+            s = tree_where(alive & ~arrived, s_new, s)
 
             err = sysm.task_position(s) - goal
             pos = torch.sqrt((err * err).sum(-1) + cfg.pos_eps)
             eff = sysm.effort(u, s)
             shp = sysm.shaping_cost(s)
             live = pos + cfg.lambda_e * eff + cfg.lambda_s * shp
+            if cfg.lambda_los:
+                live = live + cfg.lambda_los * sysm.sight_cost(s, goal)
+            if cfg.lambda_occ:
+                live = live + cfg.lambda_occ * (1.0 - sysm.visibility(s, goal))
             if res_b is not None:
                 live = live + cfg.lambda_r * sysm.residual_penalty(res_b)
             # in-place: this runs under no_grad, and the accumulators were each
@@ -311,7 +320,12 @@ class Rollout:
             # its own.  Effort and shaping are dropped: it is not actuating.
             charge = (pos if frozen_dead
                       else start_err if forfeit_dead else dead)
-            cost.add_(torch.where(alive, live, charge), alpha=dt)
+            step_cost = torch.where(alive, live, charge)
+            if stop_early:
+                # a finished episode stops accruing; it is done, not hovering
+                step_cost = torch.where(arrived, torch.zeros_like(step_cost),
+                                        step_cost)
+            cost.add_(step_cost, alpha=dt)
             sat.add_(sysm.saturation(u, s))
             eff_acc.add_(eff)
             shp_acc.add_(shp)
@@ -331,9 +345,24 @@ class Rollout:
                     credits.add_(hit.to(sysm.dtype))
                     paid_last = paid_last | (reached & last)
                 leg = torch.where(reached & ~last, leg + 1, leg)
+                if stop_early:
+                    arrived = arrived | (reached & last)
             elif t in leg_ends:
                 leg_err[:, leg_ends.index(t)] = err.norm(dim=-1)
             alive = alive & sysm.alive(s)
+            if stop_early and bool((arrived | ~alive).all()):
+                # every episode has finished or died; the tail is all zeros for
+                # the finished ones, and a constant rate for the dead ones, so
+                # settle the dead in one go rather than stepping the physics
+                # forward for nothing.
+                if not frozen_dead and not forfeit_dead:
+                    cost.add_((~alive).to(sysm.dtype),
+                              alpha=cfg.dead_cost * dt * (T - 1 - t))
+                elif frozen_dead or forfeit_dead:
+                    tail = start_err if forfeit_dead else pos
+                    cost.add_(torch.where(alive, torch.zeros_like(tail), tail),
+                              alpha=dt * (T - 1 - t))
+                break
 
         final_goal = task.goal_for_leg(goals_b, leg) if arrival \
             else task.goal_at(goals_b, T - 1, T)

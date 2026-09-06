@@ -45,7 +45,7 @@ class FixedPD(Trainable):
         _, phi = self.split(theta)
         e = sysm.task_position(s) - goal
         F_des = sysm.gravity_force(s) - kp * e - kd * sysm.task_velocity(s)
-        return sysm.allocate(F_des, s, phi)
+        return sysm.allocate(F_des, s, phi, goal)
 
     def describe(self, theta: Tensor) -> dict:
         with torch.no_grad():

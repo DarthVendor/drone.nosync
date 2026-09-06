@@ -18,7 +18,26 @@ class RolloutCfg:
     n_eps: int = 2                # episodes per genome; shared across population
     lambda_e: float = 0.02        # effort weight
     lambda_s: float = 0.10        # plant-specific shaping weight
+    lambda_los: float = 0.0       # weight on `sight_cost`: keeping the
+                                  # target in the camera's view.  Free on a
+                                  # quadrotor -- yaw does not disturb
+                                  # position tracking -- but only if the
+                                  # allocator is in yaw_mode='learned',
+                                  # otherwise heading is a fixed constant
+                                  # and this weight buys nothing.
+    lambda_occ: float = 0.0       # weight on losing sight of the target to
+                                  # an obstacle.  Distinct from lambda_los:
+                                  # that one is fixed by TURNING, this one
+                                  # only by MOVING, since no heading sees
+                                  # through a pillar.
     lambda_r: float = 0.05        # learned-residual regularizer weight
+    stop_on_arrival: bool = False  # freeze an episode once it reaches the FINAL
+                                  # waypoint, and leave the loop once every
+                                  # episode is finished or dead.  The vehicle
+                                  # arrives after ~6% of a 2400-step episode, so
+                                  # the rest is pure waste -- both in training
+                                  # time and in a replay that runs on long after
+                                  # the task is over.
     charge_slots: int = 96        # world-frame sensor returns remembered by a
                                   # harmonic field term; 8 updates of a 12-beam
                                   # fan.  Ignored unless a term asks for them.
@@ -121,6 +140,11 @@ class Config:
     task: str = "waypoint_pair"
     sensors: tuple = ()           # sensor registry names; () = full-state path
     environment: str = ""         # scene preset for plants that take one
+    task_kw: tuple = ()           # extra task kwargs as (name, value) pairs.
+                                  # A bigger arena is not one number: the scene's
+                                  # extent, the task's reach and the sensor's
+                                  # range all have to move together, and without
+                                  # this the task stays the size it always was.
     system_kw: tuple = ()         # extra plant kwargs as (name, value) pairs;
                                   # a tuple, not a dict, so Config stays frozen
                                   # and hashable
