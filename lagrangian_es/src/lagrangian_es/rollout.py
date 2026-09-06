@@ -191,6 +191,13 @@ class Rollout:
         self._held = {}
         self._raw = {}          # noiseless readings, kept so frozen episodes
                                 # can be skipped without re-marching them
+        # NOT cached: skipping the controller for arrived episodes was tried
+        # and is in the git history as a dead end.  It is 44% of a city rollout,
+        # but `s` carries per-episode obstacle geometry, so indexing the batch
+        # down to the awake rows costs more than the evaluation it saves -- 0.96x
+        # on the city, 1.12x on pillars.  It was also not bit-exact: the control
+        # cached on the step an episode arrives was computed from the state
+        # BEFORE that step, not the frozen state after it.
         if self.charge_mem is not None:
             self.charge_mem.reset()
         for sen, buf in zip(self.sensors, self.buffers):
@@ -364,8 +371,8 @@ class Rollout:
             # in the fitness, so skipping them would not be free.  An arrived
             # episode is frozen holding a perfectly ordinary state, so its
             # cached reading is exactly the reading a re-march would produce.
-            live = ~arrived
-            u = self._u(TH_b, s, goal, self._observe(s, sgen, t, live))
+            awake = ~arrived          # `live` below is a COST, not a mask
+            u = self._u(TH_b, s, goal, self._observe(s, sgen, t, awake))
             s_new = sysm.step(s, u, dt, res_b)
             # crashed vehicles freeze; never integrate a diverged state
             s = tree_where(alive & ~arrived, s_new, s)
@@ -419,10 +426,21 @@ class Rollout:
             elif t in leg_ends:
                 leg_err[:, leg_ends.index(t)] = err.norm(dim=-1)
             alive = alive & sysm.alive(s)
-            done_frac = (arrived | ~alive).to(sysm.dtype).mean()
             q = float(cfg.stop_quantile)
-            if stop_early and bool(done_frac >= 1.0 if q >= 1.0
-                                   else done_frac >= q):
+            if q >= 1.0:
+                # exact: wait for every episode to arrive or die
+                enough = bool((arrived | ~alive).all())
+            else:
+                # ARRIVALS ONLY.  Counting crashes toward the quantile lets a
+                # policy that crashes a lot reach the threshold sooner and end
+                # the batch early -- truncating precisely the survivors who were
+                # still flying, which rewards crashing with a shorter episode.
+                # Arrivals-only also self-gates: if more than (1 - q) of the
+                # batch dies, the threshold is unreachable and the batch runs to
+                # full length, so the shortcut applies only once the policy is
+                # already good.
+                enough = bool(arrived.to(sysm.dtype).mean() >= q)
+            if stop_early and enough:
                 # every episode has finished or died; the tail is all zeros for
                 # the finished ones, and a constant rate for the dead ones, so
                 # settle the dead in one go rather than stepping the physics

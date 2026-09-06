@@ -98,7 +98,18 @@ def march(group, origin: Tensor, dirs: Tensor, f: State, max_range: float,
     t, t_max = group.ray_bounds(origin, dirs, f, max_range)
     for _ in range(steps):
         d = group.sdf(o + t[..., None] * dirs, f, extra=1)
-        t = torch.minimum(t + d.clamp_min(1e-3), t_max)
+        # STOP at the surface.  The 1 mm floor exists so a grazing ray still
+        # makes progress instead of stalling, but applied unconditionally it
+        # walks a ray that has already arrived straight THROUGH the obstacle:
+        # inside, the distance is negative, the floor keeps pushing, and the ray
+        # eventually leaves by the far side and flies off into open space, where
+        # the final `sdf(end) < tol` test then calls it a miss.
+        #
+        # That made the marcher worse with more steps, not better -- a 1024-step
+        # march found FEWER hits than a 24-step one, and both under-reported
+        # against the exact box intersection by up to 19.6%.
+        step = torch.where(d < tol, torch.zeros_like(d), d.clamp_min(1e-3))
+        t = torch.minimum(t + step, t_max)
     end = o + t[..., None] * dirs
     hit = group.sdf(end, f, extra=1) < tol
     n = group.normal(end, f, extra=1)
@@ -156,7 +167,15 @@ class ObstacleGroup(ABC):
     #: fail.  24 brings the p99 to 0.044 m.  Cost is steps x rays x obstacles and
     #: does NOT depend on max_range, because vmap forbids an early exit, so this
     #: is the only dial that trades accuracy for time.
-    march_steps: int = 24
+    #: Step budget for primitives that are defined by `sdf` alone.
+    #:
+    #: Only `Hoops` still uses it -- pillars, walls, gates and boxes all have
+    #: closed-form intersections -- so raising it costs nothing on the scenes
+    #: that dominate training and buys the last of the accuracy on the one that
+    #: does not.  Measured against a converged reference AFTER the termination
+    #: fix: 10 steps misses 7.8% of hoop hits, 24 misses 0.6%, 48 misses none,
+    #: and the range error on a shared hit is already exactly zero at 24.
+    march_steps: int = 48
 
     def raycast(self, origin: Tensor, dirs: Tensor, f: State, max_range: float):
         """(range [..., m], d_range/d_origin [..., m, 3]).
@@ -308,7 +327,16 @@ class Environment:
         return out
 
     def sdf(self, p: Tensor, f: State) -> Tensor:
-        """Distance to the nearest obstacle of any group, [...]."""
+        """Distance to the nearest obstacle of any group, [...].
+
+        NOT culled, and that was measured rather than assumed.  Culling is exact
+        here -- a point query is a minimum, and `local_field` ranks by a lower
+        bound on surface distance, so the k nearest contain the true nearest for
+        any k >= 1 -- but on the imported city it came out at 0.92x, because the
+        top-k selection costs more than the 36 box SDFs it removes.  Ray marching
+        is the case that pays for culling, since it evaluates the SDF `steps`
+        times per ray off one selection.
+        """
         if not self.groups:
             return torch.full(p.shape[:-1], 1e3, dtype=p.dtype, device=p.device)
         d = None

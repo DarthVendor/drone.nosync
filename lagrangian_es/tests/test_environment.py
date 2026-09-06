@@ -411,3 +411,150 @@ def test_every_shipped_preset_is_safely_sized_for_its_culling():
             occ = float(g.chunk_occupancy(s["p"], s, 6.0).max())
             assert g.n <= k or occ < k, (
                 f"{name}/{g.kind}: cull_k {k} below occupancy {occ}")
+
+
+# --- boxes intersect exactly, rather than being marched ----------------------
+
+def _box_rays(n_boxes=5, B=64, M=64, seed=1, extent=2.4):
+    import torch
+
+    from lagrangian_es.environments.primitives import Boxes
+    from lagrangian_es.util import make_gen
+
+    g = Boxes(n=n_boxes, cull_k=0, extent=extent)
+    f = g.sample(B, make_gen(seed), torch.float64, "cpu")
+    o = torch.rand(B, 3, generator=make_gen(seed + 5), dtype=torch.float64) * 4 - 2
+    o[:, 2] = 1.0
+    keep = g.sdf(o, f) > 0.15                    # start outside every box
+    o, f = o[keep], {k: v[keep] for k, v in f.items()}
+    th = torch.linspace(0.0, 6.283185307, M, dtype=torch.float64)
+    d = torch.zeros(o.shape[0], M, 3, dtype=torch.float64)
+    d[..., 0], d[..., 1] = torch.cos(th), torch.sin(th)
+    return g, f, o, d / d.norm(dim=-1, keepdim=True), M
+
+
+def test_box_raycast_hit_lies_exactly_on_a_surface():
+    """Soundness: whatever it reports, the point there is ON a box."""
+    import torch
+
+    g, f, o, d, M = _box_rays()
+    rng, _ = g.raycast(o, d, f, 6.0)
+    hit = rng < 6.0 - 1e-9
+    p = o[:, None, :] + d * rng[..., None]
+    sd = g.sdf(p.reshape(-1, 3),
+               {k: v.repeat_interleave(M, 0) for k, v in f.items()})
+    assert sd.reshape(rng.shape)[hit].abs().max() < 1e-9
+
+
+def test_box_raycast_reports_the_NEAREST_hit():
+    """Completeness: nothing may be crossed before the reported range.
+
+    Soundness alone is not enough -- returning a far face while missing a near
+    one would pass that and still hand the controller a wall it cannot see.
+    """
+    import torch
+
+    g, f, o, d, M = _box_rays()
+    rng, _ = g.raycast(o, d, f, 6.0)
+    S = 200
+    ts = torch.linspace(0.0, 0.999, S, dtype=torch.float64)
+    pre = o[:, None, None, :] + d[:, :, None, :] * (rng[..., None, None]
+                                                   * ts[None, None, :, None])
+    sd = g.sdf(pre.reshape(-1, 3),
+               {k: v.repeat_interleave(M * S, 0) for k, v in f.items()})
+    assert sd.min() > -1e-9, float(sd.min())
+
+
+def test_box_raycast_gradient_is_the_plane_result():
+    """dt/d(origin) = -n/(d.n): stepping the origin along the ray must change
+    the range by exactly minus that step."""
+    import torch
+
+    g, f, o, d, _ = _box_rays(B=32, M=16, seed=3)
+    rng, grad = g.raycast(o, d, f, 6.0)
+    hit = rng < 6.0 - 1e-6
+    h = 1e-6
+    for k in range(3):
+        step = torch.zeros(3, dtype=torch.float64)
+        step[k] = h
+        r2, _ = g.raycast(o + step, d, f, 6.0)
+        fd = (r2 - rng) / h
+        both = hit & (r2 < 6.0 - 1e-6)
+        assert (fd[both] - grad[..., k][both]).abs().max() < 1e-3, k
+
+
+def test_an_origin_inside_a_box_reports_a_miss_like_pillars_does():
+    """One convention across primitives, or a mixed scene disagrees with itself."""
+    import torch
+
+    from lagrangian_es.environments.primitives import Boxes
+    from lagrangian_es.util import make_gen
+
+    g = Boxes(n=2, cull_k=0)
+    f = g.sample(1, make_gen(0), torch.float64, "cpu")
+    c = f[g._k("c")][0, 0]
+    hz = f[g._k("h")][0, 0, 2]
+    o = torch.cat([c, (0.5 * hz)[None]])[None]        # dead centre of the box
+    d = torch.tensor([[[1.0, 0.0, 0.0]]], dtype=torch.float64)
+    assert float(g.sdf(o, f)) < 0.0                   # really inside
+    assert float(g.raycast(o, d, f, 6.0)[0]) == 6.0
+
+
+def test_the_marcher_converges_with_its_step_budget():
+    """More steps must mean a better answer.  It used to mean a worse one.
+
+    `march` had no termination: the 1 mm floor that keeps a grazing ray moving
+    was applied unconditionally, so a ray that had already reached a surface
+    kept creeping INTO the obstacle, came out the far side, and flew off into
+    open space -- where the closing `sdf(end) < tol` test called it a miss.  A
+    1024-step march therefore found FEWER hits than a 24-step one.
+
+    `Boxes` is the primitive that can prove this, because it now has both an
+    exact intersection and an SDF, so the marcher can be scored against ground
+    truth rather than against another marcher.  Measured at the shipped budget
+    of 24 steps, the miss rate went from 19.6% to 1.2%.
+    """
+    import torch
+
+    from lagrangian_es.environments.base import march
+
+    g, f, o, d, _ = _box_rays(seed=1)
+    exact, _ = g.raycast(o, d, f, 6.0)
+    truth = exact < 6.0 - 1e-9
+    n = int(truth.sum())
+    assert n > 100, "degenerate scene: nothing to miss"
+
+    missed = []
+    for steps in (10, 24, 64, 256):
+        r, _ = march(g, o, d, f, 6.0, steps=steps)
+        missed.append(int((truth & (r > 6.0 - 1e-9)).sum()) / n)
+    # monotone non-increasing: spending more steps may not make it worse
+    for a, b in zip(missed, missed[1:]):
+        assert b <= a + 1e-9, missed
+    assert missed[1] < 0.05, f"24 steps misses {missed[1]:.1%} of box hits"
+    assert missed[-1] < 0.01, missed
+
+
+def test_marched_ranges_agree_with_the_exact_ones_where_both_hit():
+    """Convergence in the value, not just in whether a hit was found.
+
+    The marcher approaches from OUTSIDE and halts once the SDF drops under
+    `tol`, so it stops a little SHORT of the true surface and reports the
+    obstacle slightly nearer than it is.  That is the conservative direction for
+    an obstacle sensor and the one to prefer, but it is not bounded by `tol`:
+    the SDF is the distance to the nearest surface point, not the distance along
+    the ray, so a grazing ray can halt well before its intersection.  What must
+    not happen is the reverse -- reporting an obstacle FURTHER away than it is,
+    which is what the missing termination used to do on its way through.
+    """
+    import torch
+
+    from lagrangian_es.environments.base import march
+
+    g, f, o, d, _ = _box_rays(seed=2)
+    exact, _ = g.raycast(o, d, f, 6.0)
+    r, _ = march(g, o, d, f, 6.0, steps=64)
+    both = (exact < 6.0 - 1e-9) & (r < 6.0 - 1e-9)
+    err = (r - exact)[both]
+    assert err.abs().quantile(0.99) < 0.05, float(err.abs().quantile(0.99))
+    assert err.max() < 0.02, f"marcher reported {float(err.max()):.3f} m TOO FAR"

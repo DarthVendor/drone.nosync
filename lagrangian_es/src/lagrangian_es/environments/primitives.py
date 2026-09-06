@@ -220,6 +220,89 @@ class Boxes(ObstacleGroup):
         inside = q.max(dim=-1).values.clamp_max(0.0)
         return (outside + inside).min(dim=-1).values
 
+    def raycast(self, origin, dirs, f, max_range):
+        """Exact ray/box intersection -- the slab method, in each box's frame.
+
+        The base class sphere-marches any group that does not override this, and
+        for boxes that was 97% of rollout time on the imported city: 24 march
+        steps per ray, each evaluating every box's SDF, plus six more SDF calls
+        per ray for a central-difference normal.  A box is a convex intersection
+        of three slabs, so the hit has a closed form and none of that is needed.
+
+        Exactness matters as much as the speed.  A marcher with a fixed step
+        budget under-converges on grazing rays -- measured at 10 steps it got
+        9.4% of hoop rays wrong with a p99 error of 4.4 m, which is why the
+        budget is 24 and why the budget is a tuning parameter at all.  A slab
+        intersection has no budget and no grazing case.
+
+        vmap/jacrev safe: no data-dependent branches, and the direction
+        reciprocal is floored rather than guarded, so a ray exactly parallel to a
+        face produces an unbounded slab instead of a NaN.
+        """
+        c, h, a = f[self._k("c")], f[self._k("h")], f[self._k("a")]
+        # [..., 1, N, k] against dirs [..., m, 1, k]
+        c, h, a = c[..., None, :, :], h[..., None, :, :], a[..., None, :]
+        o = origin[..., None, None, :]
+        u = dirs[..., :, None, :]
+        ca, sa = torch.cos(a), torch.sin(a)
+        # into each box's frame: yaw only, and the box stands ON the floor so its
+        # centre sits at h_z / 2
+        dx, dy = o[..., 0] - c[..., 0], o[..., 1] - c[..., 1]
+        ox = dx * ca + dy * sa
+        oy = -dx * sa + dy * ca
+        oz = o[..., 2] - 0.5 * h[..., 2]
+        ux = u[..., 0] * ca + u[..., 1] * sa
+        uy = -u[..., 0] * sa + u[..., 1] * ca
+        uz = u[..., 2] + torch.zeros_like(ux)
+        ol = torch.stack([ox, oy, oz], dim=-1)
+        ul = torch.stack([ux, uy, uz], dim=-1)
+        H = torch.stack([h[..., 0], h[..., 1], 0.5 * h[..., 2]], dim=-1)
+        # floored reciprocal: a parallel ray gets a slab of +/-1e12, which never
+        # constrains, rather than an inf/inf NaN
+        safe = torch.where(ul.abs() < 1e-12,
+                           torch.full_like(ul, 1e-12) * torch.where(
+                               ul < 0, -torch.ones_like(ul), torch.ones_like(ul)),
+                           ul)
+        inv = 1.0 / safe
+        t1 = (-H - ol) * inv
+        t2 = (H - ol) * inv
+        tlo = torch.minimum(t1, t2)
+        thi = torch.maximum(t1, t2)
+        tmin, axis = tlo.max(dim=-1)
+        tmax = thi.min(dim=-1).values
+        # ENTERING hits only.  An origin inside the box reports `max_range`,
+        # matching `Pillars`, which does the same -- a vehicle inside geometry
+        # has already crashed (`alive` tests the SDF, not this), and letting one
+        # primitive report the exit distance while another reports a miss is the
+        # kind of disagreement that only shows up once both are in one scene.
+        t_hit = tmin
+        ok = (tmax >= tmin) & (tmin >= 0.0) & (tmin <= max_range)
+        big = torch.full_like(t_hit, float(max_range))
+        t_all = torch.where(ok, t_hit, big)
+        rng, which = t_all.min(dim=-1)                       # over boxes
+        # --- gradient: dt/d(origin) = -n / (d . n) for the hit face -----------
+        # On a convex box the entering face's outward normal is simply
+        # -sign(u) along the axis that produced t_min: the ray has to be
+        # travelling INTO the face it enters through.
+        pick = which[..., None]                              # [..., m, 1]
+        ax = axis.gather(-1, pick)                           # [..., m, 1]
+        gidx = pick[..., None].expand(pick.shape + (3,))     # [..., m, 1, 3]
+        ul_hit = ul.expand(t1.shape).gather(-2, gidx).squeeze(-2)     # [..., m, 3]
+        u_ax = ul_hit.gather(-1, ax)                         # [..., m, 1]
+        onehot = torch.nn.functional.one_hot(ax.squeeze(-1), 3).to(ol.dtype)
+        n_local = onehot * -torch.sign(u_ax)
+        ang = a.expand(t_all.shape).gather(-1, pick).squeeze(-1)      # [..., m]
+        cak, sak = torch.cos(ang), torch.sin(ang)
+        nx = n_local[..., 0] * cak - n_local[..., 1] * sak
+        ny = n_local[..., 0] * sak + n_local[..., 1] * cak
+        n_world = torch.stack([nx, ny, n_local[..., 2]], dim=-1)
+        den = (dirs * n_world).sum(-1)
+        den = torch.where(den.abs() < 1e-9, torch.full_like(den, -1e-9), den)
+        grad = -n_world / den[..., None]
+        miss = rng >= max_range - 1e-12
+        grad = torch.where(miss[..., None], torch.zeros_like(grad), grad)
+        return rng, grad
+
     def ray_bounds(self, origin, dirs, f, max_range):
         """Bracket on the group's bounding sphere, so the marcher spends its
         step budget where the boxes actually are."""

@@ -66,18 +66,28 @@ def test_sensor_jacobian_is_finite(sysname, name):
 
 def test_default_strides_reflect_what_each_sensor_costs_and_buys():
     """A 10 Hz refresh against a 50 Hz loop is realistic and 4-7x cheaper on
-    ray-traced scenes, and it is still the default for the expensive sensors.
+    ray-traced scenes, and it is the default for the expensive sensors.
 
-    `range` is the exception, and it was measured: striding it leaves the vehicle
-    blind for 0.1 s, which is 30 cm at 3 m/s, and that doubles the crash rate
-    (0.027 -> 0.058 on the pillar field with everything else held fixed).  For an
-    obstacle sensor that is the wrong trade, so it refreshes every step.
+    `range` used to be the exception, pinned to every step because striding it
+    doubled the crash rate (0.027 -> 0.058 on the pillar field).  That finding
+    still holds and has since been measured more precisely: nav99, trained at
+    stride 1, goes from 0.9923/0.0015 to 0.9840/0.0111 when strided to 8 under
+    it.  But that measures TRANSFER to an input the genome never saw.  The
+    march is 97% of rollout time, so the stride is the single biggest compute
+    dial in the project, and a policy that trains on 0.16 s-old readings can
+    stand further off and damp harder -- options a policy handed staleness only
+    at test time does not have.
+
+    So the default is now 8 and the cost is paid where it belongs: the >99%
+    prototype pins `PROTOTYPE_STRIDE = 1` in tests/test_prototype.py, because a
+    published number is a claim about a configuration and must not follow a
+    compute dial around.
 
     `FullState` is pinned to every step for a different reason: it is the
     identity baseline the sensor-free path has to reproduce bit-for-bit, and
     striding it would make it something else."""
     system = make_system("quadrotor")
-    assert make_sensor("range", make_system("quadrotor_nav")).update_every == 1
+    assert make_sensor("range", make_system("quadrotor_nav")).update_every == 8
     assert make_sensor("landmark_camera", system).update_every == 5
     assert make_sensor("noisy_position", system).update_every == 5
     assert make_sensor("full_state", system).update_every == 1

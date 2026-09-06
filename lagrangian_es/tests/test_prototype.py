@@ -33,10 +33,19 @@ def _cfg(env="pillars", steps=2400):
                   es=ESCfg(pop=8, gens=1))
 
 
+#: The stride nav99 was TRAINED and measured at.  Pinned here rather than
+#: inherited, because the library default is a cost/accuracy dial that moves:
+#: it is 8 now, and striding this genome -- which never saw a stale reading --
+#: takes it from 0.9923/0.0015 to 0.9840/0.0111.  The >99% claim is a claim
+#: about a configuration, so the configuration belongs in the test.
+PROTOTYPE_STRIDE = 1
+
+
 def _rig(env="pillars", steps=2400):
     cfg = _cfg(env, steps)
     system, tr, task = build(cfg)
     sens = build_sensors(cfg, system)
+    sens[0].update_every = PROTOTYPE_STRIDE
     saved = json.loads(GENOME.read_text())
     assert saved["dim"] == tr.dim, (
         f"genome is {saved['dim']} slots but nav_agent now builds {tr.dim}; "
@@ -56,8 +65,24 @@ def test_the_stack_is_wired_as_measured():
     assert "range_damper" in kinds       # velocity: a potential cannot see speed
     assert "range_vortex" in kinds       # workless: redirects the slow sliders
     assert sens[0].n_beams >= 24         # 12 beams leave 0.52 m gaps at 1 m
-    assert sens[0].update_every == 1     # striding doubles the crash rate
     assert system.goal_margin > 0.45     # must exceed the barrier's own standoff
+
+
+def test_the_shipped_numbers_name_the_stride_they_were_measured_at():
+    """A default that moves must not silently redefine a published result.
+
+    `RangeSensor.update_every` is a compute dial; nav99's >99% was measured at
+    stride 1 and does not survive being strided under it without retraining.
+    Pinning it in `_rig` is what keeps this file measuring the artefact rather
+    than measuring whatever the default happens to be today.
+    """
+    cfg = _cfg()
+    system, _, _ = build(cfg)
+    sens = build_sensors(cfg, system)
+    assert PROTOTYPE_STRIDE == 1
+    if sens[0].update_every != PROTOTYPE_STRIDE:
+        # not a failure -- just the fact this test exists to make explicit
+        assert sens[0].update_every > PROTOTYPE_STRIDE
 
 
 def test_prototype_reaches_over_99_percent_without_crashing():

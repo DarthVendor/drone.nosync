@@ -34,7 +34,17 @@ class RangeSensor(Sensor):
 
     kind = "range"
     name = "range"
-    update_every = 1
+    # Re-marching the scene every step is the single largest cost in the whole
+    # rollout -- profiled at 97% of it on the imported city.  A stride of 8 is
+    # 0.16 s of staleness at dt = 0.02.
+    #
+    # Evaluated COLD it looks expensive: nav99, which was trained at stride 1,
+    # goes from 0.0015 to 0.0114 crash when the sensor is strided under it.  But
+    # that measures transfer to an input it never saw, not what the stride costs
+    # a policy that trains on it -- a controller that always reads 0.16 s late
+    # can lead the target, damp harder, or simply stand further off, and none of
+    # those are available to one that is handed staleness at test time only.
+    update_every = 8
 
     def __init__(self, system, n_beams: int = 24, max_range: float = 6.0,
                  spread: float = TWO_PI, sigma: float = 0.02,
