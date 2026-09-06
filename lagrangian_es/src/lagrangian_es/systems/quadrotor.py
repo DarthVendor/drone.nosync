@@ -42,6 +42,7 @@ class QuadrotorSE3(LagrangianSystem):
         # below this speed the heading holds a fixed bearing rather than chasing
         # a direction estimated from near-zero velocity
         yaw_speed_gate: float = 0.6,
+        yaw_bearing_gate: float = 0.5,
         # how far the heading reference may lead the current heading (rad)
         yaw_slew: float = 0.25,
         # --- reset distribution
@@ -69,6 +70,10 @@ class QuadrotorSE3(LagrangianSystem):
             raise ValueError(f"unknown yaw_mode {yaw_mode!r}")
         self.yaw_mode = yaw_mode
         self.yaw_speed_gate = float(yaw_speed_gate)
+        # well under any standoff task's radius (ObserveTarget holds at 1.9 m),
+        # so "hover and keep it in view" is untouched; just over the 0.25 m
+        # arrival tolerance, so "parked on it" is not
+        self.yaw_bearing_gate = float(yaw_bearing_gate)
         self.yaw_slew = float(yaw_slew)
         if yaw_mode == "learned":
             # three extra slots: where to LOOK.  Yaw is the one degree of freedom
@@ -211,13 +216,34 @@ class QuadrotorSE3(LagrangianSystem):
             if goal is not None:
                 gxy = torch.cat([goal[..., :2] - s["p"][..., :2],
                                  torch.zeros_like(s["v"][..., 2:])], dim=-1)
-                gh = gxy / gxy.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                rg = gxy.norm(dim=-1, keepdim=True)
+                gh = gxy / rg.clamp_min(1e-6)
+                # RANGE-faded, for exactly the reason travel is speed-faded: a
+                # bearing measured from the point you are standing ON is well
+                # defined and meaningless.  Arrived, `gxy` is millimetres of
+                # position error, `gh` swings through half turns between steps,
+                # and the heading chases it -- measured at a mean 1.98 rad/s of
+                # yaw rate while parked inside 0.30 m, reversing direction on
+                # 3.9% of steps.  The comment that once stood here called this
+                # "the only cue still defined at rest"; that is true of a target
+                # you are holding station OFF, and false of one you are on.
+                ggate = (rg / self.yaw_bearing_gate).clamp(0.0, 1.0)
             else:
                 gh = torch.zeros_like(vh) + self._e1
+                ggate = torch.ones_like(sp0)
             lat = torch.stack([-vh[..., 1], vh[..., 0],
                                torch.zeros_like(vh[..., 2])], dim=-1)
-            look = (w[..., 0:1] * gh + w[..., 1:2] * (vgate * vh)
-                    + w[..., 2:3] * (vgate * lat))
+            # The rest state: with nowhere to go and nothing to look at, the
+            # right reference is the heading already held.  Without this the
+            # blend collapses to a normalised zero -- a direction made of pure
+            # rounding -- which is the same failure as an ungated cue, reached
+            # from the other side.
+            b1 = R[..., :, 0]
+            hxy = torch.cat([b1[..., :2], torch.zeros_like(b1[..., 2:])], dim=-1)
+            hh = hxy / hxy.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            look = (w[..., 0:1] * (ggate * gh) + w[..., 1:2] * (vgate * vh)
+                    + w[..., 2:3] * (vgate * lat)
+                    + (1.0 - ggate) * (1.0 - vgate) * hh)
             n = look.norm(dim=-1, keepdim=True)
             look = look / n.clamp_min(1e-6)
             # Blend back to a FIXED bearing at low speed.  `vh` is a normalised
@@ -238,7 +264,10 @@ class QuadrotorSE3(LagrangianSystem):
             cur = torch.atan2(R[..., 1, 0], R[..., 0, 0])
             des = torch.atan2(look[..., 1], look[..., 0])
             dpsi = torch.atan2(torch.sin(des - cur), torch.cos(des - cur))
-            psi = cur + dpsi.clamp(-self.yaw_slew, self.yaw_slew)
+            # every cue faded and the hold term degenerate (nose straight up):
+            # hold, rather than steer to the direction of the rounding error
+            valid = (n[..., 0] / 1e-3).clamp(0.0, 1.0)
+            psi = cur + (valid * dpsi).clamp(-self.yaw_slew, self.yaw_slew)
             b1c = torch.stack([torch.cos(psi), torch.sin(psi),
                                torch.zeros_like(psi)], dim=-1)
         else:

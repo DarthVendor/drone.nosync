@@ -184,3 +184,128 @@ def test_saturation_flags_bounds():
     assert float(sat[0]) == 0.0                      # mid-range on every channel
     assert abs(float(sat[1]) - 0.25) < 1e-12         # thrust only, 1 of 4
     assert abs(float(sat[2]) - 1.0) < 1e-12          # all four
+
+
+# --- learned yaw: what the heading reference does when the cues run out -------
+
+def _yaw_of(R):
+    return torch.atan2(R[..., 1, 0], R[..., 0, 0])
+
+
+def _hover(sysm, B, at):
+    s = _level_state(sysm, B=B, z=float(at[0, 2]))
+    s["p"] = at.clone()
+    return s
+
+
+def test_bearing_cue_is_range_gated_so_arrival_does_not_spin_the_heading():
+    """Parked ON the target, the bearing to it is rounding error.
+
+    `gh = (goal - p) / |goal - p|` is a perfectly well-defined unit vector for a
+    position error of a millimetre, and its direction is noise: it swings through
+    half turns between steps, the yaw reference follows, and the vehicle rotates
+    on the spot.  Measured before the range gate, a drone parked inside 0.30 m of
+    its final waypoint held a mean yaw rate of 1.98 rad/s and reversed direction
+    on 3.9% of steps -- which is what "it starts oscillating once it arrives"
+    looks like from inside the allocator.
+
+    The speed gate already made this argument for the travel cue.  The bearing
+    needed the same treatment and did not have it.
+    """
+    B = 64
+    g = make_gen(0)
+    goal = torch.zeros(B, 3, dtype=DT)
+    goal[:, 2] = 1.0
+    # scattered by microns to millimetres: arrived, by any tolerance that matters
+    at = goal + (torch.rand(B, 3, generator=g, dtype=DT) - 0.5) * 2e-3
+
+    def yaw_torque(gate):
+        sysm = make_system("quadrotor", yaw_mode="learned", yaw_bearing_gate=gate)
+        s = _hover(sysm, B, at)
+        s["v"] = torch.zeros(B, 3, dtype=DT)      # station keeping
+        phi = torch.ones(B, sysm.allocator_dim, dtype=DT)
+        u = sysm.allocate(sysm.gravity_force(s), s, phi, goal)
+        return u[:, 3].abs(), sysm
+
+    # A/B on the mechanism itself: a gate of ~0 is the old ungated blend, since
+    # `ggate = (r / gate).clamp(0, 1)` saturates at 1 for any real position error
+    default = make_system("quadrotor", yaw_mode="learned").yaw_bearing_gate
+    off, sysm = yaw_torque(1e-12)
+    on, _ = yaw_torque(default)
+    assert off.max() > 30 * on.max(), (float(off.max()), float(on.max()))
+    # and in absolute terms it is now noise against the torque budget
+    assert on.max() < 0.01 * sysm.tau_max, float(on.max())
+    # the gate is linear in range, so the residual pull scales with how far off
+    # the target the vehicle actually is -- it is faded, not switched off
+    assert on.max() > 0.0
+
+
+def test_heading_is_held_when_every_cue_has_faded():
+    """No speed, no bearing: the reference is the heading already held.
+
+    Otherwise the blend is a normalised zero -- a direction assembled out of
+    rounding -- and the vehicle steers to it.
+    """
+    sysm = make_system("quadrotor", yaw_mode="learned")
+    B = 8
+    goal = torch.zeros(B, 3, dtype=DT)
+    goal[:, 2] = 1.0
+    s = _hover(sysm, B, goal.clone())
+    s["v"] = torch.zeros(B, 3, dtype=DT)
+    # yaw the airframes around the circle: whatever they hold, they should keep
+    psi0 = torch.linspace(-3.0, 3.0, B, dtype=DT)
+    for i in range(B):
+        s["R"][i] = rodrigues(torch.tensor([0.0, 0.0, float(psi0[i])], dtype=DT))
+    phi = torch.ones(B, sysm.allocator_dim, dtype=DT)
+    u = sysm.allocate(sysm.gravity_force(s), s, phi, goal)
+    assert torch.allclose(_yaw_of(s["R"]), psi0, atol=1e-9)
+    assert u[:, 3].abs().max() < 1e-6, float(u[:, 3].abs().max())
+
+
+def test_the_gate_does_not_touch_a_standoff_hover():
+    """A drone holding station OFF a target still gets the bearing cue.
+
+    The gate is 0.5 m; `ObserveTarget` hovers at 1.9 m.  If the fix for arrival
+    also switched the cue off there, "keep it in view" would stop working, which
+    is the regression worth guarding against.
+    """
+    sysm = make_system("quadrotor", yaw_mode="learned")
+    assert sysm.yaw_bearing_gate < 1.9
+    B = 16
+    goal = torch.zeros(B, 3, dtype=DT)
+    goal[:, 2] = 1.0
+    at = goal.clone()
+    th = torch.linspace(0.0, 6.0, B, dtype=DT)
+    at[:, 0] = 1.9 * torch.cos(th)                 # a ring at standoff
+    at[:, 1] = 1.9 * torch.sin(th)
+    s = _hover(sysm, B, at)
+    s["v"] = torch.zeros(B, 3, dtype=DT)
+    phi = torch.zeros(B, sysm.allocator_dim, dtype=DT)
+    phi[:, 0:6] = 1.0
+    phi[:, 6] = 1.0                                # bearing cue only
+    u = sysm.allocate(sysm.gravity_force(s), s, phi, goal)
+    # facing away from the target on the ring, so a real yaw command is expected
+    assert u[:, 3].abs().max() > 1e-3, float(u[:, 3].abs().max())
+
+
+def test_learned_yaw_stays_vmap_and_jacrev_safe():
+    """The allocator is differentiated w.r.t. phi by the whitening metric."""
+    from torch.func import jacrev, vmap
+    sysm = make_system("quadrotor", yaw_mode="learned")
+    B = 4
+    goal = torch.zeros(B, 3, dtype=DT)
+    goal[:, 2] = 1.0
+    s = _hover(sysm, B, goal.clone())
+    s["v"] = torch.zeros(B, 3, dtype=DT)
+    F = sysm.gravity_force(s)
+
+    def one(phi, si, Fi, gi):
+        st = {k: v[None] for k, v in si.items()}
+        return sysm.allocate(Fi[None], st, phi[None], gi[None])[0]
+
+    phi = torch.ones(B, sysm.allocator_dim, dtype=DT)
+    si = [{k: v[i] for k, v in s.items()} for i in range(B)]
+    J = vmap(jacrev(one), in_dims=(0, 0, 0, 0))(
+        phi, {k: v for k, v in s.items()}, F, goal)
+    assert J.shape == (B, 4, sysm.allocator_dim)
+    assert torch.isfinite(J).all()
