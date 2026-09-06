@@ -7,10 +7,16 @@ particular it never imports `systems/`, so the world and the robot stay separabl
 """
 from __future__ import annotations
 
+import pathlib as _pathlib
+
 from .base import (
     EPS, Environment, Mixture, ObstacleGroup, State, march,
 )
+from .cad import StaticBoxes, city_to_environment
 from .primitives import Boxes, Gate, Hoops, Pillars, Walls
+
+#: derived maps that ship with the package, built by `scripts/dxf_city.py`
+MAPS = _pathlib.Path(__file__).parent / "maps"
 
 GROUPS = {"pillars": Pillars, "walls": Walls, "gate": Gate,
           "hoops": Hoops, "boxes": Boxes}
@@ -55,6 +61,25 @@ PRESETS = {
 }
 
 
+#: scenes that are LOADED rather than sampled -- real geometry, so they build a
+#: whole `Environment` (waypoints and span included) instead of a group list
+LOADERS = {
+    # Singapore's CBD from the OSM DXF: real streets, at 1 simulated metre per
+    # 8 real ones.  The scale is not cosmetic.  A quadrotor that covers about
+    # 8 m in a 24 s episode cannot cross a true-scale junction, and a street
+    # divided by much more than this closes to under the 0.60 m standoff the
+    # controller flies with -- so 8 is where a residential corridor is still
+    # wide enough to fly down and the block spacing is still reachable.
+    # cull_k 24 against a measured worst case of 10 blocks whose surface is
+    # within a 6 m sensor reach -- exact, and 2.5x less box SDF work per march
+    # step than the 40 it defaults to.  Sized by measurement, and the soundness
+    # condition is asserted in tests/test_citymap.py rather than assumed.
+    "singapore_cbd": lambda: city_to_environment(MAPS / "singapore_cbd.json",
+                                                 cull_k=24,
+                                                 name="singapore_cbd"),
+}
+
+
 #: the regimes a controller trains on, one at a time
 REGIMES = lambda: [Pillars(n=6), Walls(n=2), Gate(), Hoops(n=2, radius=0.55)]
 
@@ -71,9 +96,13 @@ def make_environment(name: str = "empty", **kw) -> Environment:
     if name in MIXTURES:
         lo, hi = MIXTURES[name]
         return Mixture(REGIMES(), n_active=(lo, hi), name=name)
+    if name in LOADERS:
+        return LOADERS[name](**kw)
     if name not in PRESETS:
         raise KeyError(f"unknown environment {name!r}; "
-                       f"presets: {sorted(PRESETS)}; mixtures: {sorted(MIXTURES)}")
+                       f"presets: {sorted(PRESETS)}; "
+                       f"loaders: {sorted(LOADERS)}; "
+                       f"mixtures: {sorted(MIXTURES)}")
     return Environment(PRESETS[name](), name=name)
 
 
@@ -93,6 +122,7 @@ def load_dxf(path, **kw) -> Environment:
 __all__ = [
     "Environment", "Mixture", "ObstacleGroup", "State", "EPS", "march",
     "Pillars", "Walls", "Gate", "Hoops",
-    "GROUPS", "PRESETS", "MIXTURES", "REGIMES",
-    "make_environment", "make_group", "load_dxf",
+    "Boxes", "StaticBoxes",
+    "GROUPS", "PRESETS", "LOADERS", "MAPS", "MIXTURES", "REGIMES",
+    "make_environment", "make_group", "load_dxf", "city_to_environment",
 ]

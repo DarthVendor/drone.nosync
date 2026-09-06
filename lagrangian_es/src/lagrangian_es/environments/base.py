@@ -23,7 +23,7 @@ jacrev-safe and the search never differentiates through it.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Optional
 
 import torch
 from torch import Tensor
@@ -179,7 +179,7 @@ class ObstacleGroup(ABC):
                      steps=self.march_steps)
 
     def near_indices(self, origin: Tensor, f: State, k: int, key_c: str,
-                     reach: float):
+                     reach: float, radius: Optional[Tensor] = None):
         """Indices of the `k` obstacles nearest `origin`, [..., k].
 
         The chunking idea, adapted to batched tensors.  A ray march tests every
@@ -206,6 +206,17 @@ class ObstacleGroup(ABC):
         """
         c = f[key_c]
         d = (origin[..., None, :2] - c).norm(dim=-1)          # [..., N]
+        if radius is not None:
+            # Rank by a LOWER BOUND on the distance to the primitive's SURFACE,
+            # not to its centre.  With primitives of one size the two orders
+            # agree and the difference is a constant pad; with a mixed field
+            # they do not, and centre order is simply wrong -- an imported city
+            # block 15 m across can have its centre 25 m away and a face 1 m
+            # away, so centre-ranking drops the only obstacle that matters while
+            # keeping specks.  Padding cannot repair that: it has to cover the
+            # LARGEST primitive, which on such a map swells the cull radius until
+            # 51 of 60 blocks qualify and `cull_k` no longer covers them.
+            d = d - radius
         k = min(int(k), c.shape[-2])
         near = torch.topk(d, k, dim=-1, largest=False)
         return near.indices, near.values

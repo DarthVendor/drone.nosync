@@ -29,6 +29,7 @@ building.  Waypoints are instead sampled from free space -- see
 """
 from __future__ import annotations
 
+import json
 import math
 import pathlib
 from typing import List, Optional, Tuple
@@ -36,7 +37,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from .base import EPS, Environment
-from .primitives import Pillars, Walls
+from .primitives import Boxes, Pillars, Walls
 
 ARC_SEGMENTS = 16
 
@@ -201,6 +202,59 @@ class StaticPillars(Pillars):
 
     def clear_points(self, f, pts, margin):
         return f
+
+
+class StaticBoxes(Boxes):
+    """City blocks loaded from a map.  Identical geometry every episode."""
+
+    kind = "static_boxes"
+
+    def __init__(self, centres, halves, angles=None, key: str = "boxes",
+                 cull_k: int = 40):
+        super().__init__(n=max(1, len(centres)), key=key, cull_k=cull_k)
+        c = torch.as_tensor(list(centres), dtype=torch.float64).reshape(-1, 2)
+        h = torch.as_tensor(list(halves), dtype=torch.float64).reshape(-1, 3)
+        a = (torch.zeros(c.shape[0], dtype=torch.float64) if angles is None
+             else torch.as_tensor(list(angles), dtype=torch.float64).reshape(-1))
+        if c.numel() == 0:
+            c = torch.full((1, 2), 1e4, dtype=torch.float64)
+            h = torch.full((1, 3), 0.1, dtype=torch.float64)
+            a = torch.zeros(1, dtype=torch.float64)
+        self.ctr, self.half, self.ang = c, h, a
+        self.n = c.shape[0]
+        # `local_field` pads its cull radius by `half_hi`; for a real map that
+        # has to be the largest block actually present, not a sampling bound
+        self.half_hi = float(h[:, :2].max())
+
+    def sample(self, B, gen, dtype, device):
+        kw = dict(dtype=dtype, device=device)
+        return {self._k("c"): self.ctr.to(**kw).expand(B, self.n, 2).clone(),
+                self._k("h"): self.half.to(**kw).expand(B, self.n, 3).clone(),
+                self._k("a"): self.ang.to(**kw).expand(B, self.n).clone()}
+
+    def clear_points(self, f, pts, margin):
+        """No-op: a city block does not move to make a waypoint reachable."""
+        return f
+
+
+def city_to_environment(path, cull_k: int = 40, name: Optional[str] = None
+                        ) -> Environment:
+    """Load a city built by `scripts/dxf_city.py`.
+
+    That script does the part this module cannot: the OSM export has no
+    buildings, so the built form has to be recovered as the COMPLEMENT of the
+    road network, which is a raster operation rather than an entity mapping.
+    What lands here is the result -- blocks as rectangles, already in simulation
+    metres -- so the import seam stays the same as any other drawing's.
+    """
+    data = json.loads(pathlib.Path(path).read_text())
+    b = data["boxes"]
+    env = Environment([StaticBoxes(b["c"], b["h"], b.get("a"), cull_k=cull_k)],
+                      name=name or pathlib.Path(path).stem)
+    env.city = data.get("meta", {})
+    env.waypoints = data.get("waypoints", [])
+    env.span = float(env.city.get("span", 3.0))
+    return env
 
 
 # --------------------------------------------------------------------------- #

@@ -7,7 +7,7 @@ but it never reads a raw state key.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Callable, Dict, Type
+from typing import Callable, Dict, Optional, Type
 
 import torch
 from torch import Tensor
@@ -209,7 +209,7 @@ class FreeSpaceWaypoints(Task):
     """
 
     def __init__(self, system, n_legs: int = 2, pool: int = 4096,
-                 margin: float = 0.40, extent: float = 3.0,
+                 margin: float = 0.40, extent: Optional[float] = None,
                  z_range=(1.0, 2.0), tol: float = 0.25, seed: int = 12345,
                  gating: str = "arrival"):
         super().__init__(system)
@@ -219,6 +219,9 @@ class FreeSpaceWaypoints(Task):
         env = getattr(system, "env", None)
         if env is None:
             raise ValueError("FreeSpaceWaypoints needs a plant with an environment")
+        # sized to the scene unless told otherwise -- see `use_free_start`
+        extent = float(extent if extent is not None
+                       else getattr(env, "span", 3.0))
         self.pool = env.free_points(int(pool), make_gen(seed), extent=extent,
                                     margin=margin, z_range=z_range,
                                     dtype=system.dtype, device=system.device)
@@ -232,8 +235,105 @@ class FreeSpaceWaypoints(Task):
         return goals[:, leg]
 
 
+class CityTour(Task):
+    """Fly between waypoints on a real city's road network.
+
+    The pool is not rejection-sampled free space: it is the map's own street
+    vertices, thinned to a spacing and filtered to those with room to hover.
+    That difference is the point of using a map at all -- free space includes
+    the air over a low block, and "a waypoint in the city" means a place on a
+    street, reachable by flying down streets.
+
+    Legs are drawn from a NEIGHBOUR graph rather than uniformly, because the
+    pool spans the whole imported window while the vehicle covers only metres in
+    an episode.  Two waypoints picked independently are usually further apart
+    than the episode is long, which does not make the task harder, it makes it
+    unfinishable -- and an unfinishable leg teaches the search nothing except
+    that the goal term is hopeless.  `max_leg` is the reach that keeps a tour a
+    tour.
+    """
+
+    def __init__(self, system, n_legs: int = 2, max_leg: float = 10.0,
+                 tol: float = 0.25, gating: str = "arrival", seed: int = 12345):
+        super().__init__(system)
+        self.gating = gating
+        self.n_legs = int(n_legs)
+        self.tol = float(tol)
+        self.max_leg = float(max_leg)
+        env = getattr(system, "env", None)
+        pts = list(getattr(env, "waypoints", []) or [])
+        if not pts:
+            raise ValueError(
+                "CityTour needs an environment carrying waypoints; build one "
+                "with `city_to_environment` (see scripts/dxf_city.py)")
+        P = torch.as_tensor(pts, dtype=system.dtype, device=system.device)
+        d = torch.cdist(P[:, :2], P[:, :2])
+        adj = d <= self.max_leg
+        # Exclude self by INDEX, not by `d > 0`: cdist computes the diagonal
+        # through the same expansion as everything else, so it comes back as a
+        # few times 1e-9 rather than as an exact zero on some rows and not
+        # others.  Left to a distance test, those rows list themselves as a
+        # neighbour, and a tour that lands on one never leaves it -- measured,
+        # 349 of 8000 legs had zero length and every leg after was the same
+        # point.
+        adj.fill_diagonal_(False)
+        keep = adj.any(dim=1)
+        if not bool(keep.any()):
+            raise ValueError(
+                f"no two of the {len(pts)} waypoints are within max_leg="
+                f"{self.max_leg}; the map's scale and the episode's reach "
+                "disagree")
+        # renumber to the connected part, then pad each row to a fixed width so
+        # sampling is one gather rather than a Python loop per episode
+        P, adj = P[keep], adj[keep][:, keep]
+        cnt = adj.sum(dim=1)
+        K = int(cnt.max())
+        order = torch.argsort(adj.to(torch.int8), dim=1, descending=True,
+                              stable=True)[:, :K]
+        self.pool, self.nbr, self.cnt = P, order, cnt.clamp_min(1)
+
+    def sample(self, n: int, gen: torch.Generator) -> Tensor:
+        idx = torch.randint(self.pool.shape[0], (n,), generator=gen)
+        legs = [idx]
+        for _ in range(self.n_legs - 1):
+            r = torch.rand(n, generator=gen)
+            pick = (r * self.cnt[idx].to(r.dtype)).long()
+            idx = self.nbr[idx, pick]
+            legs.append(idx)
+        return self.pool[torch.stack(legs, dim=1)]
+
+    def place_start(self, s: State, goals: Tensor) -> State:
+        """Begin the tour on a street ADJACENT to its first waypoint.
+
+        `reset` samples a start from the whole waypoint pool, which spans the
+        imported window; the first goal is sampled independently.  Left alone
+        the opening leg averaged 22-36 m against a `max_leg` of 10 -- so the
+        episode was over before it began, and every candidate scored the same
+        hopeless number.
+
+        The random start is PROJECTED rather than replaced: whichever adjacent
+        waypoint it is nearest to becomes the start, so the choice still varies
+        across episodes and still comes from the map.
+        """
+        p0 = self.system.task_position(s)
+        near = (self.pool[None, :, :2] - goals[:, None, 0, :2]).norm(dim=-1)
+        ok = (near <= self.max_leg) & (near > 0.0)
+        d = (self.pool[None, :, :2] - p0[:, None, :2]).norm(dim=-1)
+        d = torch.where(ok, d, torch.full_like(d, float("inf")))
+        pick = d.argmin(dim=1)
+        out = dict(s)
+        out["p"] = self.pool[pick].clone()
+        out["v"] = torch.zeros_like(s["v"])
+        return out
+
+    def goal_at(self, goals: Tensor, t: int, ep_steps: int) -> Tensor:
+        leg = min(t * self.n_legs // ep_steps, self.n_legs - 1)
+        return goals[:, leg]
+
+
 TASKS: Dict[str, Type[Task]] = {
     "base_pose": BasePose,
+    "city_tour": CityTour,
     "free_space": FreeSpaceWaypoints,
     "hoop_course": HoopCourse,
     "waypoint_pair": WaypointPair,

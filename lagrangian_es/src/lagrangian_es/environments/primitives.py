@@ -119,8 +119,8 @@ class Pillars(ObstacleGroup):
         k = getattr(self, "cull_k", 0)
         if not k or f[self._k("c")].shape[-2] <= k:
             return f
-        idx, _ = self.near_indices(origin, f, k, self._k("c"),
-                                   reach + getattr(self, "r_hi", 0.0))
+        idx, _ = self.near_indices(origin, f, k, self._k("c"), reach,
+                                   radius=f[self._k("r")])
         out = dict(f)
         out[self._k("c")] = f[self._k("c")].gather(
             -2, idx[..., None].expand(idx.shape + (2,)))
@@ -268,8 +268,10 @@ class Boxes(ObstacleGroup):
     def local_field(self, origin, f, reach):
         if not self.cull_k or f[self._k("c")].shape[-2] <= self.cull_k:
             return f
-        idx, _ = self.near_indices(origin, f, self.cull_k, self._k("c"),
-                                   reach + self.half_hi * 1.5)
+        # bounding radius in plan, per box: the pad that centre-ranking needed
+        # becomes part of the ranking itself, so a mixed-size field culls exactly
+        idx, _ = self.near_indices(origin, f, self.cull_k, self._k("c"), reach,
+                                   radius=f[self._k("h")][..., :2].norm(dim=-1))
         out = dict(f)
         out[self._k("c")] = f[self._k("c")].gather(
             -2, idx[..., None].expand(idx.shape + (2,)))

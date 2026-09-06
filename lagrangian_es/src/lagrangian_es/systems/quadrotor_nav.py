@@ -48,6 +48,19 @@ class QuadrotorNav(QuadrotorSE3):
         self.prox_gain = float(prox_gain)
         self.prox_band = float(prox_band)
         self.env = env if env is not None else make_environment(environment)
+        # A scene can be bigger than the workspace the liveness test was written
+        # for.  `alive` kills anything outside |p| < p_max, and that default of
+        # 20 m is the +/-3 m arena's bound -- on an imported city spanning +/-31 m
+        # it marks most of the map as dead ground, so episodes die AT STEP ZERO
+        # with metres of clearance and the failure looks like a controller that
+        # cannot fly rather than a box that is too small.  Measured on the
+        # Singapore CBD: 3 of 8 episodes dead before the first step.
+        span = float(getattr(self.env, "span", 0.0))
+        if span:
+            need = 2.0 * span + 20.0
+            if self.p_max < need:
+                self.p_max = need
+                self._p_max2 = need ** 2
         # Scene difficulty as the fraction of obstacles left ACTIVE.
         #
         # Size was the obvious dial and it does not work: tripling the pillar
@@ -79,13 +92,29 @@ class QuadrotorNav(QuadrotorSE3):
             self.use_free_start()
 
     def use_free_start(self, n: int = 2048, margin: float = 0.45,
-                       extent: float = 3.0, z_range=(0.6, 1.6), seed: int = 999):
+                       extent: Optional[float] = None, z_range=(0.6, 1.6),
+                       seed: int = 999):
         """Start episodes in free space rather than at the origin.
 
         Needed for imported scenes, where the drawing's origin is very often
         inside a wall and every episode would begin in collision.
+
+        A map that carries its own waypoints supplies the pool directly.  Those
+        are street vertices: already clearance-checked, and unlike
+        rejection-sampled free space they are places a vehicle would actually
+        lift off from rather than the air above a low block.
         """
         from ..util import make_gen
+        wps = getattr(self.env, "waypoints", None)
+        if wps:
+            self.start_pool = torch.as_tensor(wps, dtype=self.dtype,
+                                              device=self.device)
+            return self
+        # sized to the SCENE: the 3 m default is the arena these fields were
+        # written for, and on an imported city it samples a pool that is
+        # entirely inside one block
+        extent = float(extent if extent is not None
+                       else getattr(self.env, "span", 3.0))
         self.start_pool = self.env.free_points(
             n, make_gen(seed), extent=extent, margin=margin, z_range=z_range,
             dtype=self.dtype, device=self.device)

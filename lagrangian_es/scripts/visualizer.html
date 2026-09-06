@@ -814,7 +814,27 @@ requestAnimationFrame(t=>{last=t; tick(t);});
 /* ---------- robot switching ---------- */
 function frameCamera(){
   const s=R.scale||1;
-  if (R.dim===3){ cam3={az:-0.9, el:0.42, dist:8.2*s, tx:0, ty:0, tz:1.3*s}; }
+  if (R.dim===3){
+    // Frame what was FLOWN, not a fixed distance from the origin.  An imported
+    // city is +/-31 m and the tour crosses maybe 15 m of it somewhere off to one
+    // side; a camera parked at the origin at 8.2 m starts inside a building.
+    const kk=K(), nb=NB();
+    let lo=[1e9,1e9,1e9], hi=[-1e9,-1e9,-1e9];
+    for(const g of ["trained","prior"]) for(const ep of (R.runs[g]||[])){
+      const a=ep.pose;
+      for(let i=0;i<a.length;i+=kk) for(let d=0;d<3;d++){
+        if(a[i+d]<lo[d]) lo[d]=a[i+d];
+        if(a[i+d]>hi[d]) hi[d]=a[i+d];
+      }
+    }
+    const ok = lo[0]<hi[0];
+    const span = ok ? Math.max(hi[0]-lo[0], hi[1]-lo[1], hi[2]-lo[2], 1e-3) : 0;
+    cam3 = ok
+      ? {az:-0.9, el:0.42, dist:Math.max(8.2*s, 1.9*span+3*s),
+         tx:(lo[0]+hi[0])/2, ty:(lo[1]+hi[1])/2,
+         tz:Math.max((lo[2]+hi[2])/2, 1.3*s)}
+      : {az:-0.9, el:0.42, dist:8.2*s, tx:0, ty:0, tz:1.3*s};
+  }
   else {
     let lo=[1e9,1e9], hi=[-1e9,-1e9];
     for(const k of ["trained","prior"]) for(let e=0;e<R.runs[k].length;e++){

@@ -246,6 +246,14 @@ class Rollout:
             # geometry and waypoints come from different generators, so a plant
             # that wants gates ON the route has to be handed the route
             s = self.system.place_course(s, goals_b)
+        # A task may also own where the episode BEGINS.  `reset` picks a start
+        # before any goal exists, so on a map whose waypoints span the whole
+        # window the first leg is drawn between two unrelated points -- measured
+        # at 22-36 m against a `max_leg` of 10.  That is not a hard task, it is
+        # an unreachable one, and it is invisible until the goal distances are
+        # printed.
+        if hasattr(self.task, "place_start"):
+            s = self.task.place_start(s, goals_b)
         # learned-dynamics residual, if the plant declares one
         res_b = self.trainable.residual_slice(TH_b)
         return s, TH_b, goals_b, res_b, P, E
