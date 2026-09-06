@@ -14,6 +14,7 @@ something other than the vehicle.  The payload here is built from the real
 away from what the exporter actually produces.
 """
 import json
+import re
 import shutil
 import subprocess
 
@@ -40,6 +41,8 @@ CASES = [
     ("camera", dict(system="quadrotor", task="waypoint_pair", sensor="camera")),
     ("obstacles", dict(system="quadrotor_nav", task="waypoint_pair",
                        env="pillars", sensor="range")),
+    ("depth", dict(system="quadrotor_nav", task="waypoint_pair",
+                   env="pillars", sensor="depth")),
     ("hoops", dict(system="quadrotor_nav", task="hoop_course", env="hoop_course",
                    sensor="range", task_kw=dict(n_gates=3))),
     ("payload", dict(system="quadrotor_payload", task="waypoint_pair")),
@@ -65,6 +68,13 @@ def _build(spec, steps=6):
                  + [DissipationTerm(sysm.task_dim),
                     FovBarrier(sysm.task_dim, sensor.name, sensor.lens.width,
                                sensor.lens.height, sensor.K)])
+        sensors = (sensor,)
+    elif spec.get("sensor") == "depth":
+        sensor = make_sensor("depth_camera", sysm, width=6, height=4,
+                             latency_steps=0)
+        terms = ([GoalBowl(sysm.task_dim) for _ in range(3)]
+                 + [DissipationTerm(sysm.task_dim),
+                    RangeBarrier(sysm.task_dim, sensor.name, sensor.obs_dim)])
         sensors = (sensor,)
     elif spec.get("sensor") == "range":
         sensor = make_sensor("range", sysm, n_beams=8, latency_steps=0)
@@ -169,8 +179,8 @@ def test_payload_covers_every_overlay(payload):
             if ep.get(key):
                 kinds.add(key)
         kinds.add(f"dim{r['dim']}")
-    for need in ("landmark_camera", "range", "obstacles", "cable", "feet",
-                 "dim2", "dim3"):
+    for need in ("landmark_camera", "range", "depth_camera", "obstacles",
+                 "cable", "feet", "dim2", "dim3"):
         assert need in kinds, f"no case exercises {need}"
 
 
@@ -214,3 +224,20 @@ def test_trace_legs_advance_on_arrival_not_on_a_timer():
     assert len(set(advanced)) > 1, (
         f"every episode switched at the same frame {advanced[:5]} -- "
         "legs are on a timer, not on arrival")
+
+
+def test_every_sensor_overlay_function_is_actually_called(pytestconfig):
+    """A sprite builder or panel painter that is defined but never invoked.
+
+    This is silent in every other check: the page loads, no exception is thrown,
+    the guard reports "renders" -- the overlay simply is not there.  `depthSprites`
+    and `drawDepthPanel` shipped in exactly that state, so the rule is now
+    mechanical: anything named *Sprites or draw*Panel has to appear somewhere
+    other than its own definition.
+    """
+    src = (pytestconfig.rootpath / "scripts" / "visualizer.html").read_text()
+    defined = set(re.findall(r"function\s+(\w+(?:Sprites|Panel))\s*\(", src))
+    assert {"depthSprites", "drawDepthPanel"} <= defined, defined
+    for fn in sorted(defined):
+        uses = len(re.findall(rf"\b{fn}\s*\(", src))
+        assert uses > 1, f"{fn} is defined but never called"

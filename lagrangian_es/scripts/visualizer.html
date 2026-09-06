@@ -155,6 +155,12 @@ figcaption{color:var(--muted);font-size:12px;margin-top:7px}
       <div id="beamBars" style="display:flex;gap:2px;align-items:flex-end;height:48px"></div>
       <p class="note" style="margin:7px 0 0;font-size:11.5px" id="rangeNote"></p>
     </div>
+    <div class="panel" id="depthPanel" hidden>
+      <p class="ptitle">Depth camera</p>
+      <canvas id="depthcv" style="width:100%;display:block;border-radius:4px;
+        image-rendering:pixelated"></canvas>
+      <p class="note" style="margin:7px 0 0;font-size:11.5px" id="depthNote"></p>
+    </div>
     <div class="panel" id="visionPanel" hidden>
       <p class="ptitle">Camera view</p>
       <canvas id="imgcv" style="width:100%;display:block;border-radius:4px"></canvas>
@@ -345,6 +351,7 @@ const SENS = () => R.sensor;
 // overlay -- so gate on the TYPE.
 const hasCam   = () => !!R.sensor && R.sensor.type === "landmark_camera";
 const hasRange = () => !!R.sensor && R.sensor.type === "range";
+const hasDepth = () => !!R.sensor && R.sensor.type === "depth_camera";
 function uvAt(k, f){
   const K = SENS().n_landmarks, a = run(k).uv;
   const o = Math.min(f, R.n_frames-1)*K*2;
@@ -447,6 +454,56 @@ function beamSprites(k, f){
                        fill: rgba(PAL.warn, 0.9), stroke: null, width: 0});
   }
   return out;
+}
+
+function depthSprites(k, f){
+  // The camera's footprint in the world: where it is looking, and how far it
+  // can see there.  Drawn from the BODY axes rather than from yaw alone, since
+  // a depth camera pitches and rolls with the vehicle.
+  if (!hasDepth()) return [];
+  const S = SENS(), p = pose(k, f)[0];
+  const fwd = [p[3], p[6], p[9]], left = [p[4], p[7], p[10]];
+  const half = S.hfov / 2, out = [];
+  for (const sgn of [-1, 1]){
+    const c = Math.cos(half), sn = Math.sin(half) * sgn;
+    const d = [fwd[0]*c + left[0]*sn, fwd[1]*c + left[1]*sn, fwd[2]*c + left[2]*sn];
+    out.push({pts: [[p[0],p[1],p[2]],
+                    [p[0]+d[0]*S.max_range, p[1]+d[1]*S.max_range,
+                     p[2]+d[2]*S.max_range]],
+              line: true, stroke: rgba(PAL.accent, 0.30), width: 1, alpha: 1});
+  }
+  return out;
+}
+
+function drawDepthPanel(k, f){
+  const panel = $("depthPanel");
+  if (!hasDepth()){ panel.hidden = true; return; }
+  panel.hidden = false;
+  const S = SENS(), W = S.width, H = S.height, a = run(k).beams;
+  if (!a) { panel.hidden = true; return; }
+  const cv = $("depthcv"), g = cv.getContext("2d");
+  cv.width = W; cv.height = H;
+  const o = Math.min(f, R.n_frames - 1) * W * H;
+  const img = g.createImageData(W, H);
+  let closest = S.max_range, seen = 0;
+  for (let i = 0; i < W * H; i++){
+    const v = a[o + i];
+    closest = Math.min(closest, v);
+    // near is BRIGHT: what matters is what is close, so it should draw the eye
+    const t = 1 - Math.min(v, S.max_range) / S.max_range;
+    if (t > 1e-3) seen++;
+    const q = i * 4;
+    img.data[q]     = Math.round(40 + 215 * t * t);
+    img.data[q + 1] = Math.round(48 + 90 * t);
+    img.data[q + 2] = Math.round(64 + 40 * (1 - t));
+    img.data[q + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+  $("depthNote").innerHTML = `${W}&times;${H} rays, ${(S.hfov*57.2958).toFixed(0)}&deg;`
+    + ` &times; ${(S.vfov*57.2958).toFixed(0)}&deg;. Nearest <b>${closest.toFixed(2)} m</b>`
+    + ` of ${S.max_range.toFixed(1)} m; ${seen} of ${W*H} rays return something.`
+    + ` Brighter is nearer. A miss reads as FAR, never as a sentinel, so`
+    + ` "nothing there" cannot be confused with "something close".`;
 }
 
 function drawRangePanel(k, f){
@@ -700,6 +757,7 @@ function render(){
   for(const k of keys){
     sp=sp.concat(cameraAxis(k, frame, k==="trained"?PAL.accent:PAL.warn));
     sp=sp.concat(beamSprites(k, frame));
+    sp=sp.concat(depthSprites(k, frame));
     const col = k==="trained"?PAL.accent:PAL.warn;
     sp=sp.concat(cableSprites(k, frame, col));
     sp=sp.concat(bodyShapes(pose(k,frame), col, 1, isAlive(k,frame)));
@@ -748,6 +806,7 @@ function tick(now){
   const who = mode==="prior" ? "prior" : "trained";
   drawImagePlane(who, frame);
   drawRangePanel(who, frame);
+  drawDepthPanel(who, frame);
   requestAnimationFrame(tick);
 }
 requestAnimationFrame(t=>{last=t; tick(t);});
@@ -778,6 +837,7 @@ function selectRobot(i){
   frameCamera(); buildEpisodes(); buildVerdict(); buildLegend();
   buildGenome(); buildCharts(); buildBlurb();
   $("visionPanel").hidden = !hasCam();
+  $("depthPanel").hidden = !hasDepth();
   $("rangePanel").hidden = !hasRange();
 }
 $("robots").innerHTML = ROBOTS.map((r,i)=>

@@ -71,7 +71,8 @@ def build(cfg: Config):
     kw = {"environment": cfg.environment} if cfg.environment else {}
     kw.update(dict(cfg.system_kw))
     system = make_system(cfg.system, dtype=dt, **kw)
-    trainable = make_trainable(cfg.trainable, system)
+    trainable = make_trainable(cfg.trainable, system,
+                               **dict(cfg.trainable_kw))
     tkw = dict(cfg.task_kw)
     tkw.setdefault("gating", cfg.gating)
     task = make_task(cfg.task, system, **tkw)

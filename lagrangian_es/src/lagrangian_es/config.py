@@ -161,6 +161,12 @@ class Config:
     system_kw: tuple = ()         # extra plant kwargs as (name, value) pairs;
                                   # a tuple, not a dict, so Config stays frozen
                                   # and hashable
+    trainable_kw: tuple = ()      # extra trainable kwargs as (name, value)
+                                  # pairs. Which SENSOR a term reads, and how
+                                  # wide it is, are arguments to build_terms;
+                                  # without this the only way to point NavAgent
+                                  # at a depth camera is a hand-assembled term
+                                  # list, which a worker process cannot rebuild.
     gating: str = "arrival"       # "time" | "arrival"; see tasks.Task.gating
     seed: int = 0
     dtype: str = "float64"

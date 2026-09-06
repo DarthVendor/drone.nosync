@@ -25,11 +25,15 @@ class Pillars(ObstacleGroup):
 
     def __init__(self, n: int = 6, key: str = "pillars", extent: float = 2.6,
                  r_lo: float = 0.18, r_hi: float = 0.38, keep_clear: float = 0.55,
-                 cull_k: int = 0):
+                 cull_k: int = 64):
         self.n, self.key = int(n), key
         self.extent, self.r_lo, self.r_hi = float(extent), float(r_lo), float(r_hi)
         self.keep_clear = float(keep_clear)
-        # CHUNKING: how many nearby pillars a ray march considers.
+        # CHUNKING: how many nearby pillars a query considers.  ON by default,
+        # and sized so it is a NO-OP on any scene smaller than itself -- a
+        # 6-pillar field has nothing to cull, so the default cannot change an
+        # existing result, only stop a large one from paying for geometry it
+        # cannot see.
         #
         # Exact if and only if `cull_k` >= the number of pillars within the
         # sensor's reach, since anything beyond that provably cannot be hit.  The
@@ -180,7 +184,7 @@ class Boxes(ObstacleGroup):
     def __init__(self, n: int = 4, key: str = "boxes", extent: float = 2.4,
                  half_lo: float = 0.16, half_hi: float = 0.42,
                  h_lo: float = 0.7, h_hi: float = 2.0,
-                 keep_clear: float = 0.65, cull_k: int = 0):
+                 keep_clear: float = 0.65, cull_k: int = 48):
         self.n, self.key = int(n), key
         self.extent = float(extent)
         self.half_lo, self.half_hi = float(half_lo), float(half_hi)

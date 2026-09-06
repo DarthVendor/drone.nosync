@@ -382,9 +382,32 @@ def test_shipped_chunked_presets_are_sized_correctly():
         assert g.cull_k > occ, f"{name}: cull_k {g.cull_k} <= occupancy {occ}"
 
 
-def test_chunking_is_off_by_default_where_it_would_not_help():
-    """On a small arena everything is within reach, so culling can only cost
-    correctness -- it must not be on unless a scene asks for it."""
-    from lagrangian_es.environments import Pillars
-    assert Pillars().cull_k == 0
-    assert make_environment("pillars").groups[0].cull_k == 0
+def test_chunking_default_is_a_no_op_on_small_scenes():
+    """Culling is ON by default, and sized so it cannot change a small result.
+
+    The saving only exists in a large world; on a small arena everything is
+    within reach and culling could only cost correctness.  So the default is set
+    above any scene that ships smaller than it -- a 6-pillar field has nothing to
+    drop -- which makes the default free rather than merely safe.
+    """
+    from lagrangian_es.environments import Boxes, Pillars
+    for g in (Pillars(), Boxes()):
+        assert g.cull_k > g.n, (
+            f"{g.kind}: default cull_k {g.cull_k} would cull its own default "
+            f"field of {g.n}, so the default is not a no-op")
+
+
+def test_every_shipped_preset_is_safely_sized_for_its_culling():
+    """A preset whose occupancy exceeds its `cull_k` is silently blind to
+    obstacles, and the symptom is that it gets FASTER."""
+    from lagrangian_es.environments import PRESETS
+    for name in sorted(PRESETS):
+        system = make_system("quadrotor_nav", environment=name, dtype=DT)
+        s = system.reset(128, make_gen(3))
+        for g in system.env.groups:
+            k = getattr(g, "cull_k", 0)
+            if not k:
+                continue
+            occ = float(g.chunk_occupancy(s["p"], s, 6.0).max())
+            assert g.n <= k or occ < k, (
+                f"{name}/{g.kind}: cull_k {k} below occupancy {occ}")
