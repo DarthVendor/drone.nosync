@@ -79,6 +79,23 @@ class RangeSensor(Sensor):
             rng = rng + self.sigma * self.crn_noise(rng.shape, gen, rng.dtype, rng.device)
         return rng.clamp(0.0, self.max_range)
 
+    stateless = True
+
+    def measure(self, s: State):
+        """One march, both outputs, no noise."""
+        return self.system.raycast(s, self._dirs(s), self.max_range)
+
+    def perturb(self, x: Tensor, gen) -> Tensor:
+        if self.sigma > 0 and gen is not None:
+            x = x + self.sigma * self.crn_noise(x.shape, gen, x.dtype, x.device)
+        return x.clamp(0.0, self.max_range)
+
+    def observe_with_jacobian(self, s: State, gen):
+        """One march for both.  The noise draw is identical to `observe`'s, so
+        common random numbers are unaffected."""
+        rng, grad = self.measure(s)
+        return self.perturb(rng, gen), grad
+
     def jacobian(self, s: State) -> Tensor:
         """d(range)/d(position), [..., n_beams, 3].
 

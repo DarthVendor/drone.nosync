@@ -124,6 +124,21 @@ class DepthCamera(Sensor):
                                                     rng.device)
         return rng.clamp(0.0, self.max_range)
 
+    stateless = True
+
+    def measure(self, s: State):
+        return self.system.raycast(s, self._dirs(s), self.max_range)
+
+    def perturb(self, x: Tensor, gen) -> Tensor:
+        if self.sigma > 0 and gen is not None:
+            x = x + self.sigma * self.crn_noise(x.shape, gen, x.dtype, x.device)
+        return x.clamp(0.0, self.max_range)
+
+    def observe_with_jacobian(self, s: State, gen):
+        """One march for both -- see `RangeSensor.observe_with_jacobian`."""
+        rng, grad = self.measure(s)
+        return self.perturb(rng, gen), grad
+
     def jacobian(self, s: State) -> Tensor:
         _, grad = self.system.raycast(s, self._dirs(s), self.max_range)
         return grad

@@ -259,3 +259,52 @@ def test_sensors_receive_the_crn_group_from_the_rollout():
     sen = make_sensor("noisy_position", system, sigma=0.01)
     Rollout(system, tr, task, cfg, [sen])
     assert sen.crn_group == cfg.n_eps == 3
+
+
+# --- one march, not two ------------------------------------------------------
+
+def test_observe_with_jacobian_matches_the_two_calls_it_replaces():
+    """`system.raycast` returns the range AND its gradient from one march.
+
+    `observe` was taking the range and discarding the gradient; `jacobian` then
+    repeated the identical march and discarded the range.  Profiled on the
+    imported city, that march was 97% of rollout time and ran twice per sensor
+    update.  Combining them is only legitimate if it is bit-exact, including the
+    common-random-numbers draw -- a sensor whose noise stream shifted would
+    change every fitness comparison in the search.
+    """
+    import torch
+
+    from lagrangian_es.sensors import make_sensor
+    from lagrangian_es.systems import make_system
+    from lagrangian_es.util import make_gen
+
+    for env, name in (("pillars", "range"), ("singapore_cbd", "range"),
+                      ("pillars", "depth_camera")):
+        sysm = make_system("quadrotor_nav", environment=env)
+        sen = make_sensor(name, sysm)
+        s = sysm.reset(32, make_gen(0))
+        for sigma in (0.0, 0.05):
+            sen.sigma = sigma
+            r_old = sen.observe(s, make_gen(7))
+            j_old = sen.jacobian(s)
+            r_new, j_new = sen.observe_with_jacobian(s, make_gen(7))
+            assert torch.equal(r_old, r_new), (env, name, sigma)
+            assert torch.equal(j_old, j_new), (env, name, sigma)
+
+
+def test_a_sensor_that_shares_nothing_still_works():
+    """The base implementation just calls both, so overriding is optional."""
+    import torch
+
+    from lagrangian_es.sensors import make_sensor
+    from lagrangian_es.systems import make_system
+    from lagrangian_es.util import make_gen
+
+    sysm = make_system("quadrotor", environment=None) \
+        if False else make_system("quadrotor")
+    sen = make_sensor("landmark_camera", sysm, n_landmarks=4)
+    s = sysm.reset(8, make_gen(0))
+    r, j = sen.observe_with_jacobian(s, make_gen(1))
+    assert torch.equal(r, sen.observe(s, make_gen(1)))
+    assert j.shape[0] == 8

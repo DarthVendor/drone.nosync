@@ -7,6 +7,7 @@ seed that training never touches.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Optional
 
 import torch
@@ -26,7 +27,16 @@ def evaluate(system, trainable, task, theta: Tensor, cfg, n_tasks: int = 128,
     `tol` is the success radius used for the "within 25 cm" criterion; it is a
     reporting threshold only and never enters the fitness.
     """
+    # MEASUREMENT never truncates.  `stop_quantile` ends a training batch once
+    # most episodes are done, which is a fine way to spend less compute ranking
+    # genomes -- but applied here it would count every episode still flying as a
+    # failure, so a reported reach would be the quantile itself and every number
+    # in this file would understate whatever it describes.
+    cfg = replace(cfg, stop_quantile=1.0) if getattr(cfg, "stop_quantile", 1.0) < 1.0 \
+        else cfg
     roll = roll or Rollout(system, trainable, task, cfg)
+    if getattr(roll.cfg, "stop_quantile", 1.0) < 1.0:
+        roll = Rollout(roll.system, roll.trainable, roll.task, cfg, roll.sensors)
     goals = task.sample(n_tasks, make_gen(seed))
     res = roll.run(theta[None], goals, seed=seed + 1)
 

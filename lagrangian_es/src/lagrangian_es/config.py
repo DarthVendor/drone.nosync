@@ -60,6 +60,14 @@ class RolloutCfg:
                                   # objective (0.100 -> 0.141 across the task).
     dead_cost: float = 5.0        # per-second cost accrued by a crashed vehicle
                                   # under dead_mode="constant"
+    stop_quantile: float = 0.8    # end the batch once this FRACTION of episodes
+                                  # have arrived or died, instead of waiting for
+                                  # every last one.  1.0 keeps the exact
+                                  # behaviour; below that, episodes still flying
+                                  # are charged as if they hovered where they
+                                  # are for the rest of the episode, which is an
+                                  # approximation and a biased one -- see
+                                  # tests/test_es.py
     dead_mode: str = "constant"   # "constant" | "frozen" | "forfeit".
                                   # "constant" charges a flat dead_cost/s, which
                                   # is a free parameter that has to be tuned

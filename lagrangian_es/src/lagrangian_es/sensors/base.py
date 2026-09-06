@@ -130,6 +130,40 @@ class Sensor(ABC):
                 "latency_steps": self.latency_steps, "kind": self.kind,
                 "update_every": self.update_every}
 
+    #: set by sensors whose reading is a pure function of the state, so a frozen
+    #: episode's cached reading is not an approximation of the right answer, it
+    #: IS the right answer
+    stateless = False
+
+    def measure(self, s: State):
+        """Noiseless reading and Jacobian, [..., m] and [..., m, k] or None.
+
+        Split out from `observe` so the rollout can skip it for episodes that
+        have crashed or arrived, whose state no longer changes.  The noise draw
+        stays where it was and at full width, so common random numbers are
+        untouched -- that is the whole reason this is a separate seam rather
+        than a smaller batch.
+        """
+        raise NotImplementedError
+
+    def perturb(self, x: Tensor, gen) -> Tensor:
+        """Apply this sensor's noise model to a noiseless reading."""
+        return x
+
+    def observe_with_jacobian(self, s: State, gen):
+        """Readings and their pullback Jacobian, from ONE evaluation.
+
+        `observe` and `jacobian` repeat whatever work they share.  For a marched
+        sensor that is the entire ray march -- `system.raycast` already returns
+        both the range and its gradient, and each of the two calls was throwing
+        away half of what it computed.  Profiled on the city, the march was 97%
+        of rollout time and ran twice per update.
+
+        The default keeps the old behaviour, so a sensor that shares nothing
+        between the two does not have to care.
+        """
+        return self.observe(s, gen), self.jacobian(s)
+
     # --- rendering ----------------------------------------------------------
     def render_spec(self) -> Optional[dict]:
         """Static description of what this sensor draws, or None if nothing.

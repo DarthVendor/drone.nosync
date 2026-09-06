@@ -189,12 +189,14 @@ class Rollout:
     # --- sensing ------------------------------------------------------------
     def _prime(self, s: State, gen) -> None:
         self._held = {}
+        self._raw = {}          # noiseless readings, kept so frozen episodes
+                                # can be skipped without re-marching them
         if self.charge_mem is not None:
             self.charge_mem.reset()
         for sen, buf in zip(self.sensors, self.buffers):
             buf.reset(sen.observe(s, gen))
 
-    def _observe(self, s: State, gen, step: int = 0) -> dict:
+    def _observe(self, s: State, gen, step: int = 0, live=None) -> dict:
         """Delayed observations plus their pullback Jacobians.
 
         The MEASUREMENT is delayed; the Jacobian is evaluated at the current
@@ -208,8 +210,13 @@ class Rollout:
         for sen, buf in zip(self.sensors, self.buffers):
             k = max(1, int(getattr(sen, "update_every", 1)))
             if step % k == 0 or sen.name not in self._held:
-                fresh = sen.observe(s, gen)
-                jac = sen.jacobian(s) if self._needs_jac else None
+                raw, jac = self._measure(sen, s, live)
+                # noise is drawn AFTER, at full batch width, from the same
+                # generator in the same order -- so skipping frozen episodes
+                # cannot shift the common-random-numbers stream
+                fresh = sen.perturb(raw, gen) if sen.stateless \
+                    else (sen.observe(s, gen) if not self._needs_jac
+                          else sen.observe_with_jacobian(s, gen)[0])
                 self._held[sen.name] = (fresh, jac)
             else:
                 fresh, jac = self._held[sen.name]
@@ -229,6 +236,47 @@ class Rollout:
         if self.charge_mem is not None:
             out["charges"], out["charge_w"] = self.charge_mem.read()
         return out
+
+    def _measure(self, sen, s: State, live):
+        """Noiseless reading and Jacobian, marching only what is still flying.
+
+        An episode that has crashed or arrived is frozen by `tree_where`, so its
+        state -- vehicle AND geometry -- is bit-identical to the step before.  A
+        sensor whose reading is a pure function of that state therefore returns
+        exactly what it returned last time, which makes the cached value the
+        right answer rather than a stale one.  Skipping it is an optimisation
+        with no approximation in it, and the test asserts that.
+
+        The batch is NOT compacted.  `crn_noise` draws `[n_eps, ...]` and tiles
+        it across the population, so a smaller batch would change `B % n_eps`,
+        fall through to an untiled draw, and silently give every episode
+        different noise.  Indexing the expensive call while leaving the batch
+        shape alone keeps that stream exactly where it was.
+        """
+        cached = self._raw.get(sen.name)
+        if (not sen.stateless or live is None or cached is None
+                or bool(live.all())):
+            if sen.stateless:
+                out = sen.measure(s)
+                raw, jac = (out[0], out[1] if self._needs_jac else None)
+            else:
+                raw = sen.observe(s, None)
+                jac = sen.jacobian(s) if self._needs_jac else None
+            self._raw[sen.name] = (raw, jac)
+            return raw, jac
+        idx = live.nonzero(as_tuple=False).squeeze(-1)
+        if idx.numel() == 0:
+            return cached
+        sub = {k: v[idx] for k, v in s.items()}
+        r_sub, j_sub = sen.measure(sub)
+        raw = cached[0].clone()
+        raw[idx] = r_sub
+        jac = None
+        if self._needs_jac:
+            jac = cached[1].clone()
+            jac[idx] = j_sub
+        self._raw[sen.name] = (raw, jac)
+        return raw, jac
 
     def _u(self, TH_b, s, goal, obs):
         return (self.forward_batch(TH_b, s, goal, obs) if self.sensors
@@ -305,7 +353,19 @@ class Rollout:
         for t in range(T):
             goal = task.goal_for_leg(goals_b, leg) if arrival \
                 else task.goal_at(goals_b, t, T)
-            u = self._u(TH_b, s, goal, self._observe(s, sgen, t))
+            # Episodes whose sensors cannot see anything new, because their
+            # state is frozen and will not change again.
+            #
+            # ARRIVED only, deliberately -- not `alive & ~arrived`.  A crashed
+            # episode is frozen too, but it is frozen holding the DIVERGED state
+            # that killed it, and re-marching that garbage is what the old path
+            # did.  Caching it instead changes the reported `effort` and
+            # `saturation` for dead episodes, and `constraints.py` can put both
+            # in the fitness, so skipping them would not be free.  An arrived
+            # episode is frozen holding a perfectly ordinary state, so its
+            # cached reading is exactly the reading a re-march would produce.
+            live = ~arrived
+            u = self._u(TH_b, s, goal, self._observe(s, sgen, t, live))
             s_new = sysm.step(s, u, dt, res_b)
             # crashed vehicles freeze; never integrate a diverged state
             s = tree_where(alive & ~arrived, s_new, s)
@@ -359,7 +419,10 @@ class Rollout:
             elif t in leg_ends:
                 leg_err[:, leg_ends.index(t)] = err.norm(dim=-1)
             alive = alive & sysm.alive(s)
-            if stop_early and bool((arrived | ~alive).all()):
+            done_frac = (arrived | ~alive).to(sysm.dtype).mean()
+            q = float(cfg.stop_quantile)
+            if stop_early and bool(done_frac >= 1.0 if q >= 1.0
+                                   else done_frac >= q):
                 # every episode has finished or died; the tail is all zeros for
                 # the finished ones, and a constant rate for the dead ones, so
                 # settle the dead in one go rather than stepping the physics
@@ -370,6 +433,16 @@ class Rollout:
                 elif frozen_dead or forfeit_dead:
                     tail = start_err if forfeit_dead else pos
                     cost.add_(torch.where(alive, torch.zeros_like(tail), tail),
+                              alpha=dt * (T - 1 - t))
+                if q < 1.0:
+                    # Anything still flying is charged as if it hovered here for
+                    # the rest of the episode.  This is the approximation the
+                    # quantile buys its speed with: a vehicle that WOULD have
+                    # arrived at step 700 is scored as though it never did, so
+                    # the cut falls hardest on policies that are slow because
+                    # they are careful.
+                    flying = alive & ~arrived
+                    cost.add_(torch.where(flying, pos, torch.zeros_like(pos)),
                               alpha=dt * (T - 1 - t))
                 break
 

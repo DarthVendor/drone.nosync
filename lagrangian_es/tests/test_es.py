@@ -328,3 +328,58 @@ def test_sigma_fixed_point_is_set_by_grow_shrink_not_by_success_target():
     assert walk(p) == pytest.approx(0.05, rel=0.25)     # stationary at the balance
     assert walk(p - 0.15) < 0.05 * 0.2                  # below it, sigma decays
     assert walk(p + 0.15) > 0.05 * 5.0                  # above it, sigma grows
+
+
+# --- not simulating what has already finished --------------------------------
+
+def test_skipping_arrived_episodes_changes_nothing_it_should_not():
+    """An arrived episode is frozen, so its sensor cannot see anything new.
+
+    `tree_where` holds its state fixed, and a range sensor's reading is a pure
+    function of that state, so the cached value IS the value a re-march would
+    produce -- skipping it is an optimisation with no approximation in it.  The
+    whole claim rests on being bit-exact, so that is what gets asserted, on
+    every field the rollout reports rather than just the fitness.
+
+    Deliberately NOT extended to crashed episodes: one of those is frozen
+    holding the diverged state that killed it, and re-marching that garbage
+    gives a different answer than caching the last sane reading.  Measured, that
+    moved `effort` on 1 episode in 48 -- harmless for fitness here, but
+    `constraints.py` can put effort and saturation in the fitness, so it is not
+    free in general.
+    """
+    import json
+
+    import torch
+
+    from lagrangian_es.config import Config, RolloutCfg
+    from lagrangian_es.es import build, build_sensors
+    from lagrangian_es.rollout import Rollout
+
+    fields = ("fitness", "cost", "alive", "leg_err", "final_err", "success",
+              "legs_done", "finish_frac", "saturation", "effort", "shaping")
+
+    def go(skip):
+        cfg = Config(system="quadrotor_nav", trainable="nav_agent",
+                     task="waypoint_pair", environment="pillars",
+                     sensors=("range",), gating="arrival",
+                     system_kw=(("prox_gain", 30.0),),
+                     rollout=RolloutCfg(n_eps=8, ep_steps=400,
+                                        dead_mode="constant", dead_cost=6.0,
+                                        goal_bonus=15.0, stop_on_arrival=True,
+                                        lambda_s=0.2, lambda_e=0.005))
+        system, tr, task = build(cfg)
+        roll = Rollout(system, tr, task, cfg.rollout, build_sensors(cfg, system))
+        if not skip:                      # force the pre-optimisation path
+            orig = roll._measure
+            roll._measure = lambda sen, s, live, _o=orig: _o(sen, s, None)
+        th = tr.init()
+        pop = th[None].repeat(4, 1) + 0.02 * torch.randn(
+            4, tr.dim, generator=torch.Generator().manual_seed(2),
+            dtype=torch.float64)
+        goals = task.sample(8, torch.Generator().manual_seed(9))
+        return roll.run(pop, goals, 9)
+
+    a, b = go(False), go(True)
+    for f in fields:
+        assert torch.equal(getattr(a, f), getattr(b, f)), f
