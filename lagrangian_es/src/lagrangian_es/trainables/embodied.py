@@ -145,9 +145,9 @@ class NavAgent(EmbodiedAgent):
     for_systems = ("QuadrotorNav",)
 
     @classmethod
-    def build_terms(cls, system, n_bowls: int = 3, n_beams: int = 12,
-                    sensor_name: str = "range", barrier_weight: float = 1.2,
-                    damper: bool = True, **kw):
+    def build_terms(cls, system, n_bowls: int = 3, n_beams: int = 24,
+                    sensor_name: str = "range", barrier_weight: float = 3.0,
+                    damper: bool = True, vortex: bool = True, **kw):
         """Core, plus a barrier on POSITION and a damper on CLOSING SPEED.
 
         Both are needed, and for a reason that is structural rather than a matter
@@ -164,11 +164,17 @@ class NavAgent(EmbodiedAgent):
         barrier-only baseline of 0.779 / 0.221 that is +0.088 reach at half the
         crash rate.
         """
-        from .sensor_terms import RangeBarrier, RangeDamper
+        from .sensor_terms import RangeBarrier, RangeDamper, RangeVortex
         terms = cls._core(system, n_bowls) + [
             RangeBarrier(system.task_dim, sensor_name, n_beams, w0=barrier_weight)]
         if damper:
             terms.append(RangeDamper(system.task_dim, sensor_name, n_beams))
+        if vortex:
+            # workless: F perpendicular to v, so the certificate is untouched.
+            # Redirects the stragglers that slide around a pillar at the barrier's
+            # standoff netting only ~0.08 m/s of progress.
+            terms.append(RangeVortex(system.task_dim, sensor_name, n_beams,
+                                     k0=6.0))
         return terms
 
 

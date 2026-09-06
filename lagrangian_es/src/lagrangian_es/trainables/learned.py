@@ -55,7 +55,6 @@ from typing import Dict, Optional
 import torch
 from torch import Tensor
 
-from .sensor_terms import goal_gate, goal_gate_grad
 from .terms import LagrangianTerm
 
 

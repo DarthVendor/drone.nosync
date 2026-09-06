@@ -51,6 +51,65 @@ sensor  = make_sensor("range", system, n_beams=12)
 env     = Environment([Pillars(n=6), Hoops(n=3)])
 ```
 
+## The navigation prototype
+
+Sensor-guided waypoint navigation on randomised pillar fields. The scene lives in
+the state, so a different evaluation seed is a different set of layouts.
+
+| | n | reach | crash | timeout |
+|---|---|---|---|---|
+| pillars, eval seed | 8192 | **0.9940** | 0.0020 | 0.0040 |
+| pillars, held-out seed | 4096 | **0.9961** | 0.0010 | 0.0029 |
+
+Reproduce with `assets/nav99_genome.json` and library defaults; `tests/test_prototype.py`
+guards it. Transfer to scenes it was never tuned on — the obstacle terms consume
+beams and are never handed geometry:
+
+| sparse | gate | gate_forest | slalom | forest | cluttered | walls | hoop_* |
+|---|---|---|---|---|---|---|---|
+| 1.000 | 0.999 | 0.992 | 0.990 | 0.988 | 0.886 | 0.845 | 0.66–0.86 |
+
+The hoop scenes are a **known limitation, not a tuning gap**: a repulsive barrier
+pushes away from the ring it is supposed to fly through. That is an aperture
+problem and needs a term that can distinguish a gap from an obstacle.
+
+### What the number rests on
+
+Each of these was measured, and several overturned an earlier guess of mine.
+
+**Three terms, not one.** A potential's force depends on position alone, so it
+delivers a fixed deceleration and can only arrest an approach from
+`v <= sqrt(2 a d)` — about 2.3 m/s here, while 100% of collisions happened at a
+mean of 3.09 m/s. Raising the barrier's gain fixes the speed limit and destroys
+navigation (reach 0.21 at high gain). Only a Rayleigh term sees velocity, hence
+`RangeDamper`; and `RangeVortex` is workless (`F ⊥ v`), so it redirects the
+stragglers without touching the energy certificate.
+
+**Sensing geometry.** 12 beams over 2π sit 30° apart, leaving 0.52 m gaps at 1 m
+against pillars 0.36–0.76 m wide — one can hide entirely between two rays. 24
+beams took crashes 0.027 → 0.014; refreshing every step rather than every fifth
+took them 0.058 → 0.027.
+
+**`goal_margin` must exceed the barrier's standoff.** At 0.30 against a `safe`
+radius of 0.45, half of all waypoints sat inside the repulsion and the vehicle
+was pushed off its own target: reach 0.929 for those against 0.990–1.000 for the
+rest. That was the entire shortfall from 99%, and it is a well-posedness
+condition rather than a difficulty setting.
+
+**The objective needs both halves.** `dead_mode="frozen"` made a crash cheaper
+than a careful arrival (3.7952 against 3.9703), so selection correctly dismantled
+obstacle avoidance — the range barrier's weight went to 0.00 on two of three
+seeds. `dead_cost` alone over-corrects: crashes fall to 0.085 but reach falls to
+0.716, because punishing a crash is not the same as paying for an arrival. With
+`dead_cost=6.0` **and** `goal_bonus=15.0`, rank correlation between fitness and
+reach across a reckless-to-paralysed spectrum is +1.00.
+
+**Selection cannot polish this further.** At a 0.1% crash rate, 32 episodes per
+genome contain 0.03 crashes; resolving it would need ~1000 episodes per genome.
+Training past this point reliably *degrades* it (0.9707 → 0.9395), because the
+search optimises the only thing it can measure. The flight controller is trained;
+the sensor constants are measured.
+
 ## Results
 
 Held-out evaluation, 128–192 unseen tasks, 60 generations, identical search loop

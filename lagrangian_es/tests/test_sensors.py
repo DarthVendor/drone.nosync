@@ -64,13 +64,20 @@ def test_sensor_jacobian_is_finite(sysname, name):
     assert J.shape == (16, sen.obs_dim, system.task_dim)
 
 
-def test_default_stride_is_five_but_the_identity_is_not_strided():
-    """Physical sensors default to a 10 Hz refresh against a 50 Hz loop, which is
-    both realistic and 4-7x cheaper on ray-traced scenes.  `FullState` is pinned
-    to every step because it is the identity baseline the sensor-free path has to
-    reproduce bit-for-bit -- striding it would make it something else."""
+def test_default_strides_reflect_what_each_sensor_costs_and_buys():
+    """A 10 Hz refresh against a 50 Hz loop is realistic and 4-7x cheaper on
+    ray-traced scenes, and it is still the default for the expensive sensors.
+
+    `range` is the exception, and it was measured: striding it leaves the vehicle
+    blind for 0.1 s, which is 30 cm at 3 m/s, and that doubles the crash rate
+    (0.027 -> 0.058 on the pillar field with everything else held fixed).  For an
+    obstacle sensor that is the wrong trade, so it refreshes every step.
+
+    `FullState` is pinned to every step for a different reason: it is the
+    identity baseline the sensor-free path has to reproduce bit-for-bit, and
+    striding it would make it something else."""
     system = make_system("quadrotor")
-    assert make_sensor("range", make_system("quadrotor_nav")).update_every == 5
+    assert make_sensor("range", make_system("quadrotor_nav")).update_every == 1
     assert make_sensor("landmark_camera", system).update_every == 5
     assert make_sensor("noisy_position", system).update_every == 5
     assert make_sensor("full_state", system).update_every == 1

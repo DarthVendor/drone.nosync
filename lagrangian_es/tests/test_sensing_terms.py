@@ -497,3 +497,73 @@ def test_range_damper_certificate_declares_dissipative_not_bounded():
     c = _damper().certificate(None)
     assert c["dissipative"] and c["psd"] and c["zero_at_goal"]
     assert c["bounded_grad"] is False        # grows with closing speed, by design
+
+
+# --- gyroscopic steering ----------------------------------------------------
+def _vortex(**kw):
+    from lagrangian_es.trainables.sensor_terms import RangeVortex
+    return RangeVortex(3, "range", 12, **kw)
+
+
+def test_range_vortex_does_no_work_whatever_the_state():
+    """The entire justification for the term.  F perpendicular to v leaves
+    `H = T + V_d` non-increasing, so the certificate survives -- while breaking
+    the pure-gradient structure that forces the flow onto V_d's critical points.
+    If it could do work, it would be an unconstrained energy source."""
+    t = _vortex()
+    th = t.init(dtype=torch.float64)
+    e = torch.tensor([[3.0, 0.0, 0.0]], dtype=torch.float64)
+    x = torch.zeros(1, 3, dtype=torch.float64)
+    g = torch.Generator().manual_seed(0)
+    for _ in range(20):
+        v = torch.randn(1, 3, generator=g, dtype=torch.float64) * 2.0
+        J = torch.nn.functional.normalize(
+            torch.randn(1, 12, 3, generator=g, dtype=torch.float64), dim=-1)
+        z = torch.rand(1, 12, generator=g, dtype=torch.float64) * 3.0
+        F = -t.grad_potential(th, e, v, x, {"range": z, "range/J": J})
+        assert abs(float((F * v).sum())) < 1e-9
+
+
+def test_range_vortex_force_is_perpendicular_to_velocity():
+    t = _vortex()
+    th = t.init(dtype=torch.float64)
+    e = torch.tensor([[3.0, 0.0, 0.0]], dtype=torch.float64)
+    x = torch.zeros(1, 3, dtype=torch.float64)
+    J = torch.zeros(1, 12, 3, dtype=torch.float64)
+    J[0, 0] = torch.tensor([-1.0, 0.0, 0.0], dtype=torch.float64)
+    z = torch.full((1, 12), 4.0, dtype=torch.float64)
+    z[0, 0] = 0.4
+    v = torch.tensor([[2.0, 1.0, 0.0]], dtype=torch.float64)
+    F = -t.grad_potential(th, e, v, x, {"range": z, "range/J": J})
+    assert float(F.norm()) > 1e-6, "test is vacuous if the term is silent"
+    cosang = float((F * v).sum() / (F.norm() * v.norm()))
+    assert abs(cosang) < 1e-9
+
+
+def test_range_vortex_is_silent_in_open_space_and_at_the_goal():
+    t = _vortex()
+    th = t.init(dtype=torch.float64)
+    x = torch.zeros(1, 3, dtype=torch.float64)
+    v = torch.tensor([[2.0, 1.0, 0.0]], dtype=torch.float64)
+    J = torch.zeros(1, 12, 3, dtype=torch.float64)
+    J[0, 0] = torch.tensor([-1.0, 0.0, 0.0], dtype=torch.float64)
+    far = torch.full((1, 12), 4.0, dtype=torch.float64)
+    e = torch.tensor([[3.0, 0.0, 0.0]], dtype=torch.float64)
+    F = -t.grad_potential(th, e, v, x, {"range": far, "range/J": J})
+    assert torch.allclose(F, torch.zeros_like(F), atol=1e-12)
+    near = far.clone(); near[0, 0] = 0.4
+    at_goal = torch.tensor([[0.02, 0.0, 0.0]], dtype=torch.float64)
+    F = -t.grad_potential(th, at_goal, v, x, {"range": near, "range/J": J})
+    assert torch.allclose(F, torch.zeros_like(F), atol=1e-12)
+
+
+def test_range_vortex_reach_is_bounded():
+    t = _vortex()
+    for v in (1e3, 1e12, -1e12):
+        _, r = t._params(torch.tensor([1.0, v], dtype=torch.float64))
+        assert t.reach_lo <= float(r) <= t.reach_hi
+
+
+def test_range_vortex_certificate_declares_gyroscopic():
+    c = _vortex().certificate(None)
+    assert c["gyroscopic"] and c["workless"] and c["zero_at_goal"]

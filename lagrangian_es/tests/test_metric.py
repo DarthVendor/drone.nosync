@@ -170,7 +170,6 @@ def test_metric_sees_sensor_consuming_terms():
     over them.  Measured with `obs` withheld, a 499-slot learned genome gave an
     effective rank of 6 -- the allocator alone.
     """
-    import torch
     from lagrangian_es.config import Config, ESCfg, RolloutCfg
     from lagrangian_es.es import build, build_sensors
     from lagrangian_es.metric import physics_metric

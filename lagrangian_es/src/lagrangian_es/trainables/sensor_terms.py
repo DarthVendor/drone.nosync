@@ -427,7 +427,7 @@ class RangeDamper(SensorPotential):
     kind = "range_damper"
 
     def __init__(self, d: int, sensor_name: str, n_beams: int, c0: float = 200.0,
-                 accel0: float = 2.0, accel_lo: float = 0.5,
+                 accel0: float = 0.8, accel_lo: float = 0.5,
                  accel_hi: float = 6.0, **kw):
         super().__init__(d, sensor_name, **kw)
         self.n_beams = int(n_beams)
@@ -487,3 +487,105 @@ class RangeDamper(SensorPotential):
     def describe(self, theta):
         c, accel = self._params(theta)
         return {"dmp_c": float(c), "dmp_accel": float(accel)}
+
+
+class RangeVortex(SensorPotential):
+    """Workless steering: push AROUND what the beams see, not just away from it.
+
+    The gap this fills
+    ------------------
+    With the barrier tuned for safety the crash rate is 0.004, and what remains
+    are episodes that never arrive.  Measured, they are not trapped: 93% are
+    still moving, at 0.79 m/s and 0.435 m clearance -- exactly the barrier's safe
+    radius -- making 0.32 m of progress per 4 s with 1.4 m to go.  They ARE going
+    around the pillar; they are doing it far too slowly.
+
+    The reason is geometric.  The barrier cancels the goal's RADIAL pull, leaving
+    only the tangential remainder to drive the vehicle round, and near a head-on
+    approach that remainder is small.  Scaling the goal bowl up does supply more
+    of it (timeouts 0.032 -> 0.004) but destroys the flight controller
+    (crashes 0.312), because the gains are matched to the actuator envelope.
+
+    Why gyroscopic
+    --------------
+    A force perpendicular to velocity does NO WORK:
+
+        F = k * turn * |v| * (vhat x zhat)  =>  F . v = 0
+
+    so `H = T + V_d` is still non-increasing, the goal is still the equilibrium,
+    and LaSalle still applies -- the certificate is untouched.  What changes is
+    that the flow is no longer a pure gradient flow, which is precisely the
+    property that forces convergence onto the critical points of `V_d`.  It buys
+    circulation, and circulation is what a gradient field cannot produce.
+
+    The turn direction comes from beam ASYMMETRY -- which side is more obstructed
+    -- rather than from the potential's gradient, whose lateral component was
+    measured to be both weak (0.002 against 0.38 of braking) and sign-unreliable
+    (correct in 6/8 offsets at 12 beams, 6/8 at 48).  A decision beats an average.
+
+    Genome: [strength_raw, reach_raw], both bounded.
+    """
+
+    kind = "range_vortex"
+
+    def __init__(self, d: int, sensor_name: str, n_beams: int, k0: float = 2.0,
+                 reach0: float = 1.2, reach_lo: float = 0.20,
+                 reach_hi: float = 3.0, **kw):
+        super().__init__(d, sensor_name, **kw)
+        self.n_beams = int(n_beams)
+        self.k0, self.reach0 = float(k0), float(reach0)
+        self.reach_lo, self.reach_hi = float(reach_lo), float(reach_hi)
+
+    @property
+    def dim(self) -> int:
+        return 2
+
+    def init(self, dtype=torch.float64, device="cpu") -> Tensor:
+        t = min(max((self.reach0 - self.reach_lo)
+                    / (self.reach_hi - self.reach_lo), 1e-4), 1.0 - 1e-4)
+        return torch.tensor([self.k0 ** 0.5, math.log(t / (1.0 - t))],
+                            dtype=dtype, device=device)
+
+    def _params(self, theta):
+        k = theta[..., 0] ** 2
+        reach = (self.reach_lo + (self.reach_hi - self.reach_lo)
+                 * torch.sigmoid(theta[..., 1]))
+        return k, reach
+
+    def raw_potential(self, theta, obs):
+        return torch.zeros_like(obs[..., 0])
+
+    def raw_grad(self, theta, obs):
+        return torch.zeros_like(obs)
+
+    def potential(self, theta, e, v, x, obs=None):
+        return torch.zeros_like(e[..., 0])
+
+    def grad_potential(self, theta, e, v, x, obs=None):
+        z, J = self._read(obs)
+        if z is None or J is None:
+            return torch.zeros_like(e)
+        k, reach = self._params(theta)
+        speed = v.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        vhat = v / speed
+        # proximity weight per beam, zero beyond `reach`
+        w = (1.0 - z / reach[..., None]).clamp(0.0, 1.0) ** 2
+        # which side of the heading each beam sits on.  J = -beam direction, so
+        # the sign flips back here.
+        side = -torch.cross(vhat[..., None, :].expand_as(J), J, dim=-1)[..., 2]
+        turn = (w * torch.tanh(4.0 * side)).sum(-1) / self.n_beams
+        zhat = torch.zeros_like(vhat)
+        zhat[..., 2] = 1.0
+        lat = torch.cross(vhat, zhat, dim=-1)         # horizontal, perp to v
+        F = (k * turn)[..., None] * speed * lat
+        # the caller subtracts this, and only outside the goal ball
+        return -goal_gate(e, self.r_goal, self.gate_width)[..., None] * F
+
+    def certificate(self, theta, goal=None):
+        return {"kind": self.kind, "psd": True, "zero_at_goal": True,
+                "bounded_grad": False, "gyroscopic": True, "workless": True,
+                "sensor": self.sensor_name}
+
+    def describe(self, theta):
+        k, reach = self._params(theta)
+        return {"vtx_k": float(k), "vtx_reach": float(reach)}

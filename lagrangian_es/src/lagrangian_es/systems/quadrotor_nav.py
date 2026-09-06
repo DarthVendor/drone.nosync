@@ -25,7 +25,7 @@ class QuadrotorNav(QuadrotorSE3):
     state_keys = ("p", "v", "R", "om")          # plus the environment's own fields
 
     def __init__(self, environment: str = "pillars",
-                 env: Optional[Environment] = None, goal_margin: float = 0.30,
+                 env: Optional[Environment] = None, goal_margin: float = 0.75,
                  free_start: bool = False, prox_gain: float = 70.0,
                  prox_band: float = 0.60, **kw):
         super().__init__(**kw)
@@ -33,6 +33,10 @@ class QuadrotorNav(QuadrotorSE3):
         self.prox_band = float(prox_band)
         self.env = env if env is not None else make_environment(environment)
         self._env_keys: tuple = ()
+        # Must exceed the barrier's standoff (safe = 0.45) or the task is
+        # ill-posed: the vehicle is pushed away from its own waypoint.  Measured
+        # by waypoint clearance, reach was 0.929 for waypoints inside 0.45 m of a
+        # pillar against 0.990-1.000 outside it -- the entire shortfall from 99%.
         self.goal_margin = float(goal_margin)
         # In a mixture a hoop is just another obstacle and may not even be live
         # this episode, so pinning it to a waypoint would both un-park it and

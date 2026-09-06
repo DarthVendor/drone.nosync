@@ -1,5 +1,4 @@
 """`LearnedShaping` -- the shape is learned, the certificate is structural."""
-import pytest
 import torch
 
 from lagrangian_es.trainables.learned import LearnedShaping

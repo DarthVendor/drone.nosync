@@ -1,10 +1,7 @@
 """The harmonic obstacle field, and the charge memory that makes it harmonic."""
-import math
-
-import pytest
 import torch
 
-from lagrangian_es.config import Config, ESCfg, RolloutCfg
+from lagrangian_es.config import Config, RolloutCfg
 from lagrangian_es.es import build
 from lagrangian_es.rollout import ChargeMemory, Rollout
 from lagrangian_es.sensors.range_sensor import RangeSensor
