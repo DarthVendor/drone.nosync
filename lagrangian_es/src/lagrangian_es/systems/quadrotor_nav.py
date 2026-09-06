@@ -26,7 +26,8 @@ class QuadrotorNav(QuadrotorSE3):
 
     def __init__(self, environment: str = "pillars",
                  env: Optional[Environment] = None, goal_margin: float = 0.75,
-                 free_start: bool = False, los_range: float = 12.0,
+                 free_start: bool = False, difficulty: float = 1.0,
+                 los_range: float = 12.0,
                  los_soft: float = 0.05, los_radius: float = 0.30,
                  los_samples: int = 8, n_occluders: int = 0,
                  occ_lo: float = 0.85, occ_hi: float = 1.35,
@@ -47,6 +48,19 @@ class QuadrotorNav(QuadrotorSE3):
         self.prox_gain = float(prox_gain)
         self.prox_band = float(prox_band)
         self.env = env if env is not None else make_environment(environment)
+        # Scene difficulty as the fraction of obstacles left ACTIVE.
+        #
+        # Size was the obvious dial and it does not work: tripling the pillar
+        # radii moved the crash rate only 0.0020 -> 0.0088, because the learned
+        # controller simply handles bigger obstacles.  Nor does taking warning
+        # away -- it still flies at 1 m of sensor range, 0.8 m of range noise and
+        # 0.4 s of blindness.  DENSITY is the axis that bites: 6 -> 32 pillars
+        # takes crash 0.0020 -> 0.0684 and reach 0.9941 -> 0.7939.
+        #
+        # Applied by parking the surplus rather than by resampling a smaller
+        # field, so the state schema is identical at every difficulty and one
+        # genome trains across all of them.
+        self.difficulty = float(difficulty)
         self._env_keys: tuple = ()
         # Must exceed the barrier's standoff (safe = 0.45) or the task is
         # ill-posed: the vehicle is pushed away from its own waypoint.  Measured
@@ -81,6 +95,8 @@ class QuadrotorNav(QuadrotorSE3):
     def reset(self, B: int, gen: torch.Generator) -> State:
         s = super().reset(B, gen)
         field = self.env.sample(B, gen, self.dtype, self.device)
+        if self.difficulty < 1.0:
+            field = self._thin(field, B)
         self._env_keys = tuple(field)
         s.update(field)
         if self.start_pool is not None:
@@ -89,6 +105,20 @@ class QuadrotorNav(QuadrotorSE3):
             s["p"] = self.start_pool[idx].clone()
             s["v"] = torch.zeros_like(s["v"])
         return s
+
+    def _thin(self, field: State, B: int) -> State:
+        """Park a trailing fraction of every group, keeping shapes fixed."""
+        out = dict(field)
+        for grp in self.env.groups:
+            keys = [k for k in grp._keys() if k in out]
+            if not keys:
+                continue
+            n = out[keys[0]].shape[1]
+            keep = max(1, int(round(n * self.difficulty)))
+            off = torch.zeros(B, n, dtype=torch.bool, device=self.device)
+            off[:, keep:] = True
+            out.update(grp.deactivate(out, off))
+        return out
 
     def step(self, s: State, u: Tensor, dt: float, params: Tensor = None) -> State:
         out = super().step(s, u, dt, params)

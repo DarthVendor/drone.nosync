@@ -139,3 +139,45 @@ def test_observe_success_needs_all_three_conditions():
     goal = system.task_position(s).clone()
     goal[:, 0] += 0.1                       # standing on it: in sight, out of band
     assert not bool(task.success(s, goal).any())
+
+
+def test_observe_pays_for_the_BAND_not_for_closing_the_distance():
+    """The objective has to agree with the controller's equilibrium.
+
+    `StandoffBowl` holds a shell, but while the cost still paid for closing the
+    distance the cheapest behaviour was to fly onto the target -- where sight and
+    aim are trivially satisfied.  It did exactly that: `band` fell 0.918 -> 0.012
+    over 100 generations while visibility stayed near 0.85.  A contradiction
+    between what the potential holds and what the cost pays for is resolved in
+    favour of the cost.
+    """
+    from lagrangian_es.tasks import make_task
+    system = make_system("quadrotor_nav", environment="pillars", dtype=DT)
+    task = make_task("observe", system)
+    g = torch.zeros(1, 3, dtype=DT)
+    mid = 0.5 * (task.r_near + task.r_far)
+    at_target = float(task.position_cost(torch.tensor([[0.05, 0, 0]], dtype=DT),
+                                         g, 1e-2))
+    in_band = float(task.position_cost(torch.tensor([[mid, 0, 0]], dtype=DT),
+                                       g, 1e-2))
+    too_far = float(task.position_cost(
+        torch.tensor([[task.r_far + 1.0, 0, 0]], dtype=DT), g, 1e-2))
+    assert in_band < at_target, "sitting on the target must not be the cheapest"
+    assert in_band < too_far
+    # flat across the band: no gradient pulling it to one edge
+    for r in (task.r_near + 0.1, mid, task.r_far - 0.1):
+        c = float(task.position_cost(torch.tensor([[r, 0, 0]], dtype=DT), g, 1e-2))
+        assert abs(c - in_band) < 1e-6
+
+
+def test_waypoint_position_cost_is_unchanged():
+    """The hook exists for the observation task; every waypoint task must still
+    pay plain distance."""
+    from lagrangian_es.tasks import make_task
+    system = make_system("quadrotor_nav", environment="pillars", dtype=DT)
+    task = make_task("waypoint_pair", system)
+    g = torch.zeros(4, 3, dtype=DT)
+    x = torch.tensor([[0.3, 0, 0], [1.2, 0, 0], [3.0, 0, 0], [0, 2.0, 0]],
+                     dtype=DT)
+    want = torch.sqrt((x * x).sum(-1) + 1e-2)
+    assert torch.allclose(task.position_cost(x, g, 1e-2), want)

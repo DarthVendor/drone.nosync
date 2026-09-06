@@ -57,6 +57,16 @@ class Task(ABC):
         """[B] bool, for reporting only -- never part of the fitness."""
         return (self.system.task_position(s) - goal).norm(dim=-1) < self.tol
 
+    def position_cost(self, x: Tensor, goal: Tensor, eps: float) -> Tensor:
+        """What the objective pays per second for being where it is.
+
+        Distance to the goal, for a task that wants the vehicle AT the goal --
+        which is every waypoint task, and is why this was hard-coded until an
+        observation task needed something else.
+        """
+        e = x - goal
+        return torch.sqrt((e * e).sum(-1) + eps)
+
 
 class WaypointPair(Task):
     """Takeoff, translate, re-target, hover.
@@ -300,6 +310,22 @@ class ObserveTarget(Task):
 
     def goal_at(self, goals: Tensor, t: int, ep_steps: int) -> Tensor:
         return goals[:, 0]
+
+    def position_cost(self, x: Tensor, goal: Tensor, eps: float) -> Tensor:
+        """Distance to the standoff BAND, not to the target.
+
+        The controller's equilibrium is a shell, but the objective went on paying
+        for closing the distance -- so the cheapest thing to do was fly onto the
+        target, where visibility and aim are trivially satisfied.  It did exactly
+        that: `band` fell from 0.918 to 0.012 over 100 generations while sight
+        stayed fine.  A contradiction between what the potential holds and what
+        the cost pays for is resolved in favour of the cost, every time.
+        """
+        r = (x - goal).norm(dim=-1)
+        mid = 0.5 * (self.r_near + self.r_far)
+        half = 0.5 * (self.r_far - self.r_near)
+        d = (r - mid).abs() - half           # 0 inside the band
+        return torch.sqrt(d.clamp_min(0.0) ** 2 + eps)
 
     def success(self, s: State, goal: Tensor) -> Tensor:
         p = self.system.task_position(s)

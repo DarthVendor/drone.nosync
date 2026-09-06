@@ -303,7 +303,8 @@ class Rollout:
             s = tree_where(alive & ~arrived, s_new, s)
 
             err = sysm.task_position(s) - goal
-            pos = torch.sqrt((err * err).sum(-1) + cfg.pos_eps)
+            pos = task.position_cost(sysm.task_position(s), goal,
+                                     cfg.pos_eps)
             eff = sysm.effort(u, s)
             shp = sysm.shaping_cost(s)
             live = pos + cfg.lambda_e * eff + cfg.lambda_s * shp
@@ -376,8 +377,17 @@ class Rollout:
         done = (finish < T) if arrival else task.success(s, final_goal)
         if arrival:
             leg_err[:, -1] = (sysm.task_position(s) - final_goal).norm(dim=-1)
+        fit = cost.view(P, E).mean(dim=1)
+        if cfg.lambda_crash:
+            # Per-GENOME, not per-episode: the point is to price the rate, and a
+            # rate is not a property of one episode.  Shrunk toward a prior so
+            # the log acts on a belief rather than on a count that is usually 0.
+            died = (~alive).view(P, E).to(cost.dtype).sum(dim=1)
+            a = cfg.crash_prior * cfg.crash_prior_n
+            p_hat = (died + a) / (E + cfg.crash_prior_n)
+            fit = fit + cfg.lambda_crash * torch.log(p_hat)
         return RolloutResult(
-            fitness=cost.view(P, E).mean(dim=1),
+            fitness=fit,
             cost=cost,
             alive=alive,
             leg_err=leg_err,

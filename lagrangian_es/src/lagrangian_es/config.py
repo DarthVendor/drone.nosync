@@ -25,6 +25,19 @@ class RolloutCfg:
                                   # allocator is in yaw_mode='learned',
                                   # otherwise heading is a fixed constant
                                   # and this weight buys nothing.
+    lambda_crash: float = 0.0     # weight on log(crash rate): makes the LAST few
+                                  # percent of crashes worth far more than the
+                                  # first.  A per-episode dead cost is linear in
+                                  # the rate, so 2% -> 1% is worth exactly what
+                                  # 50% -> 49% is; d/dp of log p is 1/p, so the
+                                  # same step near zero is worth ~30x more.
+    crash_prior: float = 0.02     # rate the estimate is shrunk toward, and
+    crash_prior_n: float = 50.0   # how many pseudo-episodes of belief in it.
+                                  # Without shrinkage the log is applied to a
+                                  # measurement that is 0 in ~97% of 16-episode
+                                  # samples, and one stray crash moves fitness by
+                                  # 3.5 -- which amplifies the sampling lottery
+                                  # instead of pricing risk.
     lambda_occ: float = 0.0       # weight on losing sight of the target to
                                   # an obstacle.  Distinct from lambda_los:
                                   # that one is fixed by TURNING, this one

@@ -35,6 +35,11 @@ PRESETS = {
     # density stays comparable and "bigger" means more room to manoeuvre rather
     # than a sparser and quietly easier task.
     "pillars_large": lambda: [Pillars(n=20, extent=5.0)],
+    # Big worlds, chunked.  `cull_k` is set above the measured in-reach count
+    # (35-43 at a 6 m sensor), so the ray march is exact while touching a
+    # constant number of obstacles however large the field gets.
+    "pillars_vast":  lambda: [Pillars(n=500, extent=20.0, cull_k=72)],
+    "pillars_huge":  lambda: [Pillars(n=1000, extent=30.0, cull_k=72)],
     "boxes_large":   lambda: [Boxes(n=14, extent=4.8)],
     "box_field_large": lambda: [Boxes(n=10, extent=4.8),
                                 Pillars(n=8, extent=5.0, r_lo=0.16, r_hi=0.30)],

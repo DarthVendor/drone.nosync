@@ -333,3 +333,58 @@ def test_proximity_penalty_is_zero_in_the_clear_and_grows_approaching_geometry()
     far["p"] = s["p"] + torch.tensor([500.0, 500.0, 0.0], dtype=DT)
     lo = sysm.shaping_cost(far) - (1.0 - far["R"][..., 2, 2])
     assert torch.allclose(lo, torch.zeros_like(lo), atol=1e-12)
+
+
+# --- chunking: only the vehicle's neighbourhood is considered ---------------
+def _chunk_pair(n, extent, k, B=256, beams=24, mr=6.0):
+    from lagrangian_es.environments import Environment, Pillars
+    full = Environment([Pillars(n=n, extent=extent, cull_k=0)])
+    cull = Environment([Pillars(n=n, extent=extent, cull_k=k)])
+    system = make_system("quadrotor_nav", env=full, dtype=DT)
+    s = system.reset(B, make_gen(0))
+    d = torch.nn.functional.normalize(
+        torch.randn(B, beams, 3, generator=make_gen(1), dtype=DT), dim=-1)
+    rf, _ = full.raycast(s["p"], d, s, mr)
+    rc, _ = cull.raycast(s["p"], d, s, mr)
+    occ = full.groups[0].chunk_occupancy(s["p"], s, mr)
+    return rf, rc, float(occ.max())
+
+
+def test_chunked_raycast_is_exact_when_k_covers_the_neighbourhood():
+    """Chunking is exact iff `cull_k` exceeds the number of obstacles within the
+    sensor's reach -- everything beyond that provably cannot be hit.  The reason
+    it is worth doing is that the neighbourhood does NOT grow with the world:
+    ~35-43 pillars are in reach whether the field holds 40 or 1000."""
+    rf, rc, occ = _chunk_pair(n=500, extent=20.0, k=72)
+    assert occ < 72, f"occupancy {occ} exceeds cull_k, test is not testing exactness"
+    assert torch.equal(rf, rc), f"max diff {float((rf - rc).abs().max()):.3e}"
+
+
+def test_chunking_below_the_occupancy_is_wrong_not_merely_approximate():
+    """Guards the failure mode, because it is silent and fast.  An undersized
+    `cull_k` drops real hits and REPORTS THEM AS CLEAR -- measured, k=8 against
+    80 pillars ran 4.6x faster and lost range by up to 5.16 m."""
+    rf, rc, occ = _chunk_pair(n=80, extent=5.0, k=8)
+    assert occ > 8
+    assert not torch.equal(rf, rc)
+    # and the error is always in the dangerous direction: it over-reports range
+    assert float((rc - rf).min()) >= -1e-9, "cull shortened a range, which is new geometry"
+
+
+def test_shipped_chunked_presets_are_sized_correctly():
+    """A preset that ships with culling on must have `cull_k` above its own
+    occupancy, or it is quietly blind to obstacles."""
+    for name in ("pillars_vast", "pillars_huge"):
+        system = make_system("quadrotor_nav", environment=name, dtype=DT)
+        s = system.reset(256, make_gen(2))
+        g = system.env.groups[0]
+        occ = float(g.chunk_occupancy(s["p"], s, 6.0).max())
+        assert g.cull_k > occ, f"{name}: cull_k {g.cull_k} <= occupancy {occ}"
+
+
+def test_chunking_is_off_by_default_where_it_would_not_help():
+    """On a small arena everything is within reach, so culling can only cost
+    correctness -- it must not be on unless a scene asks for it."""
+    from lagrangian_es.environments import Pillars
+    assert Pillars().cull_k == 0
+    assert make_environment("pillars").groups[0].cull_k == 0
