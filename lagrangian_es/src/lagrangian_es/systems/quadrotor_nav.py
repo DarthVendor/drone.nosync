@@ -197,7 +197,7 @@ class QuadrotorNav(QuadrotorSE3):
             # goal's clearance to -0.18, i.e. buried, making those episodes
             # unsolvable rather than hard.
             leg = (g[:, :2] - start[:, :2])
-            L = leg.norm(dim=-1).clamp_min(1e-6)
+            L = torch.linalg.vector_norm(leg, dim=-1).clamp_min(1e-6)
             t_lo, t_hi = self.occ_clear / L, 1.0 - self.occ_clear / L
             t = torch.minimum(torch.maximum(t, t_lo), t_hi)
             on_line = start[:, :2] + t[:, None] * leg
@@ -296,7 +296,7 @@ class QuadrotorNav(QuadrotorSE3):
         no surface normal, so it costs nothing beyond the clearance already
         computed for the liveness test, and it errs conservatively.
         """
-        v = s["v"].norm(dim=-1).clamp_min(0.05)
+        v = torch.linalg.vector_norm(s["v"], dim=-1).clamp_min(0.05)
         return self.clearance(s) / v
 
     def raycast(self, s: State, dirs: Tensor, max_range: float = 4.0):
@@ -326,7 +326,7 @@ class QuadrotorNav(QuadrotorSE3):
         """
         p = self.task_position(s)
         d = goal - p
-        dist = d.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        dist = torch.linalg.vector_norm(d, dim=-1, keepdim=True).clamp_min(1e-6)
         n = d / dist
         # an orthonormal pair spanning the disc facing the viewer; the seed axis
         # is chosen away from n so the cross product never degenerates
@@ -336,7 +336,7 @@ class QuadrotorNav(QuadrotorSE3):
         alt[..., 0] = 1.0
         up = torch.where((n[..., 2:3].abs() > 0.9), alt, up)
         e1 = torch.cross(n, up, dim=-1)
-        e1 = e1 / e1.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        e1 = e1 / torch.linalg.vector_norm(e1, dim=-1, keepdim=True).clamp_min(1e-6)
         e2 = torch.cross(n, e1, dim=-1)
         k = self.los_samples
         th = torch.arange(k, dtype=p.dtype, device=p.device) * (6.283185307 / k)
@@ -346,7 +346,7 @@ class QuadrotorNav(QuadrotorSE3):
         pts = goal[..., None, :] + offs                     # [..., k, 3]
         pts = torch.cat([goal[..., None, :], pts], dim=-2)  # [..., k+1, 3]
         dv = pts - p[..., None, :]
-        dn = dv.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        dn = torch.linalg.vector_norm(dv, dim=-1, keepdim=True).clamp_min(1e-6)
         rng, _ = self.env.raycast(s["p"], dv / dn, s, self.los_range)
         clear = torch.sigmoid((rng - dn[..., 0]) / self.los_soft)
         return clear.mean(-1)

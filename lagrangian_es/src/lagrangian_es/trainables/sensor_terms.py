@@ -39,14 +39,14 @@ from .terms import LagrangianTerm
 
 def goal_gate(e: Tensor, r_goal: float, width: float) -> Tensor:
     """Smoothstep, EXACTLY zero for ||e|| <= r_goal and 1 beyond r_goal + width."""
-    t = ((e.norm(dim=-1) - r_goal) / max(width, 1e-9)).clamp(0.0, 1.0)
+    t = ((torch.linalg.vector_norm(e, dim=-1) - r_goal) / max(width, 1e-9)).clamp(0.0, 1.0)
     return t * t * (3.0 - 2.0 * t)
 
 
 def goal_gate_grad(e: Tensor, r_goal: float, width: float) -> Tensor:
     """d(gate)/d(e), [..., d].  Zero inside the goal ball, so the whole term --
     value and gradient -- vanishes there."""
-    n = e.norm(dim=-1).clamp_min(1e-9)
+    n = torch.linalg.vector_norm(e, dim=-1).clamp_min(1e-9)
     w = max(width, 1e-9)
     t = ((n - r_goal) / w).clamp(0.0, 1.0)
     dt = 6.0 * t * (1.0 - t) / w
@@ -592,7 +592,7 @@ class RangeVortex(SensorPotential):
         if z is None or J is None:
             return torch.zeros_like(e)
         k, reach = self._params(theta)
-        speed = v.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        speed = torch.linalg.vector_norm(v, dim=-1, keepdim=True).clamp_min(1e-6)
         vhat = v / speed
         # proximity weight per beam, zero beyond `reach`
         w = (1.0 - z / reach[..., None]).clamp(0.0, 1.0) ** 2

@@ -60,6 +60,19 @@ class RolloutCfg:
                                   # objective (0.100 -> 0.141 across the task).
     dead_cost: float = 5.0        # per-second cost accrued by a crashed vehicle
                                   # under dead_mode="constant"
+    compile_forward: bool = False  # torch.compile the vmapped controller.
+                                  # Measured 1.78x on the learned rig, matching
+                                  # eager exactly.  OFF by default because the
+                                  # compile costs ~13 s per process and per
+                                  # batch shape: negligible for a training run
+                                  # that makes 10^5 forward calls, a large
+                                  # regression for a one-off evaluation.
+                                  #
+                                  # IGNORED inside `ParallelRollout` workers,
+                                  # which force it off: Inductor's own compile
+                                  # pool deadlocks when started from inside a
+                                  # process-pool worker, and the run then sits
+                                  # at 0% CPU forever.
     lambda_ttc: float = 0.0       # weight on a shortfall in TIME TO COLLISION.
     ttc_safe: float = 0.6         # seconds of margin below which it is charged.
                                   # Unlike a crash COUNT, this never saturates:

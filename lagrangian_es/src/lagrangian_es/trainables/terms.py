@@ -309,7 +309,7 @@ class ObstacleBarrier(_Bump):
     def _s(self, x: Tensor):
         c = torch.as_tensor(self.center_t, dtype=x.dtype, device=x.device)
         rel = x - c
-        dist = rel.norm(dim=-1).clamp_min(1e-6)
+        dist = torch.linalg.vector_norm(rel, dim=-1).clamp_min(1e-6)
         return rel, dist
 
     def potential(self, theta, e, v, x):
@@ -333,7 +333,8 @@ class ObstacleBarrier(_Bump):
         clear = None
         if goal is not None:
             c = torch.as_tensor(self.center_t, dtype=goal.dtype, device=goal.device)
-            clear = bool(((goal - c).norm(dim=-1) >= self.radius + m).all())
+            clear = bool((torch.linalg.vector_norm(goal - c, dim=-1)
+                          >= self.radius + m).all())
         return {"kind": self.kind, "psd": True,
                 # compact support: exactly zero beyond radius + margin
                 "zero_at_goal": True if clear else (False if clear is None else clear),
@@ -461,13 +462,13 @@ class StandoffBowl(LagrangianTerm):
 
     def potential(self, theta, e, v, x):
         w, r0 = self._params(theta)
-        n = e.norm(dim=-1)
+        n = torch.linalg.vector_norm(e, dim=-1)
         d = n - r0
         return w * d * d
 
     def grad_potential(self, theta, e, v, x):
         w, r0 = self._params(theta)
-        n = e.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        n = torch.linalg.vector_norm(e, dim=-1, keepdim=True).clamp_min(1e-6)
         d = n - r0[..., None]
         return 2.0 * w[..., None] * d * (e / n)
 

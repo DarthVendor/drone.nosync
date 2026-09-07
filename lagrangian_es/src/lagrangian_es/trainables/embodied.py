@@ -148,7 +148,9 @@ class NavAgent(EmbodiedAgent):
     def build_terms(cls, system, n_bowls: int = 3, n_beams: int = 24,
                     sensor_name: str = "range", barrier_weight: float = 3.0,
                     damper: bool = True, vortex: bool = True,
-                    harmonic: bool = False, **kw):
+                    harmonic: bool = False,
+                    harmonic_goal: bool = False,
+                    learned: bool = True, **kw):
         """Core, plus a barrier on POSITION and a damper on CLOSING SPEED.
 
         Both are needed, and for a reason that is structural rather than a matter
@@ -166,7 +168,60 @@ class NavAgent(EmbodiedAgent):
         crash rate.
         """
         from .sensor_terms import RangeBarrier, RangeDamper, RangeVortex
-        terms = cls._core(system, n_bowls)
+        if learned:
+            # THE DEFAULT.  The learned potential, in place of the bowls and the
+            # constant damper.  This is the option for a failure the hand-designed stack
+            # cannot express, and the whole-city tour is one: 94% of stalls are
+            # SADDLES with the vehicle pinned 0.35 m off a building under 4.9 N,
+            # goal 16.5 m away past it.  The bowl and the barrier balance normal
+            # to the wall and the way out runs ALONG it, where a potential built
+            # from distance-to-goal and distance-to-obstacle has nothing to say.
+            #
+            # The network sees the beams, so it CAN say something there.  What
+            # it may not do is give up the certificate: V = ||h(e,obs) -
+            # h(0,obs)||^2 is nonnegative and stationary at the goal by its
+            # form, not by training.
+            #
+            # `learned=False` restores the hand-designed stack -- three bowls, a
+            # constant damper and a range barrier.  The shipped genomes were
+            # measured with it and PIN it, because a genome is 52 slots there
+            # and 806 here, and a published number is a claim about a
+            # configuration rather than about whatever the default is today.
+            from .learned import LearnedShaping
+            # NOTHING hand-designed alongside it.  The term supplies both heads
+            # -- V(e, obs) and R(v, obs) -- and both see the beams, so the
+            # barrier, the closing damper and the constant damper are all things
+            # it can represent rather than things it needs given to it.
+            #
+            # What it cannot represent is the gyroscopic vortex: a gradient plus
+            # a Rayleigh dissipation has no workless component by construction.
+            # That is a real loss and it is deliberate -- a term whose weight was
+            # chosen by hand is a guess, and several of the guesses in this stack
+            # turned out to be wrong in ways only measurement found.
+            #
+            # The cost is the starting point.  With small initial weights V is
+            # nearly the bare bowl and there is NO obstacle avoidance at all, so
+            # avoidance has to be discovered rather than warm-started.
+            return [LearnedShaping(system.task_dim, sensor_name, n_obs=n_beams)]
+        elif harmonic_goal:
+            # A harmonic SINK in place of the bowls, so the composed potential is
+            # harmonic and not merely its obstacle half.  Measured: the field
+            # alone is lap V = 0.0000, but three quadratic bowls add +8.69, and a
+            # potential with positive Laplacian may have interior minima -- which
+            # is why swapping only the obstacle term left 56% of whole-city tours
+            # trapped against the barrier's 65%.
+            #
+            # ONE bowl is kept, because the `log2d` kernel is a function of the
+            # horizontal radius alone and so exerts no vertical force at all.
+            # The bowl holds altitude and gives the last few centimetres their
+            # precision; it also puts a little positive curvature back, so this
+            # is harmonic in the plane rather than everywhere.
+            from .harmonic import HarmonicGoal
+            from .terms import DissipationTerm, GoalBowl
+            d = system.task_dim
+            terms = [HarmonicGoal(d), GoalBowl(d), DissipationTerm(d)]
+        else:
+            terms = cls._core(system, n_bowls)
         if harmonic:
             # A HARMONIC obstacle field instead of the local barrier.
             #

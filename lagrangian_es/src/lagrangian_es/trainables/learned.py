@@ -116,30 +116,46 @@ class LearnedShaping(LagrangianTerm):
         return torch.cat([p.reshape(-1) for p in parts]).to(device)
 
     # --- heads --------------------------------------------------------------
-    def _h(self, theta, e, z):
+    def _weights(self, theta):
+        """The trunk's parameters, sliced out once.
+
+        `_h` runs TWICE per step -- for h(e, obs) and for h(0, obs), whose
+        difference is what makes V vanish at the goal -- and each call was
+        re-slicing and re-reshaping the same five tensors.  Profiled on the
+        default rig that was 12 `_p` calls and 15 reshapes per step producing
+        identical results.
+        """
+        return (self._p(theta, "W1", (self.n_in, self.h)),
+                self._p(theta, "b1", (self.h,)),
+                self._p(theta, "W2", (self.h, self.out)),
+                self._p(theta, "b2", (self.out,)),
+                self._p(theta, "A", (self.d, self.out)))
+
+    def _h(self, theta, e, z, w=None):
         """Trunk. Returns (value, d(value)/d(e)) -- the Jacobian is written out
         rather than taken with autodiff so the term composes under vmap/jacrev
         without nesting transforms."""
-        W1 = self._p(theta, "W1", (self.n_in, self.h))
-        b1 = self._p(theta, "b1", (self.h,))
-        W2 = self._p(theta, "W2", (self.h, self.out))
-        b2 = self._p(theta, "b2", (self.out,))
-        A = self._p(theta, "A", (self.d, self.out))
+        W1, b1, W2, b2, A = self._weights(theta) if w is None else w
         inp = torch.cat([e / self.e_scale, z], dim=-1)
-        a1 = torch.einsum("...i,...ih->...h", inp, W1) + b1
+        # matmul, not einsum: these are batched MATVECS and go straight to
+        # bmm, where einsum pays its equation-parsing and backend-check
+        # overhead on every call.  Measured on the trunk's four contractions:
+        # 1.23x together, 2.09x on the smallest.  (The hand-designed terms
+        # measured the other way round -- einsum won there -- so this is a
+        # shape-by-shape fact, not a rule.)
+        a1 = (inp.unsqueeze(-2) @ W1).squeeze(-2) + b1
         t1 = torch.tanh(a1)
-        y = torch.einsum("...h,...ho->...o", t1, W2) + b2 \
-            + torch.einsum("...i,...io->...o", e, A)
+        y = (t1.unsqueeze(-2) @ W2).squeeze(-2) + b2 \
+            + (e.unsqueeze(-2) @ A).squeeze(-2)
         # d y / d e = A + W1[:d] * (1 - t1^2) * W2 , scaled
         dt = 1.0 - t1 * t1
-        J = A + torch.einsum("...ih,...h,...ho->...io",
-                             W1[..., :self.d, :], dt, W2) / self.e_scale
+        J = A + ((W1[..., :self.d, :] * dt.unsqueeze(-2)) @ W2) / self.e_scale
         return y, J
 
     def _L(self, theta, z):
         Wd = self._p(theta, "Wd", (self.n_obs, self.d * self.d))
         bd = self._p(theta, "bd", (self.d * self.d,))
-        flat = torch.einsum("...i,...ij->...j", z, Wd) + bd
+        flat = (z.unsqueeze(-2) @ Wd).squeeze(-2) + bd
         return flat.reshape(flat.shape[:-1] + (self.d, self.d))
 
     def _read(self, obs):
@@ -152,8 +168,9 @@ class LearnedShaping(LagrangianTerm):
         z = self._read(obs)
         if z is None:
             return torch.zeros_like(e[..., 0])
-        y, _ = self._h(theta, e, z)
-        y0, _ = self._h(theta, torch.zeros_like(e), z)
+        w = self._weights(theta)
+        y, _ = self._h(theta, e, z, w)
+        y0, _ = self._h(theta, torch.zeros_like(e), z, w)
         g = y - y0
         return (g * g).sum(-1)
 
@@ -161,14 +178,15 @@ class LearnedShaping(LagrangianTerm):
         z = self._read(obs)
         if z is None:
             return torch.zeros_like(e)
-        y, J = self._h(theta, e, z)
-        y0, _ = self._h(theta, torch.zeros_like(e), z)
+        w = self._weights(theta)
+        y, J = self._h(theta, e, z, w)
+        y0, _ = self._h(theta, torch.zeros_like(e), z, w)
         g = y - y0
         # grad_e ||g||^2 = 2 J g ; vanishes at e = 0 because g does
-        gradV = 2.0 * torch.einsum("...io,...o->...i", J, g)
+        gradV = 2.0 * (J @ g.unsqueeze(-1)).squeeze(-1)
         L = self._L(theta, z)
-        Lv = torch.einsum("...ji,...j->...i", L, v)
-        dRdv = torch.einsum("...ij,...j->...i", L, Lv)     # (L L^T) v
+        Lv = (v.unsqueeze(-2) @ L).squeeze(-2)
+        dRdv = (L @ Lv.unsqueeze(-1)).squeeze(-1)          # (L L^T) v
         return gradV + dRdv
 
     def damping(self, theta: Tensor) -> Tensor:

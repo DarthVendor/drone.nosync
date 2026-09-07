@@ -458,3 +458,45 @@ def test_dwell_is_seconds_so_it_survives_a_change_of_dt():
     assert bool(done.any())
     # same wall-clock dwell, so the same FRACTION of a same-duration episode
     assert (out[0.02][done] - out[0.01][done]).abs().max() < 0.08
+
+
+def test_compiling_the_forward_pass_changes_nothing():
+    """`compile_forward` is a speed switch and must be nothing else.
+
+    Compiled OUTSIDE the vmap -- one graph over the whole population -- it
+    measured 3.16x on a rollout.  It is off by default because the compile costs
+    several seconds per process and per batch shape, which a training run
+    amortises in its first generation and a one-off evaluation does not.
+
+    NOT bit-identical, and the distinction matters.  Fusing changes the order of
+    a reduction, so the accumulators come back different in their last bits:
+    relative 1.7e-16 on fitness, 5.3e-16 on cost.  What must not move is any
+    DECISION -- whether an episode lived, whether it counted as a success -- and
+    those are exact.
+    """
+    import torch
+
+    from lagrangian_es.config import Config, RolloutCfg
+    from lagrangian_es.es import build, build_sensors
+    from lagrangian_es.rollout import Rollout
+
+    out = []
+    for comp in (False, True):
+        cfg = Config(system="quadrotor_nav", trainable="nav_agent",
+                     task="waypoint_pair", environment="pillars",
+                     sensors=("range",), gating="arrival",
+                     system_kw=(("prox_gain", 30.0),),
+                     rollout=RolloutCfg(n_eps=4, ep_steps=120,
+                                        dead_mode="constant", dead_cost=6.0,
+                                        goal_bonus=15.0, stop_on_arrival=True,
+                                        compile_forward=comp))
+        system, tr, task = build(cfg)
+        roll = Rollout(system, tr, task, cfg.rollout, build_sensors(cfg, system))
+        goals = task.sample(4, torch.Generator().manual_seed(11))
+        out.append(roll.run(tr.init()[None].repeat(2, 1), goals, 11))
+    for f in ("alive", "success"):                       # decisions: exact
+        assert torch.equal(getattr(out[0], f), getattr(out[1], f)), f
+    for f in ("fitness", "cost", "final_err", "finish_frac"):
+        a, b = getattr(out[0], f), getattr(out[1], f)
+        scale = max(float(a.abs().max()), 1e-30)
+        assert float((a - b).abs().max()) / scale < 1e-12, f

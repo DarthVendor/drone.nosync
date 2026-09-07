@@ -27,6 +27,12 @@ def _cfg(env="pillars", steps=2400):
     return Config(system="quadrotor_nav", trainable="nav_agent",
                   task="waypoint_pair", environment=env, sensors=("range",),
                   gating="arrival", seed=0, system_kw=(("prox_gain", 30.0),),
+                  # PINNED.  `nav_agent` now defaults to the learned potential,
+                  # which is an 806-slot genome; nav99 is 52 and was measured on
+                  # the hand-designed stack.  A published number names the
+                  # configuration it was measured in -- same rule as
+                  # PROTOTYPE_STRIDE above.
+                  trainable_kw=(("learned", False),),
                   rollout=RolloutCfg(n_eps=8, ep_steps=steps, lambda_s=0.2,
                                      lambda_e=0.005, dead_mode="constant",
                                      dead_cost=6.0, goal_bonus=15.0),

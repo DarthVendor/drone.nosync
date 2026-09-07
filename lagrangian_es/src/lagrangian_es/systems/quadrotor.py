@@ -192,7 +192,7 @@ class QuadrotorSE3(LagrangianSystem):
         f = (F_des * b3).sum(dim=-1).clamp(self.f_min, self.f_max)
 
         # --- desired attitude: body z along F_des, then choose where to LOOK --
-        b3d = F_des / F_des.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        b3d = F_des / torch.linalg.vector_norm(F_des, dim=-1, keepdim=True).clamp_min(1e-6)
         if self.yaw_mode == "learned":
             # A heading blended from three horizontal cues, all available here:
             #   travel   where the vehicle is going now
@@ -203,7 +203,7 @@ class QuadrotorSE3(LagrangianSystem):
             w = phi[..., 6:9]
             vxy = torch.cat([s["v"][..., :2],
                              torch.zeros_like(s["v"][..., 2:])], dim=-1)
-            sp0 = vxy.norm(dim=-1, keepdim=True)
+            sp0 = torch.linalg.vector_norm(vxy, dim=-1, keepdim=True)
             vh = vxy / sp0.clamp_min(1e-6)
             # TRAVEL faded out by speed: a direction estimated from millimetres
             # per second is well defined and meaningless, and chasing it spins
@@ -216,7 +216,7 @@ class QuadrotorSE3(LagrangianSystem):
             if goal is not None:
                 gxy = torch.cat([goal[..., :2] - s["p"][..., :2],
                                  torch.zeros_like(s["v"][..., 2:])], dim=-1)
-                rg = gxy.norm(dim=-1, keepdim=True)
+                rg = torch.linalg.vector_norm(gxy, dim=-1, keepdim=True)
                 gh = gxy / rg.clamp_min(1e-6)
                 # RANGE-faded, for exactly the reason travel is speed-faded: a
                 # bearing measured from the point you are standing ON is well
@@ -240,11 +240,11 @@ class QuadrotorSE3(LagrangianSystem):
             # from the other side.
             b1 = R[..., :, 0]
             hxy = torch.cat([b1[..., :2], torch.zeros_like(b1[..., 2:])], dim=-1)
-            hh = hxy / hxy.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            hh = hxy / torch.linalg.vector_norm(hxy, dim=-1, keepdim=True).clamp_min(1e-6)
             look = (w[..., 0:1] * (ggate * gh) + w[..., 1:2] * (vgate * vh)
                     + w[..., 2:3] * (vgate * lat)
                     + (1.0 - ggate) * (1.0 - vgate) * hh)
-            n = look.norm(dim=-1, keepdim=True)
+            n = torch.linalg.vector_norm(look, dim=-1, keepdim=True)
             look = look / n.clamp_min(1e-6)
             # Blend back to a FIXED bearing at low speed.  `vh` is a normalised
             # direction, so it is well defined but meaningless when barely
@@ -273,7 +273,7 @@ class QuadrotorSE3(LagrangianSystem):
         else:
             b1c = torch.zeros_like(b3d) + self._e1
         b2d = torch.cross(b3d, b1c, dim=-1)
-        b2d = b2d / b2d.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        b2d = b2d / torch.linalg.vector_norm(b2d, dim=-1, keepdim=True).clamp_min(1e-6)
         b1d = torch.cross(b2d, b3d, dim=-1)
         Rd = torch.stack([b1d, b2d, b3d], dim=-1)            # columns
 
@@ -365,7 +365,7 @@ class QuadrotorSE3(LagrangianSystem):
         cost near zero there rather than swinging the heading around.
         """
         d = goal[..., :2] - s["p"][..., :2]
-        n = d.norm(dim=-1, keepdim=True)
+        n = torch.linalg.vector_norm(d, dim=-1, keepdim=True)
         dh = d / n.clamp_min(1e-6)
         fwd = s["R"][..., :2, 0]
         cos = (fwd * dh).sum(-1)

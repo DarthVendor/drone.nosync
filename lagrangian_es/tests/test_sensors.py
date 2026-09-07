@@ -100,7 +100,12 @@ def test_stride_holds_the_last_measurement():
     not doing anything."""
     from lagrangian_es.tasks import make_task as _mt
     system = make_system("quadrotor_nav", environment="pillars")
-    tr = make_trainable("nav_agent", system)
+    # `n_beams` has to match the sensor now.  The hand-designed terms sliced
+    # whatever width they were given; the learned potential's first layer is
+    # sized `task_dim + n_obs`, so a 12-beam sensor under a 24-beam trainable is
+    # an einsum shape error rather than a silent mis-read.  That coupling is a
+    # feature -- it fails loudly -- but it is new, so it is stated here.
+    tr = make_trainable("nav_agent", system, n_beams=12)
     task = _mt("waypoint_pair", system, gating="arrival")
     goals = task.sample(4, make_gen(0))
     TH = tr.init()[None]

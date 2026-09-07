@@ -617,6 +617,7 @@ def test_the_range_barrier_fights_the_task_on_a_hoop_course():
                      task="hoop_course", environment="hoop_course",
                      sensors=("range",), gating="arrival",
                      system_kw=(("prox_gain", 30.0),), task_kw=(("n_gates", 3),),
+                     trainable_kw=(("learned", False),),
                      rollout=RolloutCfg(n_eps=16, ep_steps=1800, lambda_s=0.2,
                                         lambda_e=0.005, dead_mode="constant",
                                         dead_cost=6.0, goal_bonus=15.0))

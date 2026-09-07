@@ -169,14 +169,23 @@ def test_nav_agent_carries_both_a_position_barrier_and_a_closing_damper():
     happen at 3.09 m/s, and raising its gain to cover that wrecks navigation.
     Only a Rayleigh term sees velocity, so dropping either one leaves a gap that
     no amount of tuning on the other closes.
+
+    `learned=False` is pinned because that argument is what selects this stack.
+    The DEFAULT is now a single learned term, which has to satisfy the same
+    requirement -- its `V(e, obs)` head is the potential and its `R(v, obs)` head
+    the Rayleigh one -- but by learning them rather than by being handed them.
+    The property below is about the hand-designed composition; the learned rig's
+    version of it is `test_learned.py`.
     """
     from lagrangian_es.systems import make_system
     system = make_system("quadrotor_nav", environment="pillars")
-    kinds = [t.kind for t in make_trainable("nav_agent", system).terms]
+    kinds = [t.kind for t in make_trainable("nav_agent", system,
+                                            learned=False).terms]
     assert "range_barrier" in kinds
     assert "range_damper" in kinds
     # the damper must be the dissipative one and the barrier the potential one
-    terms = {t.kind: t for t in make_trainable("nav_agent", system).terms}
+    terms = {t.kind: t for t in make_trainable("nav_agent", system,
+                                               learned=False).terms}
     assert terms["range_damper"].certificate(None).get("dissipative") is True
     assert terms["range_barrier"].certificate(None).get("dissipative") is None
 

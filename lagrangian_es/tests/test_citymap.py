@@ -230,6 +230,8 @@ def test_the_shipped_city_genome_still_flies_the_city():
                  environment="singapore_cbd", sensors=("range",),
                  gating="arrival",
                  system_kw=(("prox_gain", 30.0), ("free_start", True)),
+                 # pinned: this genome is 52 slots, from the hand-designed stack
+                 trainable_kw=(("learned", False),),
                  task_kw=(("n_legs", 2), ("max_leg", 10.0)),
                  rollout=RolloutCfg(n_eps=16, ep_steps=900, lambda_s=0.2,
                                     lambda_e=0.005, dead_mode="constant",

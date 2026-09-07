@@ -91,3 +91,42 @@ def test_certificate_claims_what_the_form_guarantees():
     c = t.certificate(t.init(dtype=DT))
     assert c["psd"] and c["zero_at_goal"] and c["learned"]
     assert c["params"] == t.dim
+
+
+def test_the_learned_term_supplies_both_kinds_of_force():
+    """The default rig is ONE learned term, so it has to carry both.
+
+    Obstacle avoidance needs a potential (force from position) and a Rayleigh
+    term (force from velocity): stopping takes v^2/2a of room, so a potential
+    alone delivers a fixed `a` and can only arrest an approach from
+    v <= sqrt(2ad).  The hand-designed stack was handed one of each.  This one
+    has a `V(e, obs)` head and an `R(v, obs)` head and must learn them -- but the
+    STRUCTURE has to be there or there is nothing to learn into.
+    """
+    import torch
+
+    from lagrangian_es.trainables.learned import LearnedShaping
+
+    t = LearnedShaping(3, "range", n_obs=24)
+    th = t.init()
+    g = torch.Generator().manual_seed(3)
+    B = 64
+    e = torch.randn(B, 3, generator=g, dtype=torch.float64)
+    v = torch.randn(B, 3, generator=g, dtype=torch.float64)
+    z = torch.zeros(B, 3, dtype=torch.float64)
+    obs = {"range": torch.rand(B, 24, generator=g, dtype=torch.float64) * 5 + 0.3}
+
+    # a POSITION force: depends on e with the vehicle at rest
+    at_rest = t.grad_potential(th, e, z, e, obs)
+    assert float(at_rest.abs().max()) > 1e-6
+
+    # a VELOCITY force: depends on v with the vehicle AT the goal, where the
+    # potential contributes exactly nothing
+    at_goal = t.grad_potential(th, z, v, z, obs)
+    assert float(at_goal.abs().max()) > 1e-6
+    assert float(t.grad_potential(th, z, z, z, obs).abs().max()) == 0.0
+
+    # and the certificate the form is supposed to guarantee
+    V = t.potential(th, e, v, e, obs)
+    assert float(V.min()) >= -1e-12                     # nonnegative
+    assert float(t.potential(th, z, v, z, obs).abs().max()) == 0.0   # zero at goal

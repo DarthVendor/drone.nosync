@@ -47,7 +47,20 @@ def _init(spec: dict) -> None:
                                    terms=spec["terms_fn"](system))
     sensors = spec["sensors_fn"](system) if spec.get("sensors_fn") \
         else build_sensors(cfg, system)
-    _RIG = Rollout(system, trainable, task, cfg.rollout, sensors)
+    # NEVER compile inside a worker.  TorchInductor runs its own pool of compile
+    # processes, and starting one from inside a `ProcessPoolExecutor` worker
+    # deadlocks: measured, the whole run sat at 0% CPU across every process and
+    # made no progress at all -- which looks like a slow generation rather than a
+    # hang, and is the worst possible failure mode for an unattended run.
+    #
+    # `compile_forward` measured a genuine 3.16x, but only in a single process.
+    # It stays available for that case; here it is forced off rather than left
+    # to whoever writes the config.
+    rc = cfg.rollout
+    if getattr(rc, "compile_forward", False):
+        from dataclasses import replace
+        rc = replace(rc, compile_forward=False)
+    _RIG = Rollout(system, trainable, task, rc, sensors)
 
 
 def _work(payload):

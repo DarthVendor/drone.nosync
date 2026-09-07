@@ -160,6 +160,7 @@ def test_a_shard_split_does_not_change_the_answer():
     cfg = Config(system="quadrotor_nav", trainable="nav_agent",
                  task="waypoint_pair", environment="pillars", sensors=("range",),
                  gating="arrival", seed=0, system_kw=(("prox_gain", 30.0),),
+                 trainable_kw=(("learned", False),),
                  rollout=RolloutCfg(n_eps=8, ep_steps=300, dead_mode="constant",
                                     dead_cost=6.0, goal_bonus=15.0,
                                     stop_on_arrival=True),   # default quantile
@@ -217,6 +218,7 @@ def test_a_quantile_stop_makes_fitness_depend_on_the_shard_split():
                      task="waypoint_pair", environment="pillars",
                      sensors=("range",), gating="arrival", seed=0,
                      system_kw=(("prox_gain", 30.0),),
+                     trainable_kw=(("learned", False),),   # nav99 is 52 slots
                      rollout=RolloutCfg(n_eps=8, ep_steps=300,
                                         dead_mode="constant", dead_cost=6.0,
                                         goal_bonus=15.0, stop_on_arrival=True,
@@ -240,3 +242,44 @@ def test_a_quantile_stop_makes_fitness_depend_on_the_shard_split():
 
     assert spread(1.0) < 1e-9
     assert spread(0.8) > 0.1, "the coupling this test documents has gone away"
+
+
+def test_workers_never_compile_however_the_config_asks():
+    """`torch.compile` inside a process-pool worker deadlocks.
+
+    Inductor runs its own pool of compile processes; starting that from inside a
+    `ProcessPoolExecutor` worker hangs, and the symptom is the worst kind --
+    every process at 0% CPU, no output, indistinguishable from a slow generation
+    until you look at the CPU.  An unattended run can sit there for hours.
+
+    `compile_forward` is worth having (3.16x measured, single-process), so it is
+    not removed; it is forced off where it is unsafe.
+    """
+    import json
+    import pathlib
+
+    import torch
+
+    from lagrangian_es.config import Config, ESCfg, RolloutCfg
+    from lagrangian_es.es import build
+    from lagrangian_es.parallel import ParallelRollout
+
+    genome = pathlib.Path(__file__).parent.parent / "assets" / "nav99_genome.json"
+    if not genome.exists():
+        pytest.skip("prototype genome not present")
+    cfg = Config(system="quadrotor_nav", trainable="nav_agent",
+                 task="waypoint_pair", environment="pillars", sensors=("range",),
+                 gating="arrival", seed=0, system_kw=(("prox_gain", 30.0),),
+                 trainable_kw=(("learned", False),),
+                 rollout=RolloutCfg(n_eps=4, ep_steps=120, compile_forward=True),
+                 es=ESCfg(pop=16, gens=1))
+    system, tr, task = build(cfg)
+    th = torch.tensor(json.loads(genome.read_text())["theta"], dtype=torch.float64)
+    TH = th[None].expand(16, -1).contiguous()
+    goals = task.sample(4, make_gen(1))
+    par = ParallelRollout({"cfg": cfg}, workers=2, min_pop=4)
+    try:
+        r = par.run(TH, goals, 1)          # would hang if the worker compiled
+    finally:
+        par.close()
+    assert torch.isfinite(r.fitness).all()
