@@ -1,0 +1,119 @@
+<?xml version="1.0"?>
+<!-- Delivery quadrotor, 650 mm wheelbase, 15in props, 1.5 kg gimballed payload.
+     Units: metres, kg. base_link origin is at the airframe centre of mass.
+     The cardan is modelled as two revolute joints so payload swing is
+     simulated; do NOT collapse it into a fixed inertia. -->
+<robot name="delivery_quad">
+
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0 0 0"/>
+      <mass value="4.0700"/>
+      <inertia ixx="0.077220" iyy="0.077220" izz="0.127661"
+               ixy="0.000000" ixz="0.000000" iyz="0.000000"/>
+    </inertial>
+    <visual>
+      <geometry><mesh filename="package://delivery_quad/meshes/airframe.stl"/></geometry>
+      <material name="carbon"><color rgba="0.20 0.22 0.26 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.0013"/>
+      <geometry><box size="0.22 0.22 0.09"/></geometry>
+    </collision>
+    <collision>
+      <origin xyz="0.1386 0.1386 -0.0047" rpy="0 1.5708 0.7854"/>
+      <geometry><cylinder radius="0.0125" length="0.252"/></geometry>
+    </collision>
+    <collision>
+      <origin xyz="-0.1386 0.1386 -0.0047" rpy="0 1.5708 2.3562"/>
+      <geometry><cylinder radius="0.0125" length="0.252"/></geometry>
+    </collision>
+    <collision>
+      <origin xyz="-0.1386 -0.1386 -0.0047" rpy="0 1.5708 -2.3562"/>
+      <geometry><cylinder radius="0.0125" length="0.252"/></geometry>
+    </collision>
+    <collision>
+      <origin xyz="0.1386 -0.1386 -0.0047" rpy="0 1.5708 -0.7854"/>
+      <geometry><cylinder radius="0.0125" length="0.252"/></geometry>
+    </collision>
+  </link>
+
+  <link name="rotor_0">
+    <inertial><mass value="0.030"/>
+      <inertia ixx="1.0e-4" iyy="1.0e-4" izz="2.0e-4" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+    <visual><geometry><cylinder radius="0.1905" length="0.004"/></geometry>
+      <material name="prop"><color rgba="0.3 0.34 0.4 0.35"/></material></visual>
+  </link>
+  <joint name="rotor_0_joint" type="continuous">
+    <parent link="base_link"/><child link="rotor_0"/>
+    <origin xyz="0.2298 0.2298 0.0513"/><axis xyz="0 0 1"/>
+  </joint>
+  <link name="rotor_1">
+    <inertial><mass value="0.030"/>
+      <inertia ixx="1.0e-4" iyy="1.0e-4" izz="2.0e-4" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+    <visual><geometry><cylinder radius="0.1905" length="0.004"/></geometry>
+      <material name="prop"><color rgba="0.3 0.34 0.4 0.35"/></material></visual>
+  </link>
+  <joint name="rotor_1_joint" type="continuous">
+    <parent link="base_link"/><child link="rotor_1"/>
+    <origin xyz="-0.2298 0.2298 0.0513"/><axis xyz="0 0 1"/>
+  </joint>
+  <link name="rotor_2">
+    <inertial><mass value="0.030"/>
+      <inertia ixx="1.0e-4" iyy="1.0e-4" izz="2.0e-4" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+    <visual><geometry><cylinder radius="0.1905" length="0.004"/></geometry>
+      <material name="prop"><color rgba="0.3 0.34 0.4 0.35"/></material></visual>
+  </link>
+  <joint name="rotor_2_joint" type="continuous">
+    <parent link="base_link"/><child link="rotor_2"/>
+    <origin xyz="-0.2298 -0.2298 0.0513"/><axis xyz="0 0 1"/>
+  </joint>
+  <link name="rotor_3">
+    <inertial><mass value="0.030"/>
+      <inertia ixx="1.0e-4" iyy="1.0e-4" izz="2.0e-4" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+    <visual><geometry><cylinder radius="0.1905" length="0.004"/></geometry>
+      <material name="prop"><color rgba="0.3 0.34 0.4 0.35"/></material></visual>
+  </link>
+  <joint name="rotor_3_joint" type="continuous">
+    <parent link="base_link"/><child link="rotor_3"/>
+    <origin xyz="0.2298 -0.2298 0.0513"/><axis xyz="0 0 1"/>
+  </joint>
+
+  <!-- passive cardan: gravity levels the payload, no actuator -->
+  <link name="cardan_ring">
+    <inertial><mass value="0.060"/>
+      <inertia ixx="1e-4" iyy="1e-4" izz="1.8e-4" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <joint name="cardan_roll" type="revolute">
+    <parent link="base_link"/><child link="cardan_ring"/>
+    <origin xyz="0 0 -0.0687"/><axis xyz="1 0 0"/>
+    <limit lower="-0.436" upper="0.436" effort="0" velocity="10"/>
+    <dynamics damping="0.02" friction="0.01"/>
+  </joint>
+
+  <link name="payload">
+    <inertial><origin xyz="0 0 -0.1300"/>
+      <mass value="1.5000"/>
+      <inertia ixx="0.016666" iyy="0.019346" izz="0.018056"
+               ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+    <visual><origin xyz="0 0 -0.1300"/>
+      <geometry><box size="0.288 0.248 0.268"/></geometry>
+      <material name="bay"><color rgba="0.62 0.47 0.26 1"/></material>
+    </visual>
+    <collision><origin xyz="0 0 -0.1300"/>
+      <geometry><box size="0.288 0.248 0.268"/></geometry>
+    </collision>
+  </link>
+  <joint name="cardan_pitch" type="revolute">
+    <parent link="cardan_ring"/><child link="payload"/>
+    <origin xyz="0 0 0"/><axis xyz="0 1 0"/>
+    <limit lower="-0.436" upper="0.436" effort="0" velocity="10"/>
+    <dynamics damping="0.02" friction="0.01"/>
+  </joint>
+</robot>

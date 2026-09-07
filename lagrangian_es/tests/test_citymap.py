@@ -243,3 +243,50 @@ def test_the_shipped_city_genome_still_flies_the_city():
                   roll=roll)
     assert ev["success_rate"] > 0.95, f"city reach regressed to {ev['success_rate']:.4f}"
     assert ev["crash_rate"] < 0.02, f"city crash regressed to {ev['crash_rate']:.4f}"
+
+
+def test_max_leg_zero_means_the_whole_map():
+    """`max_leg = 0` is the "any waypoint to any other" setting.
+
+    Resolved from the geometry rather than written as a number, so it stays
+    correct if the map is rebuilt at a different scale or extent: the graph
+    becomes complete, and every waypoint has every other as a neighbour.
+    """
+    sysm = make_system("quadrotor_nav", environment="singapore_cbd")
+    full = make_task("city_tour", sysm, n_legs=4, max_leg=0.0)
+    n = full.pool.shape[0]
+    assert int(full.cnt.min()) == n - 1, (int(full.cnt.min()), n - 1)
+    w = torch.as_tensor(sysm.env.waypoints, dtype=DT)
+    d = torch.cdist(w[:, :2], w[:, :2])
+    assert full.max_leg >= float(d.max())
+    # and it really does propose legs the bounded version cannot
+    near = make_task("city_tour", sysm, n_legs=4, max_leg=10.0)
+    gf = full.sample(2000, make_gen(3))
+    gn = near.sample(2000, make_gen(3))
+    lf = (gf[:, 1:, :2] - gf[:, :-1, :2]).norm(dim=-1).max()
+    ln = (gn[:, 1:, :2] - gn[:, :-1, :2]).norm(dim=-1).max()
+    assert float(lf) > 2.0 * float(ln)
+
+
+def test_a_variable_length_tour_pads_without_paying_for_it():
+    """Short tours repeat their last waypoint to keep the batch rectangular.
+
+    A padded leg is already satisfied, so it would advance the leg counter AND
+    credit the goal bonus -- a 5-leg tour padded to 15 collecting ten bonuses
+    for standing still.  `last_leg` reads where the padding starts, so the
+    episode ends at its own final waypoint and never enters the padding.
+    """
+    sysm = make_system("quadrotor_nav", environment="singapore_cbd")
+    task = make_task("city_tour", sysm, n_legs=15, min_legs=5, max_leg=16.0)
+    g = task.sample(3000, make_gen(7))
+    last = task.last_leg(g)
+    n = last + 1
+    assert int(n.min()) == 5 and int(n.max()) == 15
+    assert len(set(n.tolist())) == 11, "not all tour lengths are drawn"
+    # every leg up to `last` is a genuine move; everything after repeats
+    step = (g[:, 1:] - g[:, :-1]).norm(dim=-1)
+    idx = torch.arange(14)[None, :]
+    assert float(step[idx < last[:, None]].min()) > 0.0
+    pad = idx >= last[:, None]
+    if bool(pad.any()):
+        assert float(step[pad].abs().max()) == 0.0

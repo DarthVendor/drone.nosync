@@ -147,7 +147,8 @@ class NavAgent(EmbodiedAgent):
     @classmethod
     def build_terms(cls, system, n_bowls: int = 3, n_beams: int = 24,
                     sensor_name: str = "range", barrier_weight: float = 3.0,
-                    damper: bool = True, vortex: bool = True, **kw):
+                    damper: bool = True, vortex: bool = True,
+                    harmonic: bool = False, **kw):
         """Core, plus a barrier on POSITION and a damper on CLOSING SPEED.
 
         Both are needed, and for a reason that is structural rather than a matter
@@ -165,8 +166,28 @@ class NavAgent(EmbodiedAgent):
         crash rate.
         """
         from .sensor_terms import RangeBarrier, RangeDamper, RangeVortex
-        terms = cls._core(system, n_bowls) + [
-            RangeBarrier(system.task_dim, sensor_name, n_beams, w0=barrier_weight)]
+        terms = cls._core(system, n_bowls)
+        if harmonic:
+            # A HARMONIC obstacle field instead of the local barrier.
+            #
+            # LaSalle puts every bounded trajectory on the critical points of
+            # V_d, so pathing is decided by V_d's critical-point structure and
+            # not by training.  A bowl plus locally-supported repulsive barriers
+            # has spurious minima -- Koditschek-Rimon -- and on the whole-city
+            # tour that is the dominant failure: 71% of episodes end ALIVE and
+            # STUCK, 1.3 legs into a 10-leg route.  A harmonic field cannot have
+            # an interior local minimum, because the Hessian's eigenvalues sum
+            # to zero at any critical point, so none of them can all be positive.
+            #
+            # It needs `charge_slots` in the rollout config: the charges have to
+            # be remembered in the WORLD frame, or body-fixed beams slide them
+            # along the surface as the vehicle moves and harmonicity is lost
+            # (measured lap V = 69.4 sliding, 0.0039 frozen).
+            from .harmonic import HarmonicField
+            terms.append(HarmonicField(system.task_dim, w0=barrier_weight))
+        else:
+            terms.append(RangeBarrier(system.task_dim, sensor_name, n_beams,
+                                      w0=barrier_weight))
         if damper:
             terms.append(RangeDamper(system.task_dim, sensor_name, n_beams))
         if vortex:

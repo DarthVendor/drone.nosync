@@ -1,0 +1,32 @@
+<mujoco model="delivery_quad">
+  <compiler angle="radian" meshdir="meshes"/>
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4"/>
+  <asset><mesh name="airframe" file="airframe.stl"/></asset>
+  <worldbody>
+    <body name="base_link" pos="0 0 0.5">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="4.0700" fullinertia="0.077220 0.077220 0.127661 0.000000 0.000000 0.000000"/>
+      <geom type="mesh" mesh="airframe" contype="0" conaffinity="0" rgba="0.2 0.22 0.26 1"/>
+      <geom type="box" size="0.11 0.11 0.045" pos="0 0 0.0013" rgba="0.2 0.22 0.26 0"/>
+      <site name="rotor0" pos="0.2298 0.2298 0.0513" size="0.01"/>
+      <site name="rotor1" pos="-0.2298 0.2298 0.0513" size="0.01"/>
+      <site name="rotor2" pos="-0.2298 -0.2298 0.0513" size="0.01"/>
+      <site name="rotor3" pos="0.2298 -0.2298 0.0513" size="0.01"/>
+      <body name="cardan_ring" pos="0 0 -0.0687">
+        <joint name="cardan_roll" type="hinge" axis="1 0 0" range="-0.436 0.436" damping="0.02"/>
+        <inertial pos="0 0 0" mass="0.06" diaginertia="1e-4 1e-4 1.8e-4"/>
+        <body name="payload" pos="0 0 0">
+          <joint name="cardan_pitch" type="hinge" axis="0 1 0" range="-0.436 0.436" damping="0.02"/>
+          <inertial pos="0 0 -0.1300" mass="1.5000" diaginertia="0.016666 0.019346 0.018056"/>
+          <geom type="box" size="0.1440 0.1240 0.1340" pos="0 0 -0.1300" rgba="0.62 0.47 0.26 1"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor name="thrust0" site="rotor0" gear="0 0 1 0 0 0.016" ctrlrange="0 26"/>
+    <motor name="thrust1" site="rotor1" gear="0 0 1 0 0 -0.016" ctrlrange="0 26"/>
+    <motor name="thrust2" site="rotor2" gear="0 0 1 0 0 0.016" ctrlrange="0 26"/>
+    <motor name="thrust3" site="rotor3" gear="0 0 1 0 0 -0.016" ctrlrange="0 26"/>
+  </actuator>
+</mujoco>

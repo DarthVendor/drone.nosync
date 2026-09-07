@@ -265,6 +265,7 @@ class CityTour(Task):
     tour.
     """
 
+    #: `max_leg <= 0` means the whole map -- see `__init__`
     def __init__(self, system, n_legs: int = 2, max_leg: float = 10.0,
                  tol: float = 0.25, gating: str = "arrival", seed: int = 12345,
                  min_legs: int = 0):
@@ -277,7 +278,7 @@ class CityTour(Task):
         # final waypoint, and `last_leg` reads the repeat back off the goals.
         self.min_legs = int(min_legs) if min_legs else 0
         self.tol = float(tol)
-        self.max_leg = float(max_leg)
+        self.max_leg = float(max_leg)     # <= 0 -> the whole map, resolved below
         env = getattr(system, "env", None)
         pts = list(getattr(env, "waypoints", []) or [])
         if not pts:
@@ -286,6 +287,11 @@ class CityTour(Task):
                 "with `city_to_environment` (see scripts/dxf_city.py)")
         P = torch.as_tensor(pts, dtype=system.dtype, device=system.device)
         d = torch.cdist(P[:, :2], P[:, :2])
+        if self.max_leg <= 0.0:
+            # WHOLE MAP: any waypoint may follow any other.  Taken from the
+            # geometry rather than written as a number, so it stays true if the
+            # map is rebuilt at a different scale or extent.
+            self.max_leg = float(d.max()) + 1e-6
         adj = d <= self.max_leg
         # Exclude self by INDEX, not by `d > 0`: cdist computes the diagonal
         # through the same expansion as everything else, so it comes back as a
