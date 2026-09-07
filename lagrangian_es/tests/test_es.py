@@ -229,8 +229,14 @@ def test_goal_bonus_is_credited_once_per_waypoint_not_once_per_step():
     meaning anything -- the saving must be an integer multiple of the bonus, at
     most one per leg.
     """
+    # `tol_scale` 1.5, because the final leg is now credited on HOLDING the
+    # goal for `dwell_s` rather than on touching it, and the untrained prior
+    # cannot hold the default tolerance long enough to earn the second credit.
+    # A longer episode does not help and makes it worse: the bonus is paid at
+    # the end and only to survivors, so the prior reaches, drifts off and dies,
+    # forfeiting credits it had already earned.
     bonus = 10.0
-    base, with_bonus, n_legs = _bonus_costs(bonus)
+    base, with_bonus, n_legs = _bonus_costs(bonus, tol_scale=1.5)
     saved = base - with_bonus
     assert torch.all(saved >= -1e-9)
     assert torch.all(saved <= n_legs * bonus + 1e-9)
@@ -383,3 +389,72 @@ def test_skipping_arrived_episodes_changes_nothing_it_should_not():
     a, b = go(False), go(True)
     for f in fields:
         assert torch.equal(getattr(a, f), getattr(b, f)), f
+
+
+def test_arrival_requires_holding_the_goal_not_touching_it():
+    """`stop_on_arrival` ends the episode on arrival, so whatever "arrival"
+    means is the last thing the objective ever sees.
+
+    Defined as contact, it removes station-keeping from the task entirely: a
+    genome trained that way scored 0.9990 with the freeze and 0.4141 without,
+    having learned to touch the goal and drift off, while one trained without
+    the freeze scored 0.9868 either way.  Defined as HOLDING the goal for
+    `dwell_s`, the freeze stays a compute saving instead of becoming a different
+    task.
+    """
+    import torch
+
+    from lagrangian_es.config import RolloutCfg
+    from lagrangian_es.rollout import Rollout
+    from lagrangian_es.systems import make_system
+    from lagrangian_es.tasks import make_task
+    from lagrangian_es.trainables import make_trainable
+    from lagrangian_es.util import make_gen
+
+    system = make_system("quadrotor", dtype=DT)
+    tr = make_trainable("energy_shaping", system)
+    task = make_task("waypoint_pair", system, gating="arrival")
+    task.tol = task.tol * 2.0
+    th = tr.init()[None]
+    goals = task.sample(16, make_gen(4))
+
+    def finish_at(dwell_s):
+        cfg = RolloutCfg(n_eps=16, ep_steps=400, dwell_s=dwell_s,
+                         stop_on_arrival=True, goal_bonus=0.0)
+        return Rollout(system, tr, task, cfg).run(th, goals, 5).finish_frac
+
+    quick, held = finish_at(0.0), finish_at(0.5)
+    done = (quick < 1.0) & (held < 1.0)
+    assert bool(done.any()), "no episode finished either way; test is vacuous"
+    # holding takes strictly longer than touching, for every episode that did both
+    assert (held[done] >= quick[done] - 1e-12).all()
+    assert (held[done] > quick[done]).any()
+
+
+def test_dwell_is_seconds_so_it_survives_a_change_of_dt():
+    """A dwell counted in STEPS would silently mean half as long at dt/2."""
+    import torch
+
+    from lagrangian_es.config import RolloutCfg
+    from lagrangian_es.rollout import Rollout
+    from lagrangian_es.systems import make_system
+    from lagrangian_es.tasks import make_task
+    from lagrangian_es.trainables import make_trainable
+    from lagrangian_es.util import make_gen
+
+    system = make_system("quadrotor", dtype=DT)
+    tr = make_trainable("energy_shaping", system)
+    task = make_task("waypoint_pair", system, gating="arrival")
+    task.tol = task.tol * 2.0
+    th = tr.init()[None]
+    goals = task.sample(16, make_gen(4))
+    out = {}
+    for dt, steps in ((0.02, 400), (0.01, 800)):
+        cfg = RolloutCfg(n_eps=16, ep_steps=steps, dt=dt, dwell_s=0.5,
+                         stop_on_arrival=True, goal_bonus=0.0)
+        r = Rollout(system, tr, task, cfg).run(th, goals, 5)
+        out[dt] = r.finish_frac
+    done = (out[0.02] < 1.0) & (out[0.01] < 1.0)
+    assert bool(done.any())
+    # same wall-clock dwell, so the same FRACTION of a same-duration episode
+    assert (out[0.02][done] - out[0.01][done]).abs().max() < 0.08

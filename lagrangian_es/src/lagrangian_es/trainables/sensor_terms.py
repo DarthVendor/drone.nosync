@@ -296,8 +296,9 @@ class RangeBarrier(SensorPotential):
         """
         mc = m.clamp(0.0, 1.0)
         u = 1.0 - mc
+        u2 = u * u                           # shared by the value and the slope
         below = (-m).clamp_min(0.0)          # depth inside `safe`, 0 outside
-        return u * u * u + 3.0 * below, -3.0 * u * u
+        return u2 * u + 3.0 * below, -3.0 * u2
 
     def _wall(self, obs, safe):
         """Hard-wall barrier: -log((d - d_min) / (safe - d_min)).
@@ -595,13 +596,18 @@ class RangeVortex(SensorPotential):
         vhat = v / speed
         # proximity weight per beam, zero beyond `reach`
         w = (1.0 - z / reach[..., None]).clamp(0.0, 1.0) ** 2
-        # which side of the heading each beam sits on.  J = -beam direction, so
+        # Which side of the heading each beam sits on.  J = -beam direction, so
         # the sign flips back here.
-        side = -torch.cross(vhat[..., None, :].expand_as(J), J, dim=-1)[..., 2]
+        #
+        # Only the z component of that cross product is ever used, and
+        # cross(a, b)_z is a_x b_y - a_y b_x -- so computing all three and
+        # discarding two is two thirds wasted, plus an `expand_as` that
+        # materialises the broadcast.  `torch.cross` was ~10% of the rollout.
+        side = -(vhat[..., None, 0] * J[..., 1] - vhat[..., None, 1] * J[..., 0])
         turn = (w * torch.tanh(4.0 * side)).sum(-1) / self.n_beams
-        zhat = torch.zeros_like(vhat)
-        zhat[..., 2] = 1.0
-        lat = torch.cross(vhat, zhat, dim=-1)         # horizontal, perp to v
+        # cross(v, zhat) with zhat = (0, 0, 1) is exactly (v_y, -v_x, 0)
+        lat = torch.stack([vhat[..., 1], -vhat[..., 0],
+                           torch.zeros_like(vhat[..., 2])], dim=-1)
         F = (k * turn)[..., None] * speed * lat
         # the caller subtracts this, and only outside the goal ball
         return -goal_gate(e, self.r_goal, self.gate_width)[..., None] * F

@@ -60,13 +60,48 @@ class RolloutCfg:
                                   # objective (0.100 -> 0.141 across the task).
     dead_cost: float = 5.0        # per-second cost accrued by a crashed vehicle
                                   # under dead_mode="constant"
-    stop_quantile: float = 0.8    # end the batch once this fraction of episodes
+    lambda_ttc: float = 0.0       # weight on a shortfall in TIME TO COLLISION.
+    ttc_safe: float = 0.6         # seconds of margin below which it is charged.
+                                  # Unlike a crash COUNT, this never saturates:
+                                  # every candidate has a different one even when
+                                  # none of them crash, which is the regime where
+                                  # the count ties and selection falls through to
+                                  # speed.
+    dwell_s: float = 0.5          # seconds the vehicle must HOLD the final
+                                  # waypoint before it counts as arrived.  In
+                                  # SECONDS, not steps, so it survives a change
+                                  # of `dt`.  Without it, freezing the episode
+                                  # on contact removes station-keeping from the
+                                  # objective entirely: a genome trained that
+                                  # way scored 0.9990 with the freeze and 0.4141
+                                  # without, having learned to touch the goal
+                                  # and drift off, while one trained without the
+                                  # freeze scored 0.9868 either way.
+    stop_quantile: float = 1.0    # end the batch once this fraction of episodes
                                   # have ARRIVED (crashes do not count -- see
                                   # rollout.run), instead of waiting for the last
-                                  # straggler.  1.0 keeps the exact behaviour;
-                                  # below that, episodes still flying are charged
-                                  # as if they hovered where they are, which is
-                                  # an approximation and a biased one
+                                  # straggler.
+                                  #
+                                  # DEFAULT 1.0, i.e. off, and the reason is not
+                                  # the bias.  Below 1.0 the exit depends on how
+                                  # many of THIS BATCH have arrived, and the
+                                  # population is split across workers -- so a
+                                  # genome's fitness depends on which other
+                                  # genomes happen to share its chunk.  Measured
+                                  # at 0.8: up to 3.95 of fitness between a
+                                  # 2-worker and a 4-worker split, against 0.0000
+                                  # at 1.0.  That is not a speed/accuracy trade,
+                                  # it makes the objective ill-defined and
+                                  # unreproducible across machines.
+                                  #
+                                  # It also cost selection quality where it was
+                                  # supposed to be cheap: rank correlation
+                                  # between fitness and the true crash rate fell
+                                  # from +0.171 to +0.017 at n_eps 64, which is
+                                  # below what ranking on pure speed achieves
+                                  # (+0.141).  Available for a compute-bound
+                                  # sweep that accepts the coupling; not a
+                                  # default.
     dead_mode: str = "constant"   # "constant" | "frozen" | "forfeit".
                                   # "constant" charges a flat dead_cost/s, which
                                   # is a free parameter that has to be tuned

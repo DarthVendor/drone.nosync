@@ -43,6 +43,10 @@ CASES = [
                        env="pillars", sensor="range")),
     ("depth", dict(system="quadrotor_nav", task="waypoint_pair",
                    env="pillars", sensor="depth")),
+    # boxes had no renderer at all: every previous payload used pillars or
+    # hoops, so a scene made of blocks declared obstacles and drew none
+    ("boxes", dict(system="quadrotor_nav", task="waypoint_pair",
+                   env="boxes", sensor="range")),
     ("hoops", dict(system="quadrotor_nav", task="hoop_course", env="hoop_course",
                    sensor="range", task_kw=dict(n_gates=3))),
     ("payload", dict(system="quadrotor_payload", task="waypoint_pair")),
@@ -178,9 +182,11 @@ def test_payload_covers_every_overlay(payload):
         for key in ("obstacles", "cable", "feet", "beams", "uv"):
             if ep.get(key):
                 kinds.add(key)
+        for grp in (ep.get("obstacles") or []):
+            kinds.add(grp["kind"])
         kinds.add(f"dim{r['dim']}")
     for need in ("landmark_camera", "range", "depth_camera", "obstacles",
-                 "cable", "feet", "dim2", "dim3"):
+                 "boxes", "cable", "feet", "dim2", "dim3"):
         assert need in kinds, f"no case exercises {need}"
 
 

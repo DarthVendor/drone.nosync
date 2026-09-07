@@ -317,6 +317,27 @@ function obstacleSprites(k){
         for (let i=0;i<16;i+=4)
           out.push({pts:[lo[i],hi[i]], line:true, stroke:rgba(PAL.warn,0.45), width:1, alpha:1});
       }
+    } else if (g.kind === "boxes"){
+      // Rotated cuboids standing ON the floor, with their real finite height --
+      // an imported city block is 20 m across and 11 m tall in simulation
+      // metres, and drawing it at a pillar's fixed height would misrepresent
+      // both the canyon the drone flies down and what it can see over.
+      const n = g.a.length;
+      for (let j=0;j<n;j++){
+        const cx=g.c[2*j], cy=g.c[2*j+1];
+        const hx=g.h[3*j], hy=g.h[3*j+1], hz=g.h[3*j+2];
+        const ca=Math.cos(g.a[j]), sa=Math.sin(g.a[j]);
+        const corner=(sx,sy)=>[cx+sx*hx*ca-sy*hy*sa, cy+sx*hx*sa+sy*hy*ca];
+        const q=[corner(-1,-1),corner(1,-1),corner(1,1),corner(-1,1)];
+        const lo=q.map(p=>[p[0],p[1],0]), hi=q.map(p=>[p[0],p[1],hz]);
+        out.push({pts:lo, fill:rgba(PAL.warn,0.16), stroke:rgba(PAL.warn,0.55),
+                  width:1, alpha:1});
+        out.push({pts:hi, fill:rgba(PAL.warn,0.13), stroke:rgba(PAL.warn,0.7),
+                  width:1.2, alpha:1});
+        for (let i=0;i<4;i++)
+          out.push({pts:[lo[i],hi[i]], line:true, stroke:rgba(PAL.warn,0.45),
+                    width:1, alpha:1});
+      }
     } else if (g.kind === "walls"){
       const n = g.a.length/2;
       for (let j=0;j<n;j++){
@@ -921,6 +942,7 @@ function buildLegend(){
   if (gg){
     if (gg.some(x=>x.kind!=="hoops")) rows.push(["var(--warn)","Obstacles"]);
     if (gg.some(x=>x.kind==="hoops")) rows.push(["var(--ok)","Hoops"]);
+    if (gg.some(x=>x.kind==="boxes")) rows.push(["var(--warn)","City blocks"]);
   }
   $("legend").innerHTML=rows.map(([c,t])=>
     `<div class="lgi"><span class="sw" style="background:${c}"></span>${t}</div>`).join("");

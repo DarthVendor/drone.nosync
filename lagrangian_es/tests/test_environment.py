@@ -9,8 +9,8 @@ from lagrangian_es.rollout import Rollout
 from lagrangian_es.sensors import make_sensor
 from lagrangian_es.systems import make_system
 from lagrangian_es.environments import (
-    GROUPS, PRESETS, Environment, Hoops, Pillars, Walls, make_environment,
-    make_group,
+    GROUPS, PRESETS, Boxes, Environment, Gate, Hoops, Pillars, Walls,
+    make_environment, make_group,
 )
 from lagrangian_es.tasks import make_task
 from lagrangian_es.trainables import make_trainable
@@ -57,9 +57,16 @@ def test_raycast_shapes_and_finiteness(name):
 
 
 def test_closed_form_raycast_matches_finite_differences():
-    """Pillars and walls override the marcher with analytic intersections; the
-    gradient has to be the real derivative, not merely finite."""
-    env = Environment([Pillars(n=3), Walls(n=2)])
+    """The primitives with an analytic intersection must return the real
+    derivative, not merely a finite one.
+
+    `Walls` is deliberately NOT here any more: its closed form described a
+    centreline offset by a constant, while its SDF is a capsule with round caps,
+    so the two disagreed by roughly the wall thickness.  It marches now, and a
+    marched range is quantised by the marcher's `tol`, which a 1e-6 finite
+    difference cannot see through.
+    """
+    env = Environment([Pillars(n=3), Boxes(n=3, cull_k=0)])
     f = env.sample(4, make_gen(2), DT, "cpu")
     o = torch.zeros(4, 3, dtype=DT)
     o[:, 2] = 1.0
@@ -73,6 +80,40 @@ def test_closed_form_raycast_matches_finite_differences():
         om[:, i] -= h
         fd = (env.raycast(op, d, f, 6.0)[0] - env.raycast(om, d, f, 6.0)[0]) / (2 * h)
         assert float((fd - grad[..., i]).abs().max()) < 1e-4
+
+
+def test_tilted_rays_get_the_right_range_from_vertical_primitives():
+    """A cylinder's intersection is solved in the xy-plane, and a tilted ray's
+    xy-projection is NOT a unit vector.
+
+    Using the unit-direction closed form there scales the range wrong by
+    1/|d_xy|.  It is exact for a horizontal beam fan -- which is what
+    `RangeSensor` ships -- and wrong for a depth camera, which has a vertical
+    field of view, so the error hid behind the default sensor.  Measured before
+    the fix: |sdf| at the reported hit was 1.9e-14 horizontally and 0.19 m at a
+    modest tilt.
+    """
+    for grp in (Pillars(n=5), Gate()):
+        f = grp.sample(16, make_gen(1), DT, "cpu")
+        o = torch.rand(16, 3, generator=make_gen(11), dtype=DT) * 4 - 2
+        o[:, 2] = 1.0
+        keep = grp.sdf(o, f) > 0.15
+        o, f = o[keep], {k: v[keep] for k, v in f.items()}
+        n, M = o.shape[0], 48
+        th = torch.linspace(0.0, 6.283185307, M, dtype=DT)
+        for tilt in (0.0, 0.2, 0.5):
+            d = torch.zeros(n, M, 3, dtype=DT)
+            d[..., 0], d[..., 1] = torch.cos(th), torch.sin(th)
+            d[..., 2] = tilt
+            d = d / d.norm(dim=-1, keepdim=True)
+            rng, _ = grp.raycast(o, d, f, 6.0)
+            hit = rng < 6.0 - 1e-9
+            if not bool(hit.any()):
+                continue
+            p = o[:, None, :] + d * rng[..., None]
+            sd = grp.sdf(p.reshape(-1, 3),
+                         {k: v.repeat_interleave(M, 0) for k, v in f.items()})
+            assert sd.reshape(rng.shape)[hit].abs().max() < 1e-9, (grp.kind, tilt)
 
 
 def test_vertical_primitives_report_zero_height_gradient():
@@ -558,3 +599,106 @@ def test_marched_ranges_agree_with_the_exact_ones_where_both_hit():
     err = (r - exact)[both]
     assert err.abs().quantile(0.99) < 0.05, float(err.abs().quantile(0.99))
     assert err.max() < 0.02, f"marcher reported {float(err.max()):.3f} m TOO FAR"
+
+
+def test_every_culled_raycast_is_exact_on_the_big_presets():
+    """Culling is a compute trick; it must not change a single reading.
+
+    Both closed-form primitives cull, and both used to do it by CENTRE distance:
+    `Boxes` padded the reach by the largest half-extent and `Pillars` by the
+    largest radius.  A pad is a proxy for "a fat primitive reaches further than
+    its centre suggests", and ranking by `|a| - r` says that exactly, so the pad
+    goes.  The presets that ship with culling on are the ones that have to be
+    checked, because they are the ones where `cull_k` is smaller than the scene.
+    """
+    import torch
+
+    from lagrangian_es.environments import make_environment
+    from lagrangian_es.util import make_gen
+
+    for name in ("pillars_vast", "pillars_huge", "singapore_cbd"):
+        env = make_environment(name)
+        grp = env.groups[0]
+        assert grp.cull_k and grp.n > grp.cull_k, (name, grp.n, grp.cull_k)
+        B = 24
+        f = env.sample(B, make_gen(0), torch.float64, "cpu")
+        extent = float(getattr(grp, "extent", getattr(env, "span", 3.0)))
+        o = (torch.rand(B, 3, generator=make_gen(4), dtype=torch.float64) * 2 - 1)
+        o = o * extent
+        o[:, 2] = 1.0
+        M = 32
+        th = torch.linspace(0.0, 6.283185307, M, dtype=torch.float64)
+        d = torch.zeros(B, M, 3, dtype=torch.float64)
+        d[..., 0], d[..., 1] = torch.cos(th), torch.sin(th)
+        r_cull, g_cull = env.raycast(o, d, f, 6.0)
+        saved, grp.cull_k = grp.cull_k, 0
+        try:
+            r_full, g_full = env.raycast(o, d, f, 6.0)
+        finally:
+            grp.cull_k = saved
+        assert torch.equal(r_cull, r_full), (name, float((r_cull - r_full).abs().max()))
+        assert torch.equal(g_cull, g_full), name
+
+
+def test_the_box_yaw_memo_invalidates_when_the_field_changes():
+    """The cos/sin of the block yaws is cached on the yaw tensor's IDENTITY.
+
+    Geometry is constant for a whole rollout and axis-aligned for an imported
+    city, so recomputing it every step is 4.4% of a city rollout spent
+    reproducing the same numbers.  But a cache keyed on identity is only safe if
+    it cannot answer for the wrong field, so: a freshly sampled scene must give
+    a different answer, and the tensor is held so its id cannot be recycled.
+    """
+    import torch
+
+    from lagrangian_es.environments.primitives import Boxes
+    from lagrangian_es.util import make_gen
+
+    g = Boxes(n=6, cull_k=0)
+    f1 = g.sample(8, make_gen(1), DT, "cpu")
+    f2 = g.sample(8, make_gen(2), DT, "cpu")
+    p = torch.rand(8, 3, generator=make_gen(3), dtype=DT) * 4 - 2
+    p[:, 2] = 1.0
+    a1 = g.sdf(p, f1)
+    a2 = g.sdf(p, f2)          # different scene -> must not reuse f1's rotation
+    a1b = g.sdf(p, f1)         # back again
+    assert not torch.equal(a1, a2)
+    assert torch.equal(a1, a1b)
+    # the cached tensor is HELD, so its id cannot be handed to a later object
+    held = getattr(g, "_rot_held", None)
+    assert held is not None and held[0] is f1[g._k("a")]
+
+
+def test_the_axis_aligned_fast_path_gives_the_same_answer():
+    """An imported city's blocks are rectangles with no rotation at all, so the
+    change into each box's frame is two copies rather than four multiplies and
+    two adds over every box and every query point.
+
+    Worth a test rather than trust because it is a BRANCH on the geometry: the
+    fast path must be exactly the general one when the yaws are zero, and must
+    not be taken when they are not.
+    """
+    import torch
+
+    from lagrangian_es.environments import make_environment
+    from lagrangian_es.environments.primitives import Boxes
+    from lagrangian_es.util import make_gen
+
+    for env_name in ("singapore_cbd", None):
+        if env_name:
+            env = make_environment(env_name)
+            grp = env.groups[0]
+            f = env.sample(16, make_gen(1), DT, "cpu")
+        else:
+            grp = Boxes(n=6, cull_k=0)
+            f = grp.sample(16, make_gen(1), DT, "cpu")
+        a = f[grp._k("a")]
+        p = torch.rand(16, 3, generator=make_gen(4), dtype=DT) * 10 - 5
+        p[:, 2] = 1.0
+        grp._rot_held = None
+        got = grp.sdf(p, f)
+        # force the general path and compare
+        grp._rot_held = (a, (torch.cos(a), torch.sin(a), False))
+        assert torch.equal(got, grp.sdf(p, f)), env_name
+        grp._rot_held = None
+        assert bool((a == 0).all()) == (env_name == "singapore_cbd")

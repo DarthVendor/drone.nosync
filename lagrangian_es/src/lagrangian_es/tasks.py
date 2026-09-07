@@ -47,6 +47,18 @@ class Task(ABC):
         n = self.n_legs
         return [(i + 1) * ep_steps // n - 1 for i in range(n)]
 
+    def last_leg(self, goals: Tensor) -> Tensor:
+        """Index of each episode's FINAL leg, [B].
+
+        A constant for most tasks.  A tour whose length varies per episode pads
+        its goals to `n_legs` and overrides this, so the padding is never
+        visited rather than being flown through -- which matters because an
+        intermediate arrival advances the leg AND credits the goal bonus, so
+        padded legs would pay out for standing still.
+        """
+        return torch.full(goals.shape[:1], self.n_legs - 1,
+                          dtype=torch.long, device=goals.device)
+
     def goal_for_leg(self, goals: Tensor, leg: Tensor) -> Tensor:
         """Active goal under ARRIVAL gating: whichever leg each episode is on."""
         idx = leg.clamp(0, self.n_legs - 1)
@@ -254,10 +266,16 @@ class CityTour(Task):
     """
 
     def __init__(self, system, n_legs: int = 2, max_leg: float = 10.0,
-                 tol: float = 0.25, gating: str = "arrival", seed: int = 12345):
+                 tol: float = 0.25, gating: str = "arrival", seed: int = 12345,
+                 min_legs: int = 0):
         super().__init__(system)
         self.gating = gating
         self.n_legs = int(n_legs)
+        # `min_legs` > 0 makes the tour LENGTH vary per episode, uniformly on
+        # [min_legs, n_legs].  Shapes stay fixed at `n_legs` -- the rollout is
+        # batched and cannot carry ragged ones -- so a short tour repeats its
+        # final waypoint, and `last_leg` reads the repeat back off the goals.
+        self.min_legs = int(min_legs) if min_legs else 0
         self.tol = float(tol)
         self.max_leg = float(max_leg)
         env = getattr(system, "env", None)
@@ -300,7 +318,29 @@ class CityTour(Task):
             pick = (r * self.cnt[idx].to(r.dtype)).long()
             idx = self.nbr[idx, pick]
             legs.append(idx)
-        return self.pool[torch.stack(legs, dim=1)]
+        out = self.pool[torch.stack(legs, dim=1)]              # [n, n_legs, 3]
+        if self.min_legs:
+            k = torch.randint(self.min_legs, self.n_legs + 1, (n,), generator=gen)
+            # hold the last real waypoint through the padding, so a padded leg
+            # is already satisfied and `last_leg` can find where it starts
+            ar = torch.arange(self.n_legs)
+            keep = ar[None, :].clamp_max((k - 1)[:, None])
+            out = out.gather(1, keep[..., None].expand(-1, -1, out.shape[-1]))
+        return out
+
+    def last_leg(self, goals: Tensor) -> Tensor:
+        """Where the padding starts, read back off the goals.
+
+        A padded leg repeats its predecessor EXACTLY, and two real waypoints are
+        never equal -- the pool is thinned to a minimum spacing -- so the first
+        exact repeat is unambiguous.
+        """
+        if not self.min_legs:
+            return super().last_leg(goals)
+        same = (goals[:, 1:] == goals[:, :-1]).all(dim=-1)      # [B, n_legs-1]
+        first = same.to(torch.int8).argmax(dim=1)
+        return torch.where(same.any(dim=1), first,
+                           torch.full_like(first, self.n_legs - 1)).long()
 
     def place_start(self, s: State, goals: Tensor) -> State:
         """Begin the tour on a street ADJACENT to its first waypoint.

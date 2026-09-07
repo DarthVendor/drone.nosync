@@ -256,8 +256,48 @@ class QuadrotorNav(QuadrotorSE3):
 
     # --- environment queries -------------------------------------------------
     def clearance(self, s: State) -> Tensor:
-        """Signed distance to the nearest obstacle, [...]."""
-        return self.env.sdf(s["p"], s)
+        """Signed distance to the nearest obstacle, [...].
+
+        Memoised on the position tensor's IDENTITY, because the rollout asks for
+        this twice per step with the same state and no way to tell the two
+        callers about each other: `shaping_cost` needs it for the proximity
+        penalty and `alive` needs it for the collision test.  Profiled on the
+        city those were 11.6% and 13.4% of the rollout, computing the same
+        answer.
+
+        Keyed by `is` rather than by `id()`, and the tensor is kept alive in the
+        cache: an id is only unique among LIVE objects, so a freed position
+        tensor could hand its address to the next one and the cache would answer
+        for the wrong state.  Holding the reference is what makes the identity
+        test sound.  `s["p"]` is rebuilt every step by `tree_where`, so the
+        entry invalidates itself.
+        """
+        held = getattr(self, "_clear_held", None)
+        if held is not None and held[0] is s["p"]:
+            return held[1]
+        out = self.env.sdf(s["p"], s)
+        self._clear_held = (s["p"], out)
+        return out
+
+    def time_to_collision(self, s: State) -> Tensor:
+        """Clearance divided by speed, [...] seconds.
+
+        The one statistic measured to predict crashing among policies a crash
+        COUNT cannot separate: over 23 candidates that never crashed in 64
+        episodes, rank correlation with the true crash rate was -0.485 for this,
+        against -0.297 for bare clearance and +0.045 for the time-integrated
+        proximity cost already in the objective.
+
+        The reason is the same one that put a Rayleigh damper next to the
+        barrier: a position-only quantity cannot see speed, and stopping takes
+        `v^2 / 2a` of room.  0.3 m of clearance is safe while receding and not
+        while closing at 3 m/s, and only a quantity with velocity in it can tell
+        those apart.  Speed rather than CLOSING speed, deliberately -- it needs
+        no surface normal, so it costs nothing beyond the clearance already
+        computed for the liveness test, and it errs conservatively.
+        """
+        v = s["v"].norm(dim=-1).clamp_min(0.05)
+        return self.clearance(s) / v
 
     def raycast(self, s: State, dirs: Tensor, max_range: float = 4.0):
         return self.env.raycast(s["p"], dirs, s, max_range)

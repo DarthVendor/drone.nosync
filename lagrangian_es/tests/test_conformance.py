@@ -10,6 +10,8 @@ import pytest
 import torch
 from torch.func import jacrev, vmap
 
+from lagrangian_es.environments import GROUPS, make_group
+from lagrangian_es.environments.base import ObstacleGroup
 from lagrangian_es.systems import SYSTEMS, make_system
 from lagrangian_es.trainables import TRAINABLES, make_trainable
 from lagrangian_es.util import make_gen, tree_where
@@ -198,3 +200,133 @@ def test_reset_is_reproducible(pair):
     b = system.reset(B, make_gen(7))
     for k in a:
         assert torch.equal(a[k], b[k])
+
+
+# --- every raycast agrees with the SDF that defines its surface ---------------
+
+def _free_origins(grp, B, seed, extent):
+    import torch
+
+    from lagrangian_es.util import make_gen
+
+    f = grp.sample(B, make_gen(seed), torch.float64, "cpu")
+    o = torch.rand(B, 3, generator=make_gen(seed + 31), dtype=torch.float64)
+    o = (o * 2 - 1) * extent
+    o[:, 2] = 1.0
+    keep = grp.sdf(o, f) > 0.15
+    return o[keep], {k: v[keep] for k, v in f.items()}
+
+
+def _fan(n, M, tilt):
+    import torch
+
+    th = torch.linspace(0.0, 6.283185307, M, dtype=torch.float64)
+    d = torch.zeros(n, M, 3, dtype=torch.float64)
+    d[..., 0], d[..., 1] = torch.cos(th), torch.sin(th)
+    d[..., 2] = tilt
+    return d / d.norm(dim=-1, keepdim=True)
+
+
+@pytest.mark.parametrize("kind", sorted(GROUPS))
+@pytest.mark.parametrize("tilt", [0.0, 0.35])
+def test_every_raycast_agrees_with_its_own_sdf(kind, tilt):
+    """A raycast is a second implementation of a surface the SDF already defines.
+
+    Three shipped primitives disagreed with their own definition and none of the
+    disagreements was visible from any other test:
+
+      * `march` never terminated, so rays walked THROUGH obstacles and out the
+        far side, and were then reported as misses -- worse with more steps.
+      * `Pillars` and `Gate` solved the xy intersection with the unit-direction
+        closed form, which is wrong by 1/|d_xy| for any ray that is not
+        horizontal.  The shipped beam fan is horizontal, so only the depth
+        camera saw it.
+      * `Walls` subtracted its thickness off the centreline distance, but its
+        SDF is a capsule with round caps.
+
+    So the check is now structural and runs over the registry: whatever a
+    raycast reports, the SDF must agree that the point is ON the surface
+    (soundness) and that nothing was crossed before it (completeness).  `tilt`
+    is parameterised because a horizontal fan is exactly the case that hid two
+    of these.
+    """
+    import torch
+
+    grp = make_group(kind)
+    extent = float(getattr(grp, "extent", 2.4))
+    o, f = _free_origins(grp, 48, 3, extent)
+    n = o.shape[0]
+    if n < 4:
+        pytest.skip(f"{kind}: too few free origins to test")
+    M = 64
+    d = _fan(n, M, tilt)
+    rng, grad = grp.raycast(o, d, f, 6.0)
+    assert torch.isfinite(rng).all() and torch.isfinite(grad).all()
+    hit = rng < 6.0 - 1e-9
+    if not bool(hit.any()):
+        pytest.skip(f"{kind}: no hits at tilt {tilt}")
+
+    exp = lambda k: {kk: vv.repeat_interleave(k, 0) for kk, vv in f.items()}
+    # SOUNDNESS -- the reported point is on the surface.  A marched primitive
+    # halts within `tol` of it by construction, so it gets that slack; a
+    # closed-form one has no excuse.
+    p = o[:, None, :] + d * rng[..., None]
+    sd = grp.sdf(p.reshape(-1, 3), exp(M)).reshape(rng.shape)
+    analytic = type(grp).raycast is not ObstacleGroup.raycast
+    tol = 1e-9 if analytic else 6e-3
+    assert float(sd[hit].abs().max()) < tol, (kind, tilt, float(sd[hit].abs().max()))
+
+    # COMPLETENESS -- nothing is crossed before it
+    S = 120
+    ts = torch.linspace(0.0, 0.999, S, dtype=torch.float64)
+    pre = o[:, None, None, :] + d[:, :, None, :] * (rng[..., None, None]
+                                                    * ts[None, None, :, None])
+    sp = grp.sdf(pre.reshape(-1, 3), exp(M * S))
+    assert float(sp.min()) > -1e-6, (kind, tilt, float(sp.min()))
+
+
+@pytest.mark.parametrize("kind", sorted(GROUPS))
+def test_every_sdf_is_a_true_distance_function(kind):
+    """|grad sdf| = 1 outside, or it is not a distance and everything built on
+    it is subtly wrong.
+
+    Sphere marching steps by the SDF and is only guaranteed not to overshoot a
+    surface when the value is a true distance; `RangeBarrier` and the proximity
+    penalty differentiate it, so a gradient of the wrong magnitude is a force of
+    the wrong magnitude.  Worth stating as a property because it is the
+    assumption every other piece of geometry code makes silently.
+
+    Measured at the same time as the raycast cross-check, and all five
+    primitives pass at 100% -- which is the useful half of that result: the
+    definitions were right and the hand-written intersections that disagreed
+    with them were the bugs.
+    """
+    import torch
+
+    from lagrangian_es.util import make_gen
+
+    grp = make_group(kind)
+    B, P, h = 16, 256, 1e-5
+    f = grp.sample(B, make_gen(2), torch.float64, "cpu")
+    ext = float(getattr(grp, "extent", 2.4))
+    p = (torch.rand(B, P, 3, generator=make_gen(8), dtype=torch.float64) * 2 - 1)
+    p = p * ext * 1.3
+    p[..., 2] = p[..., 2].abs() * 1.5 + 0.05
+    flat = {k: v[:, None].expand((B, P) + v.shape[1:]).reshape((-1,) + v.shape[1:])
+            for k, v in f.items()}
+
+    def sdf(q):
+        return grp.sdf(q.reshape(-1, 3), flat).reshape(B, P)
+
+    base = sdf(p)
+    g = []
+    for i in range(3):
+        d = torch.zeros(3, dtype=torch.float64)
+        d[i] = h
+        g.append((sdf(p + d) - sdf(p - d)) / (2 * h))
+    norm = torch.stack(g, -1).norm(dim=-1)
+    outside = base > 0.05           # away from the surface and from any cusp
+    assert bool(outside.any()), kind
+    q = norm[outside]
+    frac = float(((q - 1.0).abs() < 0.01).to(torch.float64).mean())
+    assert frac > 0.98, (kind, frac, float(q.median()))

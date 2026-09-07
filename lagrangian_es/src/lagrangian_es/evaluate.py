@@ -32,10 +32,21 @@ def evaluate(system, trainable, task, theta: Tensor, cfg, n_tasks: int = 128,
     # genomes -- but applied here it would count every episode still flying as a
     # failure, so a reported reach would be the quantile itself and every number
     # in this file would understate whatever it describes.
-    cfg = replace(cfg, stop_quantile=1.0) if getattr(cfg, "stop_quantile", 1.0) < 1.0 \
-        else cfg
+    # MEASUREMENT never inherits a training shortcut.
+    #
+    # `stop_quantile` would count every episode still flying as a failure.
+    # `stop_on_arrival` is worse: it ends the episode the instant the vehicle
+    # touches the goal, so a policy that arrives and then drifts away scores the
+    # same as one that arrives and holds station -- and evolution will take the
+    # cheaper of the two.  Measured: a genome trained under the freeze scored
+    # 0.9990 with it and 0.4141 without, while nav99, trained without, scored
+    # 0.9868 either way.  The freeze is a legitimate way to spend less compute
+    # ranking genomes; it is not a legitimate way to report a reach.
+    if getattr(cfg, "stop_quantile", 1.0) < 1.0 or getattr(cfg, "stop_on_arrival", False):
+        cfg = replace(cfg, stop_quantile=1.0, stop_on_arrival=False)
     roll = roll or Rollout(system, trainable, task, cfg)
-    if getattr(roll.cfg, "stop_quantile", 1.0) < 1.0:
+    if (getattr(roll.cfg, "stop_quantile", 1.0) < 1.0
+            or getattr(roll.cfg, "stop_on_arrival", False)):
         roll = Rollout(roll.system, roll.trainable, roll.task, cfg, roll.sensors)
     goals = task.sample(n_tasks, make_gen(seed))
     res = roll.run(theta[None], goals, seed=seed + 1)

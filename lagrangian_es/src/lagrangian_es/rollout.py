@@ -331,6 +331,9 @@ class Rollout:
         dead = torch.full((B,), cfg.dead_cost, dtype=sysm.dtype, device=sysm.device)
         arrival = getattr(task, "gating", "time") == "arrival"
         leg = torch.zeros(B, dtype=torch.long, device=sysm.device)
+        # each episode's final leg -- a constant for most tasks, per-episode for
+        # a tour whose length varies
+        last_idx = task.last_leg(goals_b)
         finish = torch.full((B,), float(T), dtype=sysm.dtype, device=sysm.device)
         # The final leg never advances `leg`, so its arrival test keeps firing for
         # every step the vehicle sits inside tol -- paying the bonus per step
@@ -341,6 +344,9 @@ class Rollout:
         # remaining steps cannot change any accumulator, so the loop can leave.
         arrived = torch.zeros(B, dtype=torch.bool, device=sysm.device)
         stop_early = bool(cfg.stop_on_arrival) and arrival
+        # consecutive steps spent inside `tol` of the FINAL waypoint
+        held = torch.zeros(B, dtype=torch.long, device=sysm.device)
+        dwell = max(1, int(round(float(cfg.dwell_s) / dt)))
         credits = torch.zeros(B, dtype=sysm.dtype, device=sysm.device)
         frozen_dead = cfg.dead_mode == "frozen"
         forfeit_dead = cfg.dead_mode == "forfeit"
@@ -383,6 +389,12 @@ class Rollout:
             eff = sysm.effort(u, s)
             shp = sysm.shaping_cost(s)
             live = pos + cfg.lambda_e * eff + cfg.lambda_s * shp
+            if cfg.lambda_ttc:
+                # charged on the SHORTFALL, so a comfortable margin costs
+                # nothing and the term only speaks near an obstacle
+                ttc = sysm.time_to_collision(s)
+                short = (cfg.ttc_safe - ttc).clamp_min(0.0)
+                live = live + cfg.lambda_ttc * short * short
             if cfg.lambda_los:
                 live = live + cfg.lambda_los * sysm.sight_cost(s, goal)
             if cfg.lambda_occ:
@@ -411,18 +423,28 @@ class Rollout:
                 # longer tail of low cost at the next one -- the incentive that
                 # makes the fastest route the cheapest
                 reached = (err.norm(dim=-1) < task.tol) & alive
-                last = leg >= task.n_legs - 1
-                finish = torch.where(reached & last & (finish >= T),
+                last = leg >= last_idx
+                # DWELL: the final waypoint has to be HELD, not merely touched.
+                # Intermediate waypoints stay pass-through -- a tour flies
+                # through them, and asking for a hover at each would be a
+                # different task.
+                held = torch.where(reached & last, held + 1,
+                                   torch.zeros_like(held))
+                done = held >= dwell
+                finish = torch.where(done & (finish >= T),
                                      torch.full_like(finish, float(t)), finish)
                 if cfg.goal_bonus:
                     # An intermediate leg can only be credited once because
                     # reaching it advances `leg`; the last one needs `paid_last`.
-                    hit = (reached & ~last) | (reached & last & ~paid_last)
+                    # The last one is also credited on DWELL, not on contact, or
+                    # the bonus pays for exactly the touch-and-go it is meant to
+                    # rule out.
+                    hit = (reached & ~last) | (done & ~paid_last)
                     credits.add_(hit.to(sysm.dtype))
-                    paid_last = paid_last | (reached & last)
+                    paid_last = paid_last | done
                 leg = torch.where(reached & ~last, leg + 1, leg)
                 if stop_early:
-                    arrived = arrived | (reached & last)
+                    arrived = arrived | done
             elif t in leg_ends:
                 leg_err[:, leg_ends.index(t)] = err.norm(dim=-1)
             alive = alive & sysm.alive(s)

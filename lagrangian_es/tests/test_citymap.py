@@ -205,3 +205,41 @@ def test_culling_ranks_by_surface_distance_not_centre_distance():
     # the wall's face is at y = 15, the speck's at y = 7.8: the speck is nearer
     kept = out[grp._k("h")][0, 0]
     assert float(kept[0]) < 1.0, "kept the 15 m block over the 0.2 m one"
+
+
+def test_the_shipped_city_genome_still_flies_the_city():
+    """The Singapore controller, pinned the way `nav99` is.
+
+    Measured with `stop_on_arrival` OFF -- the freeze is a training shortcut and
+    a policy trained under it can learn to touch the goal and drift away, which
+    is exactly what happened once today.  `evaluate` refuses the freeze now, so
+    this measures station-keeping whether the caller asked for it or not.
+    """
+    import json
+
+    from lagrangian_es.config import Config, RolloutCfg
+    from lagrangian_es.es import build, build_sensors
+    from lagrangian_es.evaluate import evaluate
+    from lagrangian_es.rollout import Rollout
+
+    path = MAPS.parent.parent.parent.parent / "assets" / "singapore_genome.json"
+    if not path.exists():
+        pytest.skip("city genome not present")
+    saved = json.loads(path.read_text())
+    cfg = Config(system="quadrotor_nav", trainable="nav_agent", task="city_tour",
+                 environment="singapore_cbd", sensors=("range",),
+                 gating="arrival",
+                 system_kw=(("prox_gain", 30.0), ("free_start", True)),
+                 task_kw=(("n_legs", 2), ("max_leg", 10.0)),
+                 rollout=RolloutCfg(n_eps=16, ep_steps=900, lambda_s=0.2,
+                                    lambda_e=0.005, dead_mode="constant",
+                                    dead_cost=6.0, goal_bonus=15.0))
+    system, tr, task = build(cfg)
+    assert saved["dim"] == tr.dim, (saved["dim"], tr.dim)
+    sens = build_sensors(cfg, system)
+    roll = Rollout(system, tr, task, cfg.rollout, sens)
+    th = torch.tensor(saved["theta"], dtype=DT)
+    ev = evaluate(system, tr, task, th, cfg.rollout, n_tasks=512, seed=808_303,
+                  roll=roll)
+    assert ev["success_rate"] > 0.95, f"city reach regressed to {ev['success_rate']:.4f}"
+    assert ev["crash_rate"] < 0.02, f"city crash regressed to {ev['crash_rate']:.4f}"

@@ -82,8 +82,13 @@ class Pillars(ObstacleGroup):
         if cull_k and c.shape[-2] > cull_k:
             # Only pillars the beams could actually reach.  All beams share an
             # origin, so this runs once per vehicle instead of once per ray.
+            # Ranked by distance to the SURFACE, not to the centre, which is
+            # what lets the `r_hi` pad go: padding the reach by the largest
+            # radius is only a proxy for the fact that a fat pillar reaches
+            # further than its centre suggests, and ranking by `|a| - r` says it
+            # exactly.  Matches `local_field`; see `near_indices`.
             idx, _ = self.near_indices(origin, f, cull_k, self._k("c"),
-                                       max_range + getattr(self, "r_hi", 0.0))
+                                       max_range, radius=r)
             c = c.gather(-2, idx[..., None].expand(idx.shape + (2,)))
             r = r.gather(-1, idx)
         o2, d2 = origin[..., :2], dirs[..., :2]          # cylinders ignore height
@@ -91,9 +96,17 @@ class Pillars(ObstacleGroup):
         dd = d2[..., :, None, :]
         fa = (a * dd).sum(-1)
         g = (a * a).sum(-1) - r[..., None, :] ** 2
-        disc = fa * fa - g
+        # `dd` is the ray's xy PROJECTION and is not a unit vector unless the ray
+        # is horizontal, so the quadratic is q t^2 + 2 fa t + g with q = |dd|^2.
+        # The unit-direction closed form (q = 1) is what was here, and it scales
+        # every tilted ray's range wrong -- exact for a beam fan, which ships with
+        # `elevations = (0.0,)`, and wrong for a depth camera, which has a
+        # vertical field of view.  Measured: |sdf| at the reported hit was 1.9e-14
+        # for horizontal rays and 0.19 m for tilted ones.
+        q = (dd * dd).sum(-1).clamp_min(EPS)
+        disc = fa * fa - q * g
         root = torch.sqrt(disc.clamp_min(EPS))
-        t = -fa - root
+        t = (-fa - root) / q
         hit = (disc > 0) & (t > 0)
         t = torch.where(hit, t, torch.full_like(t, max_range))
         rng, idx = t.min(dim=-1)
@@ -106,7 +119,9 @@ class Pillars(ObstacleGroup):
         a_e = a.expand(fa.shape + (2,))
         a_s = a_e.gather(-2, sel[..., None].expand(sel.shape + (2,))).squeeze(-2)
         hit_s = hit.gather(-1, sel).squeeze(-1)
-        grad = -d2 - (f_s[..., None] * d2 - a_s) / root_s[..., None].clamp_min(EPS)
+        q_s = (d2 * d2).sum(-1, keepdim=True).clamp_min(EPS)
+        grad = (-d2 - (f_s[..., None] * d2 - q_s * a_s)
+                / root_s[..., None].clamp_min(EPS)) / q_s
         grad = torch.where(hit_s[..., None], grad, torch.zeros_like(grad))
         return rng.clamp(0.0, max_range), _pad3(grad)
 
@@ -204,20 +219,56 @@ class Boxes(ObstacleGroup):
         return {self._k("c"): c, self._k("h"): torch.stack([hx, hy, hz], -1),
                 self._k("a"): ang}
 
+    def _rot(self, a):
+        """cos/sin of the box yaws, memoised on the tensor's IDENTITY.
+
+        The yaws are geometry: constant for a whole rollout, and identically
+        zero for an imported city, whose blocks are axis-aligned rectangles.
+        They were being recomputed on every SDF and every raycast -- profiled at
+        2144 sin/cos calls over a [B, N] tensor per city rollout, 4.4% of it, to
+        produce the same answer every time.
+
+        Keyed by `is` with the tensor held, for the same reason
+        `QuadrotorNav.clearance` is: an id is unique only among live objects, so
+        a freed tensor could hand its address to the next one.  The entry
+        invalidates itself when a new field is sampled.
+        """
+        held = getattr(self, "_rot_held", None)
+        if held is not None and held[0] is a:
+            return held[1]
+        # An imported city is made of AXIS-ALIGNED rectangles -- the greedy
+        # decomposition emits no rotation at all -- so the whole rotation into
+        # each box's frame reduces to two copies.  Detected once here rather
+        # than tested per call.
+        out = (torch.cos(a), torch.sin(a), bool((a == 0).all()))
+        self._rot_held = (a, out)
+        return out
+
     def sdf(self, p, f, extra: int = 0):
         c, h, a = f[self._k("c")], f[self._k("h")], f[self._k("a")]
         for _ in range(extra):
             c, h, a = c.unsqueeze(-3), h.unsqueeze(-3), a.unsqueeze(-2)
         d = p[..., None, :2] - c                       # into each box's frame
-        ca, sa = torch.cos(a), torch.sin(a)
-        lx = d[..., 0] * ca + d[..., 1] * sa
-        ly = -d[..., 0] * sa + d[..., 1] * ca
+        ca, sa, aligned = self._rot(a)
+        if aligned:
+            lx, ly = d[..., 0], d[..., 1]
+        else:
+            lx = d[..., 0] * ca + d[..., 1] * sa
+            ly = -d[..., 0] * sa + d[..., 1] * ca
         # boxes stand on the floor, so the vertical extent runs 0..h_z
         lz = p[..., None, 2] - 0.5 * h[..., 2]
-        q = torch.stack([lx.abs() - h[..., 0], ly.abs() - h[..., 1],
-                         lz.abs() - 0.5 * h[..., 2]], dim=-1)
-        outside = q.clamp_min(0.0).norm(dim=-1)
-        inside = q.max(dim=-1).values.clamp_max(0.0)
+        # Componentwise, without materialising the [..., N, 3] stack.  The
+        # stack existed only to let `norm` and `max` reduce over a last axis
+        # that has exactly three entries, and building it was the largest single
+        # cost of a city rollout after the ray march went closed-form: this is
+        # called once per step for the liveness and proximity tests, on every
+        # episode against every box.
+        qx = lx.abs() - h[..., 0]
+        qy = ly.abs() - h[..., 1]
+        qz = lz.abs() - 0.5 * h[..., 2]
+        ox, oy, oz = qx.clamp_min(0.0), qy.clamp_min(0.0), qz.clamp_min(0.0)
+        outside = torch.sqrt(ox * ox + oy * oy + oz * oz)
+        inside = torch.maximum(torch.maximum(qx, qy), qz).clamp_max(0.0)
         return (outside + inside).min(dim=-1).values
 
     def raycast(self, origin, dirs, f, max_range):
@@ -239,11 +290,24 @@ class Boxes(ObstacleGroup):
         reciprocal is floored rather than guarded, so a ray exactly parallel to a
         face produces an unbounded slab instead of a NaN.
         """
+        # Cull first, exactly as the marcher does.  `march` restricts the
+        # geometry before its loop; the closed-form path skipped that and tested
+        # every box in the scene, which on the imported city is 60 instead of the
+        # 24 that can be within a 6 m sensor reach.  Sound under the same
+        # condition as everywhere else: `cull_k` must cover the primitives whose
+        # SURFACE lies within `max_range`, which `chunk_occupancy` counts and
+        # tests/test_citymap.py asserts.
+        f = self.local_field(origin, f, max_range)
         c, h, a = f[self._k("c")], f[self._k("h")], f[self._k("a")]
         # [..., 1, N, k] against dirs [..., m, 1, k]
         c, h, a = c[..., None, :, :], h[..., None, :, :], a[..., None, :]
         o = origin[..., None, None, :]
         u = dirs[..., :, None, :]
+        # NOT memoised here, deliberately: `local_field` gathers a fresh `a`
+        # for every raycast, so caching it would evict the entry the per-step
+        # SDF depends on -- one step in eight thrashing the other seven.  And it
+        # buys nothing anyway: measured 1.00x, because the slab arithmetic over
+        # every box and every ray dwarfs one sin/cos over the boxes alone.
         ca, sa = torch.cos(a), torch.sin(a)
         # into each box's frame: yaw only, and the box stands ON the floor so its
         # centre sits at h_z / 2
@@ -411,42 +475,19 @@ class Walls(ObstacleGroup):
         q = self._closest(p, f, extra)
         return ((p[..., None, :2] - q).norm(dim=-1) - self.thickness).min(dim=-1).values
 
-    def raycast(self, origin, dirs, f, max_range):
-        """Ray/segment intersection in the plane, then a thickness offset.
-
-        The gradient is the exact derivative of the line-line solution; parallel
-        or behind-the-ray cases fall through to `max_range` with zero gradient.
-        """
-        a, b = f[self._k("a")], f[self._k("b")]
-        A = a[..., None, :, :]
-        AB = (b - a)[..., None, :, :]
-        D = dirs[..., :2][..., :, None, :]               # walls ignore height
-        O = origin[..., :2][..., None, None, :]
-        # O + t D = A + u AB   ->   cross products give t and u
-        den = D[..., 0] * AB[..., 1] - D[..., 1] * AB[..., 0]   # [..., m, n]
-        # A - O carries a singleton beam axis; expand to the full [beam, seg] grid
-        # so the per-beam gather below has something to index
-        oa = (A - O).expand(den.shape + (2,))
-        safe_den = torch.where(den.abs() < EPS, torch.full_like(den, EPS), den)
-        t = (oa[..., 0] * AB[..., 1] - oa[..., 1] * AB[..., 0]) / safe_den
-        u = (oa[..., 0] * D[..., 1] - oa[..., 1] * D[..., 0]) / safe_den
-        hit = (den.abs() > EPS) & (t > 0) & (u >= 0.0) & (u <= 1.0)
-        t = torch.where(hit, (t - self.thickness).clamp_min(0.0),
-                        torch.full_like(t, max_range))
-        rng, idx = t.min(dim=-1)
-        # d t / d origin = -(n) / (D . n) with n the segment normal
-        nx, ny = AB[..., 1], -AB[..., 0]
-        nn = torch.sqrt((nx * nx + ny * ny).clamp_min(EPS))
-        nrm = torch.stack([nx / nn, ny / nn], dim=-1).expand(den.shape + (2,))
-        dn = (D * nrm).sum(-1)
-        gradf = -nrm / torch.where(dn.abs() < EPS,
-                                   torch.full_like(dn, EPS), dn)[..., None]
-        sel = idx[..., None]
-        grad = gradf.gather(-2, sel[..., None].expand(sel.shape + (2,))).squeeze(-2)
-        hit_s = hit.gather(-1, sel).squeeze(-1)
-        grad = torch.where(hit_s[..., None], grad, torch.zeros_like(grad))
-        return rng.clamp(0.0, max_range), _pad3(grad)
-
+    # NO analytic raycast.  There was one -- a ray/segment intersection with the
+    # thickness subtracted off the centreline distance -- and it was wrong: the
+    # surface sits `thickness` away PERPENDICULAR, so the back-off along the ray
+    # is thickness / |D . n|, and even that is only right away from the ends.
+    # A wall's SDF is `distance to segment - thickness`, which is a capsule with
+    # ROUND caps, and no centreline-plus-offset formula describes those.
+    #
+    # Measured against the SDF: the original reported points 0.111 m inside the
+    # wall (thickness 0.12), and the corrected back-off overshot to 0.760 m
+    # outside on grazing rays, where |D . n| -> 0.  So this now inherits the
+    # sphere marcher, which is exact to its step budget BY CONSTRUCTION because
+    # it consults the same SDF that defines the surface -- and `n` is 2 here, so
+    # the march costs almost nothing.
     def _keys(self):
         return (self._k("a"), self._k("b"))
 

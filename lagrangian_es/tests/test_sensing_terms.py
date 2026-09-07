@@ -573,3 +573,65 @@ def test_range_vortex_reach_is_bounded():
 def test_range_vortex_certificate_declares_gyroscopic():
     c = _vortex().certificate(None)
     assert c["gyroscopic"] and c["workless"] and c["zero_at_goal"]
+
+
+def test_the_range_barrier_fights_the_task_on_a_hoop_course():
+    """A hoop is an obstacle you have to fly THROUGH, and the barrier cannot
+    tell that from one you have to fly around.
+
+    This replaces an earlier diagnosis -- "84% of hoop impacts were more than
+    45 degrees off-axis, so the vehicle cannot see the ring" -- which was
+    computed from marched range readings while `march` was walking rays through
+    obstacles, and was retracted rather than defended.
+
+    Measured properly, the failure scales WITH sensing, not against it: 24 rays
+    gave reach 0.4896, 48 gave 0.4089, 72 gave 0.3776.  Adding rays finds more
+    of the rim, and every return is something the barrier pushes away from.
+    Scaling the barrier down recovers most of it (0.6615 at half weight), while
+    on the pillar field the same knob does the opposite -- switching it off
+    there takes crashes from 0.0078 to 0.0215.
+
+    Kept as a test because it is a STRUCTURAL limit of a range-only obstacle
+    term, not a tuning accident: an aperture and a wall look identical to a
+    beam, so a controller that must pass through apertures needs something the
+    range fan does not provide.
+    """
+    import json
+    import pathlib
+
+    import torch
+
+    from lagrangian_es.config import Config, RolloutCfg
+    from lagrangian_es.es import build
+    from lagrangian_es.evaluate import evaluate
+    from lagrangian_es.rollout import Rollout
+    from lagrangian_es.sensors import make_sensor
+
+    genome = pathlib.Path(__file__).parent.parent / "assets" / "nav99_genome.json"
+    if not genome.exists():
+        pytest.skip("prototype genome not present")
+    th = torch.tensor(json.loads(genome.read_text())["theta"], dtype=torch.float64)
+
+    def hoop_reach(scale, n=256):
+        cfg = Config(system="quadrotor_nav", trainable="nav_agent",
+                     task="hoop_course", environment="hoop_course",
+                     sensors=("range",), gating="arrival",
+                     system_kw=(("prox_gain", 30.0),), task_kw=(("n_gates", 3),),
+                     rollout=RolloutCfg(n_eps=16, ep_steps=1800, lambda_s=0.2,
+                                        lambda_e=0.005, dead_mode="constant",
+                                        dead_cost=6.0, goal_bonus=15.0))
+        system, tr, task = build(cfg)
+        off = 0
+        for t in tr.terms:
+            if t.kind == "range_barrier":
+                break
+            off += t.dim
+        roll = Rollout(system, tr, task, cfg.rollout,
+                       (make_sensor("range", system),))
+        t2 = th.clone()
+        t2[off] = th[off] * scale
+        return evaluate(system, tr, task, t2, cfg.rollout, n_tasks=n,
+                        seed=777_001, roll=roll)["success_rate"]
+
+    full, half = hoop_reach(1.0), hoop_reach(0.5)
+    assert half > full + 0.05, (full, half)

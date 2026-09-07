@@ -44,6 +44,15 @@ def tree_where(mask: Tensor, a: State, b: State) -> State:
     views: dict = {}                     # one reshaped mask per leaf rank
     for k, va in a.items():
         vb = b[k]
+        if va is vb:
+            # Same object on both branches, so the select cannot change it.
+            # This is the scene geometry: `step` carries it forward by reference
+            # because it is constant, and selecting between a tensor and itself
+            # then allocates a full copy of it every step.  On the imported city
+            # that is 60 boxes x 6 numbers x every episode, 900 times per
+            # rollout, to reproduce what was already there.
+            out[k] = va
+            continue
         if va.shape != vb.shape:
             raise ValueError(f"tree_where shape mismatch on '{k}': {va.shape} vs {vb.shape}")
         m = views.get(va.ndim)
