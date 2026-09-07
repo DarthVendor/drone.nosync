@@ -63,23 +63,43 @@ class LearnedShaping(LagrangianTerm):
 
     kind = "learned_shaping"
     uses_obs = True
+    BEAM_H = 6          # hidden width of the per-beam damping net, `beams` mode
+    HINGE = 0.1         # smoothing width of the closing-speed hinge, m/s
 
     def __init__(self, d: int, sensor_name: str = "range", n_obs: int = 12,
                  hidden: int = 16, out: int = 6, obs_scale: float = 4.0,
                  e_scale: float = 2.0, v_gate: bool = True,
-                 init_gain: float = 0.4, damp0: float = 1.2):
+                 init_gain: float = 0.4, damp0: float = 1.2,
+                 gyro: bool = False, obs_transform: str = "linear",
+                 prox_scale: float = 1.0, damp_mode: str = "full"):
         super().__init__(d)
         self.sensor_name = sensor_name
         self.n_obs, self.h, self.out = int(n_obs), int(hidden), int(out)
         self.obs_scale, self.e_scale = float(obs_scale), float(e_scale)
         self.init_gain, self.damp0 = float(init_gain), float(damp0)
+        self.gyro = bool(gyro)
+        if damp_mode not in ("full", "iso", "beams"):
+            raise ValueError(f"unknown damp_mode {damp_mode!r}")
+        self.damp_mode = damp_mode
+        if obs_transform not in ("linear", "proximity"):
+            raise ValueError(f"unknown obs_transform {obs_transform!r}")
+        self.obs_transform = obs_transform
+        self.prox_scale = float(prox_scale)
         self.n_in = self.d + self.n_obs
+        slots = [("W1", self.n_in * self.h), ("b1", self.h),
+                 ("W2", self.h * self.out), ("b2", self.out),
+                 ("A", self.d * self.out),
+                 ("Wd", {"iso": self.n_obs, "beams": 3 * self.BEAM_H + 1}
+                        .get(damp_mode, self.n_obs * self.d * self.d)),
+                 ("bd", 1 if damp_mode in ("iso", "beams") else self.d * self.d)]
+        if self.gyro:
+            # LAST, so a genome trained without the head extends to one with it
+            # by appending zeros -- which is the same controller exactly, since
+            # a zero G gives a zero S.
+            slots += [("Wg", self.n_obs * (self.d * self.d)),
+                      ("bg", self.d * self.d)]
         n, self._sl = 0, {}
-        for key, size in (("W1", self.n_in * self.h), ("b1", self.h),
-                          ("W2", self.h * self.out), ("b2", self.out),
-                          ("A", self.d * self.out),
-                          ("Wd", self.n_obs * (self.d * self.d)),
-                          ("bd", self.d * self.d)):
+        for key, size in slots:
             self._sl[key] = (n, n + size)
             n += size
         self._dim = n
@@ -153,15 +173,58 @@ class LearnedShaping(LagrangianTerm):
         return y, J
 
     def _L(self, theta, z):
+        """The dissipation factor, R = L L^T.
+
+        `full` lets the beams shape a whole matrix, which is more expressive and
+        turns out to be exploitable: R can only ever REMOVE energy, so an
+        anisotropic R offers a cheap direction to travel in, and the search takes
+        it.  Measured on the trained city controller, the velocity collects 19.9%
+        of the damping available on the stiff axis where a randomly oriented
+        heading would collect 46.5% -- below the null in 93% of samples, and the
+        same before city training, so it is the parameterisation and not the map.
+        The controller had learned enough braking to survive 94% of its crashes
+        and was receiving 30% of it.
+
+        `iso` makes R a scalar times the identity, so damping is the same in
+        every direction and cannot be dodged.  It costs FEWER parameters, not
+        more, which matters: added dimension has hurt more than added
+        expressiveness here.
+        """
+        if self.damp_mode == "iso":
+            Wd = self._p(theta, "Wd", (self.n_obs, 1))
+            bd = self._p(theta, "bd", (1,))
+            # softplus keeps it positive and smooth; sqrt because R = L L^T
+            g = torch.nn.functional.softplus(
+                (z.unsqueeze(-2) @ Wd).squeeze(-2) + bd)
+            eye = torch.eye(self.d, dtype=theta.dtype, device=theta.device)
+            return g.sqrt().unsqueeze(-1) * eye
         Wd = self._p(theta, "Wd", (self.n_obs, self.d * self.d))
         bd = self._p(theta, "bd", (self.d * self.d,))
         flat = (z.unsqueeze(-2) @ Wd).squeeze(-2) + bd
         return flat.reshape(flat.shape[:-1] + (self.d, self.d))
 
     def _read(self, obs):
+        """Beam ranges, in the coordinate the network reasons in.
+
+        `linear` divides by `obs_scale`, which spends the input range where the
+        measurements are, not where they matter: over 0.2-6 m at obs_scale 4,
+        the far half (2.5-6 m) occupies 0.875 of the input and the near half
+        (0.2-1.2 m) only 0.05 -- seventeen times more resolution devoted to
+        distances that cannot hurt the vehicle.
+
+        `proximity` uses s / (d + s), which is 1 at contact and falls towards 0
+        at range, inverting that ratio: the near half now gets 0.378 of the
+        input against the far half's 0.143.  It is the coordinate a barrier is
+        simple in, without prescribing a barrier -- the network still learns
+        what to do with it, and the channel count is unchanged, which matters
+        because dimension has measurably cost more than expressiveness here.
+        """
         if obs is None or self.sensor_name not in obs:
             return None
-        return (obs[self.sensor_name] / self.obs_scale).clamp(-4.0, 4.0)
+        d = obs[self.sensor_name]
+        if self.obs_transform == "proximity":
+            return self.prox_scale / (d.clamp_min(0.0) + self.prox_scale)
+        return (d / self.obs_scale).clamp(-4.0, 4.0)
 
     # --- contributions ------------------------------------------------------
     def potential(self, theta, e, v, x, obs=None):
@@ -184,13 +247,87 @@ class LearnedShaping(LagrangianTerm):
         g = y - y0
         # grad_e ||g||^2 = 2 J g ; vanishes at e = 0 because g does
         gradV = 2.0 * (J @ g.unsqueeze(-1)).squeeze(-1)
-        L = self._L(theta, z)
-        Lv = (v.unsqueeze(-2) @ L).squeeze(-2)
-        dRdv = (L @ Lv.unsqueeze(-1)).squeeze(-1)          # (L L^T) v
-        return gradV + dRdv
+        if self.damp_mode == "beams":
+            dRdv = self._dRdv_beams(theta, z, v, obs)
+        else:
+            L = self._L(theta, z)
+            Lv = (v.unsqueeze(-2) @ L).squeeze(-2)
+            dRdv = (L @ Lv.unsqueeze(-1)).squeeze(-1)      # (L L^T) v
+        out = gradV + dRdv
+        if self.gyro:
+            # The workless head.  A gradient plus a Rayleigh dissipation flows
+            # downhill into the nearest critical point, and on this map 94% of
+            # the stalls ARE critical points -- saddles, with the vehicle pinned
+            # 0.35 m off a building and the goal 16.5 m past it.  Going AROUND
+            # needs a force across the motion, which no gradient can supply.
+            #
+            # S = G - G^T is skew for any G, so v . S v = 0 identically: the
+            # head can steer but can never add energy, and H = T + V_d stays
+            # non-increasing exactly as before.  That is the whole reason to
+            # shape it this way rather than let the net emit a free force.
+            out = out + (self._S(theta, z) @ v.unsqueeze(-1)).squeeze(-1)
+        return out
+
+    def _dRdv_beams(self, theta, z, v, obs):
+        """One damping axis per beam, weighted by what that beam sees.
+
+            R = 1/2 s0 |v|^2  +  1/2 sum_i w_i(z_i) h(-J_i . v)^2
+
+        `J_i = d(range_i)/dx` is the world-frame direction away from whatever
+        beam i sees, so `-J_i . v` is the closing speed on it and `h` -- a smooth
+        hinge -- keeps the term one-sided: it resists approach and puts no drag
+        on retreat.  The Jacobian is already computed by the rollout for any
+        term with `uses_obs`, so reading it here costs nothing extra.
+
+        Why this shape.  The full head R = L L^T points its stiff axis at the
+        NEAREST wall (|cos| 0.80 to grad sdf, null 0.64), which is right, but in
+        a tight pocket the nearest wall and the threatening one differ, and a
+        single axis leaves the impact direction at the null share of the
+        damping (21.3% of lambda_max).  The isotropic head fixes that by
+        damping everything, and kills the tangential sliding that avoidance
+        depends on (crash 0.038 -> 0.152).  Summing an axis per beam damps each
+        close wall along its own normal and nothing else -- the structure of the
+        hand-designed `RangeDamper`, with the per-beam weight LEARNED from the
+        beam's own range through a net shared across beams, since no beam is
+        special.  `s0` is a learned floor, because this stack has no other
+        damper and free flight needs one.
+
+        Dissipative for any weights: dR/dv . v = s0|v|^2 + sum w_i h h' c_i,
+        and h, h' and c_i share a sign wherever h is non-zero.
+        """
+        H = self.BEAM_H
+        wd = self._p(theta, "Wd", (3 * H + 1,))
+        W1, b1, W2 = wd[..., :H], wd[..., H:2 * H], wd[..., 2 * H:3 * H]
+        b2 = wd[..., 3 * H:3 * H + 1]
+        s0 = torch.nn.functional.softplus(self._p(theta, "bd", (1,)))
+        base = s0 * v
+        J = obs.get(self.sensor_name + "/J") if obs is not None else None
+        if J is None:
+            return base                     # no geometry in view: floor only
+        t1 = torch.tanh(z.unsqueeze(-1) * W1 + b1)          # [..., n_obs, H]
+        w = torch.nn.functional.softplus((t1 * W2).sum(-1) + b2)   # [..., n_obs]
+        c = -(J * v.unsqueeze(-2)).sum(-1)                  # closing speed
+        eps = self.HINGE
+        root = torch.sqrt(c * c + eps * eps)
+        h = 0.5 * (c + root)
+        hp = 0.5 * (1.0 + c / root)
+        # dR/dv = sum_i w_i h h' dc_i/dv = -sum_i w_i h h' J_i
+        return base - ((w * h * hp).unsqueeze(-1) * J).sum(-2)
+
+    def _S(self, theta, z):
+        """Skew-symmetric gyroscopic matrix from the beams."""
+        Wg = self._p(theta, "Wg", (self.n_obs, self.d * self.d))
+        bg = self._p(theta, "bg", (self.d * self.d,))
+        flat = (z.unsqueeze(-2) @ Wg).squeeze(-2) + bg
+        G = flat.reshape(flat.shape[:-1] + (self.d, self.d))
+        return G - G.transpose(-1, -2)
 
     def damping(self, theta: Tensor) -> Tensor:
         """Reported at zero observation, for `describe`."""
+        if self.damp_mode == "beams":
+            s0 = torch.nn.functional.softplus(self._p(theta, "bd", (1,)))
+            eye = torch.eye(self.d, dtype=theta.dtype, device=theta.device)
+            return s0.unsqueeze(-1) * eye
         z = torch.zeros(theta.shape[:-1] + (self.n_obs,), dtype=theta.dtype,
                         device=theta.device)
         L = self._L(theta, z)

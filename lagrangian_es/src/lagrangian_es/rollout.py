@@ -475,7 +475,19 @@ class Rollout:
                 # batch dies, the threshold is unreachable and the batch runs to
                 # full length, so the shortcut applies only once the policy is
                 # already good.
-                enough = bool(arrived.to(sysm.dtype).mean() >= q)
+                #
+                # That self-gating needs the second clause, or it stalls the
+                # batch on nothing.  With q = 0.9 and a 12.5% crash rate the
+                # arrived fraction tops out at 0.875 and the quantile is never
+                # met, so the loop kept stepping physics for hundreds of steps
+                # after every episode had already arrived or died.  Measured on
+                # `pillars`: 84 s/generation, against 30 s for the same
+                # population once the batch is allowed to notice it is finished.
+                # The clause is exact rather than an approximation -- with
+                # nothing still flying, the hover charge below applies to no
+                # episode -- so it changes cost by zero and only saves work.
+                enough = bool(arrived.to(sysm.dtype).mean() >= q) or \
+                    bool((arrived | ~alive).all())
             if stop_early and enough:
                 # every episode has finished or died; the tail is all zeros for
                 # the finished ones, and a constant rate for the dead ones, so

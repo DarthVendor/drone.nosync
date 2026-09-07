@@ -150,7 +150,9 @@ class NavAgent(EmbodiedAgent):
                     damper: bool = True, vortex: bool = True,
                     harmonic: bool = False,
                     harmonic_goal: bool = False,
-                    learned: bool = True, **kw):
+                    learned: bool = True, hidden: int = 16,
+                    gyro: bool = False, obs_transform: str = "linear",
+                    damp_mode: str = "full", **kw):
         """Core, plus a barrier on POSITION and a damper on CLOSING SPEED.
 
         Both are needed, and for a reason that is structural rather than a matter
@@ -202,7 +204,18 @@ class NavAgent(EmbodiedAgent):
             # The cost is the starting point.  With small initial weights V is
             # nearly the bare bowl and there is NO obstacle avoidance at all, so
             # avoidance has to be discovered rather than warm-started.
-            return [LearnedShaping(system.task_dim, sensor_name, n_obs=n_beams)]
+            # `hidden` is reachable from config because capacity is a question
+            # the measurements raise rather than one this file should answer.
+            # The term is deliberately narrow -- one layer, 16 units -- and it
+            # still crashes 27% of the time from states with 0.87 m of clearance
+            # and 0.04 m/s of closing speed, which is not a reaction-time
+            # failure but a shape the potential may simply be unable to hold.
+            # Widening it costs ES dimension, so whether it pays is an
+            # experiment, and an experiment needs a knob.
+            return [LearnedShaping(system.task_dim, sensor_name, n_obs=n_beams,
+                                   hidden=hidden, gyro=gyro,
+                                   obs_transform=obs_transform,
+                                   damp_mode=damp_mode)]
         elif harmonic_goal:
             # A harmonic SINK in place of the bowls, so the composed potential is
             # harmonic and not merely its obstacle half.  Measured: the field

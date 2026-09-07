@@ -377,7 +377,153 @@ class CityTour(Task):
         return goals[:, leg]
 
 
+class ReplayStart(Task):
+    """Start episodes from recorded situations -- typically moments before a crash.
+
+    Mining failing GOALS is weak, because most of the episode is the easy part
+    and the batch average barely moves.  What the vehicle needs practice at is
+    the last second, and that is a STATE: measured on the pillar field, a crash
+    looks like 0.79 m of clearance and 0.69 m/s two seconds out, then 0.45 m and
+    2.81 m/s a fifth of a second out.  It sees the obstacle the whole way (100%
+    of crashes) and has 11.8 m/s^2 of deceleration in hand.  It accelerates
+    anyway.  Dropping the vehicle straight into that configuration puts every
+    step of the episode on the part it gets wrong.
+
+    A situation is the WHOLE state -- pose, velocity, and the obstacle field,
+    which rides in the state dict -- plus the goal it was chasing.  Replaying
+    less than that would be a different scene.
+
+    `mix` keeps the rest of the batch on fresh episodes, because a controller
+    trained only on recoveries is being scored on a distribution nobody flies,
+    and the number that matters is still the crash rate on the original one.
+    """
+
+    def __init__(self, system, base: str = "waypoint_pair", mix: float = 0.5,
+                 states=None, goals=None, gating: str = "arrival", **kw):
+        super().__init__(system)
+        self.base = make_task(base, system, gating=gating, **kw)
+        self.gating = gating
+        self.n_legs = self.base.n_legs
+        self.tol = self.base.tol
+        self.mix = float(mix)
+        # The pool arrives through `task_kw`, so it may be nested lists rather
+        # than tensors.  Floats take the system dtype -- a recorded state that
+        # came back as float32 would start the replay somewhere the vehicle
+        # never was.
+        self.states = {}
+        for key, val in (states or {}).items():
+            t = torch.as_tensor(val)
+            if t.is_floating_point():
+                t = t.to(dtype=system.dtype)
+            self.states[key] = t.to(device=system.device)
+        g = torch.as_tensor(goals if goals is not None else [],
+                            dtype=system.dtype, device=system.device)
+        self.goals = g.reshape(-1, self.n_legs, self.task_dim) if g.numel() else g
+        self._picked = None          # indices drawn by the last `sample`
+
+    @property
+    def n_pool(self) -> int:
+        return int(self.goals.shape[0]) if self.goals.numel() else 0
+
+    def sample(self, n: int, gen: torch.Generator) -> Tensor:
+        out = self.base.sample(n, gen)
+        k = 0 if self.n_pool == 0 else int(round(self.mix * n))
+        if k:
+            idx = torch.randint(self.n_pool, (k,), generator=gen)
+            out[:k] = self.goals[idx]
+            self._picked = (n, k, idx)
+        else:
+            self._picked = None
+        return out
+
+    def place_start(self, s: State, goals: Tensor) -> State:
+        """Drop the replayed episodes into their recorded situation.
+
+        `sample` runs once per generation and the rollout then repeats its `E`
+        goals once per population member, so batch row `j*E + i` is episode `i`
+        for member `j` and the drawn indices tile the same way.  The first `k`
+        episodes of each block are the replayed ones.
+        """
+        # The BASE task places its own starts first, and the replayed rows are
+        # written over that afterwards.  Skipping this drops the base's
+        # placement from the episodes that are NOT replays -- which is most of
+        # the batch -- and on `city_tour`, whose starts begin the tour on a
+        # street beside the first waypoint, that alone took a converged
+        # 0.9756 reach / 0.0244 crash controller to 0.9248 / 0.0752.
+        place = getattr(self.base, "place_start", None)
+        if place is not None:
+            s = place(s, goals)
+        if self._picked is None:
+            return s
+        E, k, idx = self._picked
+        B = goals.shape[0]
+        reps = max(B // E, 1)
+        sel = idx.repeat(reps)
+        rows = torch.cat([torch.arange(k, device=goals.device) + j * E
+                          for j in range(reps)])
+        out = dict(s)
+        for key, val in self.states.items():
+            if key in out and out[key].shape[0] == B:
+                out[key] = out[key].clone()
+                out[key][rows] = val[sel].to(dtype=out[key].dtype,
+                                             device=out[key].device)
+        return out
+
+    def goal_at(self, goals: Tensor, t: int, ep_steps: int) -> Tensor:
+        return self.base.goal_at(goals, t, ep_steps)
+
+
+class HardMined(Task):
+    """A base task with its own failures over-represented.
+
+    Failures are not spread evenly over the task distribution: on the pillar
+    field the crashes concentrate on layouts where an obstacle sits between the
+    start and the goal, and the vehicle is measured ACCELERATING into it -- 0.69
+    m/s two seconds out, 2.81 m/s a fifth of a second out, with 11.8 m/s^2 of
+    deceleration available and 2 s of clear warning.  Those episodes are a few
+    percent of a training batch, so a fitness averaged over the batch barely
+    moves when they improve.
+
+    Mining them raises their weight without changing what they are: the pool
+    holds goal sets the controller actually failed on, and `mix` of each batch
+    is drawn from it.  The rest stays fresh, because a controller trained only
+    on its own failures is being scored on a distribution nobody asked for --
+    and the number that matters is still the crash rate on the ORIGINAL one.
+    """
+
+    def __init__(self, system, base: str = "waypoint_pair", mix: float = 0.5,
+                 pool=None, gating: str = "arrival", **kw):
+        super().__init__(system)
+        self.base = make_task(base, system, gating=gating, **kw)
+        self.gating = gating
+        self.n_legs = self.base.n_legs
+        self.tol = self.base.tol
+        self.mix = float(mix)
+        p = torch.as_tensor(pool if pool is not None else [],
+                            dtype=system.dtype, device=system.device)
+        self.pool = p.reshape(-1, self.n_legs, self.task_dim) if p.numel() else p
+
+    def sample(self, n: int, gen: torch.Generator) -> Tensor:
+        fresh = self.base.sample(n, gen)
+        if self.pool.numel() == 0 or self.mix <= 0.0:
+            return fresh
+        k = int(round(self.mix * n))
+        if k == 0:
+            return fresh
+        idx = torch.randint(self.pool.shape[0], (k,), generator=gen)
+        fresh[:k] = self.pool[idx]
+        return fresh
+
+    def last_leg(self, goals: Tensor) -> Tensor:
+        return self.base.last_leg(goals)
+
+    def goal_at(self, goals: Tensor, t: int, ep_steps: int) -> Tensor:
+        return self.base.goal_at(goals, t, ep_steps)
+
+
 TASKS: Dict[str, Type[Task]] = {
+    "hard_mined": HardMined,
+    "replay_start": ReplayStart,
     "base_pose": BasePose,
     "city_tour": CityTour,
     "free_space": FreeSpaceWaypoints,

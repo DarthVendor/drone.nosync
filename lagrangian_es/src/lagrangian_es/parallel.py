@@ -47,15 +47,23 @@ def _init(spec: dict) -> None:
                                    terms=spec["terms_fn"](system))
     sensors = spec["sensors_fn"](system) if spec.get("sensors_fn") \
         else build_sensors(cfg, system)
-    # NEVER compile inside a worker.  TorchInductor runs its own pool of compile
-    # processes, and starting one from inside a `ProcessPoolExecutor` worker
-    # deadlocks: measured, the whole run sat at 0% CPU across every process and
-    # made no progress at all -- which looks like a slow generation rather than a
-    # hang, and is the worst possible failure mode for an unattended run.
+    # NEVER compile inside a worker.
     #
-    # `compile_forward` measured a genuine 3.16x, but only in a single process.
-    # It stays available for that case; here it is forced off rather than left
-    # to whoever writes the config.
+    # Observed twice, on the 799-slot learned rig with 4 workers: a real run sat
+    # at 0% CPU across every process and never produced a generation, and a
+    # reduced reproduction dies with `BrokenProcessPool` -- a worker terminated
+    # while the pool waited on it.  Both happen with Inductor's compile pool at
+    # its default width AND pinned to one thread, so the nested pool is not the
+    # whole story; the 52-slot hand-designed rig compiles in a worker quite
+    # happily, which points at the size of the graph each worker has to build.
+    #
+    # The first failure mode is the dangerous one: 0% CPU and no output is
+    # indistinguishable from a slow generation, and an unattended run can sit in
+    # it for hours.
+    #
+    # `compile_forward` measured a genuine 3.16x SINGLE-PROCESS and stays
+    # available for that.  Here it is forced off rather than left to whoever
+    # writes the config, because the failure is silent.
     rc = cfg.rollout
     if getattr(rc, "compile_forward", False):
         from dataclasses import replace

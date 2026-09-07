@@ -247,10 +247,15 @@ def test_a_quantile_stop_makes_fitness_depend_on_the_shard_split():
 def test_workers_never_compile_however_the_config_asks():
     """`torch.compile` inside a process-pool worker deadlocks.
 
-    Inductor runs its own pool of compile processes; starting that from inside a
-    `ProcessPoolExecutor` worker hangs, and the symptom is the worst kind --
-    every process at 0% CPU, no output, indistinguishable from a slow generation
-    until you look at the CPU.  An unattended run can sit there for hours.
+    Observed on the 799-slot learned rig with 4 workers: a real run sat at 0%
+    CPU across every process and never produced a generation, and a reduced
+    reproduction dies with `BrokenProcessPool`.  Both happen whether Inductor's
+    compile pool is at its default width or pinned to one thread, and the
+    52-slot hand-designed rig compiles in a worker fine -- so it tracks the size
+    of the graph rather than the nesting alone.
+
+    The stall is the dangerous half: 0% CPU with no output is indistinguishable
+    from a slow generation, and an unattended run can sit in it for hours.
 
     `compile_forward` is worth having (3.16x measured, single-process), so it is
     not removed; it is forced off where it is unsafe.
