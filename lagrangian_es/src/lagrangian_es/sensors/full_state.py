@@ -104,3 +104,26 @@ class NoisyPosition(Sensor):
         d = super().describe()
         d.update(sigma=self.sigma, dropout=self.dropout)
         return d
+
+
+class Tilt(Sensor):
+    """The body's z-axis in the world frame -- what an IMU's gravity estimate
+    gives a flight controller.  Three numbers: (0, 0, 1) is level, the first
+    two are the lean, and it is exactly what a controller needs to know how far
+    it is from upright without being handed the whole rotation matrix."""
+
+    kind = "attitude_like"
+    name = "tilt"
+    update_every = 1
+
+    def __init__(self, system: LagrangianSystem, latency_steps: int = 0):
+        self.system = system
+        self.obs_dim = 3
+        self.latency_steps = int(latency_steps)
+
+    def observe(self, s: State, gen: torch.Generator) -> Tensor:
+        return s["R"][..., :, 2]
+
+    def jacobian(self, s: State) -> Tensor:
+        return torch.zeros(self._batch(s) + (3, int(self.system.task_dim)),
+                           dtype=self.system.dtype, device=self.system.device)

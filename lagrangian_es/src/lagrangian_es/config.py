@@ -223,6 +223,12 @@ class Config:
                                   # at a depth camera is a hand-assembled term
                                   # list, which a worker process cannot rebuild.
     gating: str = "arrival"       # "time" | "arrival"; see tasks.Task.gating
+    sensor_kw: tuple = ()         # per-sensor kwargs as (name, ((k, v), ...)) pairs,
+                                  # e.g. (("range", (("spread", 2.0944),)),) mounts a
+                                  # 120-degree forward fan instead of the all-round one
+    composer: str = ""            # task-level layer emitting a TaskSpec each
+                                  # interval; "" = none, "fixed" = identity
+    composer_kw: tuple = ()       # (name, value) pairs, e.g. ("every", 50)
     seed: int = 0
     dtype: str = "float64"
     rollout: RolloutCfg = field(default_factory=RolloutCfg)

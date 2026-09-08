@@ -156,8 +156,14 @@ class Rollout:
     """
 
     def __init__(self, system: LagrangianSystem, trainable: Trainable, task: Task,
-                 cfg: RolloutCfg, sensors: Optional[Sequence[Sensor]] = None):
+                 cfg: RolloutCfg, sensors: Optional[Sequence[Sensor]] = None,
+                 composer=None):
         self.system, self.trainable, self.task, self.cfg = system, trainable, task, cfg
+        self.composer = composer
+        if composer is not None and hasattr(composer, "attach"):
+            composer.attach(list(sensors or []))     # bearings come from the sensors themselves
+        self.chain: list = []          # measurement tokens, one entry per interval
+        self._last_obs: dict = {}
         self.sensors: List[Sensor] = list(sensors or [])
         # Per-sensor delay, not one global lag: flow and IMU run at ~2 ms, ToF at
         # 5-20 ms, vision at 30-80 ms, and collapsing them loses the very
@@ -185,6 +191,21 @@ class Rollout:
         self.forward_batch = vmap(trainable.forward,
                                   in_dims=(0, 0, 0, 0) if self.sensors
                                   else (0, 0, 0))
+        # The composer path is a SEPARATE vmapped map, so a rollout without one
+        # is the same function object as before rather than merely equivalent.
+        # The spec rides as a (delta, weight) tuple: vmap batches tensors, not
+        # dataclasses.
+        if composer is not None:
+            self.forward_spec_yaw = (
+                vmap(lambda th, st, g, o, sp: trainable.forward(th, st, g, o, spec=sp),
+                     in_dims=(0, 0, 0, 0, (0, 0, 0, 0))) if self.sensors else
+                vmap(lambda th, st, g, sp: trainable.forward(th, st, g, spec=sp),
+                     in_dims=(0, 0, 0, (0, 0, 0, 0))))
+            self.forward_spec = (
+                vmap(lambda th, st, g, o, sp: trainable.forward(th, st, g, o, spec=sp),
+                     in_dims=(0, 0, 0, 0, (0, 0))) if self.sensors else
+                vmap(lambda th, st, g, sp: trainable.forward(th, st, g, spec=sp),
+                     in_dims=(0, 0, 0, (0, 0))))
         if getattr(cfg, "compile_forward", False):
             # Compiled OUTSIDE the vmap, not inside it: `compile(vmap(f))` is
             # one graph over the whole population, while `vmap(compile(f))`
@@ -299,9 +320,46 @@ class Rollout:
         self._raw[sen.name] = (raw, jac)
         return raw, jac
 
-    def _u(self, TH_b, s, goal, obs):
-        return (self.forward_batch(TH_b, s, goal, obs) if self.sensors
-                else self.forward_batch(TH_b, s, goal))
+    def _u(self, TH_b, s, goal, obs, spec=None):
+        if spec is None:
+            return (self.forward_batch(TH_b, s, goal, obs) if self.sensors
+                    else self.forward_batch(TH_b, s, goal))
+        sp = (spec.delta, spec.weight) if spec.yaw is None else \
+            (spec.delta, spec.weight, spec.yaw, spec.yaw_gate if spec.yaw_gate is not None else torch.ones_like(spec.yaw))
+        fn = self.forward_spec_yaw if spec.yaw is not None else self.forward_spec
+        return (fn(TH_b, s, goal, obs, sp) if self.sensors else fn(TH_b, s, goal, sp))
+
+    # --- the task-level layer -------------------------------------------------
+    def _hold_for(self, B: int):
+        """A fresh zero-order hold for this batch, rated from the plant's own
+        bandwidth rather than a tuned number."""
+        from .composer import SpecHold
+        sysm, comp = self.system, self.composer
+        omega = float(getattr(comp, "omega_n", 0.0)) or \
+            float(sysm.potential_scale()) ** 0.5
+        return SpecHold(B, sysm.task_dim, comp.n_terms, self.cfg.dt, sysm.dtype,
+                        sysm.device, omega_n=omega,
+                        reach=float(getattr(comp, "reach", 10.0)))
+
+    def _context(self, s, goal, obs, alive, arrived, leg, t):
+        """What the composer sees once an interval: the raw pieces.  Ego-centric
+        framing is the composer's own job."""
+        sysm = self.system
+        ctx = {"x": sysm.task_position(s), "v": sysm.task_velocity(s),
+               "goal": goal, "alive": alive, "arrived": arrived, "leg": leg,
+               "t": t, "state": s, "chain": self.chain}
+        if obs:
+            ctx["obs"] = obs
+        return ctx
+
+    @staticmethod
+    def _token(x0, x1, sub, beam_min, alive, arrived):
+        """The measurement token: what the last instruction actually did --
+        progress toward the subgoal it was given, the closest any beam came,
+        and whether it is still flying.  Reported, never hoped."""
+        e0 = (x0 - sub).norm(dim=-1); e1 = (x1 - sub).norm(dim=-1)
+        return {"progress": e0 - e1, "remaining": e1, "min_beam": beam_min,
+                "alive": alive.clone(), "arrived": arrived.clone()}
 
     # --- layout ------------------------------------------------------------
     def _expand(self, TH: Tensor, goals: Tensor, seed: int):
@@ -377,9 +435,39 @@ class Rollout:
         sgen = make_gen(seed + 5_701_889)
         self._prime(s, sgen)
 
+        comp = self.composer
+        self._last_obs = {}
+        if comp is not None:
+            every = int(getattr(comp, "every", 50))
+            m_every = int(getattr(comp, "measure_every", every))
+            hold = self._hold_for(goals_b.shape[0])
+            comp.reset(goals_b.shape[0])
+            self.chain = []
+            x_int = sysm.task_position(s)
+            beam_min = None
         for t in range(T):
             goal = task.goal_for_leg(goals_b, leg) if arrival \
                 else task.goal_at(goals_b, t, T)
+            spec = None
+            if comp is not None:
+                # the drone's measurement stream: a token every `m_every` steps,
+                # about the instruction in force since the last token
+                if t and t % m_every == 0:
+                    tok = self._token(x_int, sysm.task_position(s), goal + hold.target.delta,
+                                      beam_min, alive, arrived)
+                    tok["t"] = float(t)
+                    # the objective itself, so a learner above reads the same
+                    # cost the low level was evolved on and nothing shaped
+                    tok["cost"] = cost.clone()
+                    self.chain.append(tok)
+                    if len(self.chain) > 4 * int(getattr(comp, "k_chain", 64)):
+                        self.chain = self.chain[-2 * int(getattr(comp, "k_chain", 64)):]
+                    x_int = sysm.task_position(s)
+                    beam_min = None
+                if t % every == 0:
+                    hold.set_target(comp.emit(self._context(
+                        s, goal, self._last_obs, alive, arrived, leg, t)))
+                spec = hold.step()
             # Episodes whose sensors cannot see anything new, because their
             # state is frozen and will not change again.
             #
@@ -392,7 +480,14 @@ class Rollout:
             # episode is frozen holding a perfectly ordinary state, so its
             # cached reading is exactly the reading a re-march would produce.
             awake = ~arrived          # `live` below is a COST, not a mask
-            u = self._u(TH_b, s, goal, self._observe(s, sgen, t, awake))
+            obs = self._observe(s, sgen, t, awake)
+            self._last_obs = obs
+            if comp is not None and obs:
+                rng = next((v for k, v in obs.items() if k.startswith("range")), None)
+                if rng is not None:
+                    m = rng.reshape(rng.shape[0], -1).min(-1).values
+                    beam_min = m if beam_min is None else torch.minimum(beam_min, m)
+            u = self._u(TH_b, s, goal, obs, spec)
             s_new = sysm.step(s, u, dt, res_b)
             # crashed vehicles freeze; never integrate a diverged state
             s = tree_where(alive & ~arrived, s_new, s)
@@ -568,10 +663,25 @@ class Rollout:
         arrival = getattr(task, "gating", "time") == "arrival"
         leg = torch.zeros(goals_b.shape[0], dtype=torch.long, device=sysm.device)
         states, gs, us, al, lg = [s], [], [], [], []
+        comp = self.composer
+        self._last_obs = {}
+        if comp is not None:
+            every = int(getattr(comp, "every", 50))
+            hold = self._hold_for(goals_b.shape[0]); comp.reset(goals_b.shape[0])
+        specs = []
         for t in range(T):
             goal = task.goal_for_leg(goals_b, leg) if arrival \
                 else task.goal_at(goals_b, t, T)
-            u = self._u(TH_b, s, goal, self._observe(s, sgen, t))
+            spec = None
+            if comp is not None:
+                if t % every == 0:
+                    hold.set_target(comp.emit(self._context(
+                        s, goal, self._last_obs, alive, torch.zeros_like(alive),
+                        leg, t)))
+                spec = hold.step()
+                specs.append(spec.delta.clone())
+            obs = self._observe(s, sgen, t); self._last_obs = obs
+            u = self._u(TH_b, s, goal, obs, spec)
             s = tree_where(alive, sysm.step(s, u, dt, res_b), s)
             gs.append(goal)
             us.append(u)
@@ -583,6 +693,7 @@ class Rollout:
                 reached = (err < task.tol) & alive
                 leg = torch.where(reached & (leg < task.n_legs - 1), leg + 1, leg)
             alive = alive & sysm.alive(s)
+        self.last_specs = torch.stack(specs) if specs else None
         return Trace(
             states=tree_stack(states),
             goals=torch.stack(gs),

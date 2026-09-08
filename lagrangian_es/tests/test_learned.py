@@ -130,3 +130,19 @@ def test_the_learned_term_supplies_both_kinds_of_force():
     V = t.potential(th, e, v, e, obs)
     assert float(V.min()) >= -1e-12                     # nonnegative
     assert float(t.potential(th, z, v, z, obs).abs().max()) == 0.0   # zero at goal
+
+
+def test_init_matches_dim_in_every_damping_mode():
+    """A prior one slot off is a silently different controller.  Measured: the
+    per-beam mode reported dim 588 and init() built 793, and every slice read
+    the first 588 without complaint."""
+    import torch
+    from lagrangian_es.trainables.learned import LearnedShaping
+    for mode in ("full", "iso", "beams"):
+        for gyro in (False, True):
+            t = LearnedShaping(3, n_obs=24, hidden=16, damp_mode=mode, gyro=gyro)
+            th = t.init(torch.float64, "cpu")
+            assert th.shape[-1] == t.dim, (mode, gyro, th.shape[-1], t.dim)
+            # the prior damper is the isotropic hand-designed one in every mode
+            R = t.damping(th)
+            assert torch.allclose(R, t.damp0 * torch.eye(3, dtype=torch.float64), atol=1e-9), mode

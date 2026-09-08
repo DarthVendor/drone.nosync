@@ -79,9 +79,18 @@ def build(cfg: Config):
     return system, trainable, task
 
 
+def build_composer(cfg: Config, system, trainable):
+    """The task-level layer named by the config, or None."""
+    if not cfg.composer:
+        return None
+    from .composer import make_composer
+    return make_composer(cfg.composer, system, trainable, **dict(cfg.composer_kw))
+
+
 def build_sensors(cfg: Config, system):
     """Sensor instances named by the config, or () for the full-state path."""
-    return tuple(make_sensor(n, system) for n in (cfg.sensors or ()))
+    kw = {name: dict(pairs) for name, pairs in (cfg.sensor_kw or ())}
+    return tuple(make_sensor(n, system, **kw.get(n, {})) for n in (cfg.sensors or ()))
 
 
 def _maybe_metric(cfg, g, theta, system, trainable, task, roll, P):
@@ -113,7 +122,8 @@ def train_es(cfg, system, trainable, task, callback=None, verbose=False,
              theta0=None) -> TrainResult:
     es, rc = cfg.es, cfg.rollout
     roll = Rollout(system, trainable, task, rc,
-                   sensors if sensors is not None else build_sensors(cfg, system))
+                   sensors if sensors is not None else build_sensors(cfg, system),
+                   composer=build_composer(cfg, system, trainable))
     # `evaluator` shards the population across processes; the metric and the
     # traces still use the in-process rollout, which is what keeps the whole
     # thing bit-identical either way
@@ -177,7 +187,8 @@ def train_ga(cfg, system, trainable, task, callback=None, verbose=False,
              theta0=None) -> TrainResult:
     es, rc = cfg.es, cfg.rollout
     roll = Rollout(system, trainable, task, rc,
-                   sensors if sensors is not None else build_sensors(cfg, system))
+                   sensors if sensors is not None else build_sensors(cfg, system),
+                   composer=build_composer(cfg, system, trainable))
     ev = evaluator or roll
     theta0 = trainable.init() if theta0 is None else theta0.clone()
     if theta0.shape[-1] != trainable.dim:

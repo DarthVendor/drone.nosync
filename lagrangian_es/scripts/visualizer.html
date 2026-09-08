@@ -183,6 +183,8 @@ figcaption{color:var(--muted);font-size:12px;margin-top:7px}
     <option value="1" selected>1&times;</option><option value="2">2&times;</option>
   </select>
   <button id="ghost" aria-pressed="true">Goal ghost</button>
+  <button id="wps" aria-pressed="true">Waypoints</button>
+  <button id="sub" aria-pressed="true">Sub-goal</button>
   <button id="follow" aria-pressed="false">Follow</button>
   <button id="resetView">Reset view</button>
 </div>
@@ -231,7 +233,7 @@ new MutationObserver(readPalette).observe(document.documentElement,
 /* ---------- state ---------- */
 let ri = 0, R = ROBOTS[0];
 let ep = 0, frame = 0, playing = true, speed = 1, mode = "both",
-    showGhost = true, follow = false;
+    showGhost = true, follow = false, showWps = true, showSub = true;
 let cam3 = {az:-0.9, el:0.42, dist:8.2, tx:0, ty:0, tz:1.3};
 let cam2 = {cx:0, cz:0.4, s:1};
 const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -298,6 +300,33 @@ function ringPts(c, ax, R, n){
     out.push([c[0]+cs*e1[0]+sn*e2[0], c[1]+cs*e1[1]+sn*e2[1], c[2]+cs*e1[2]+sn*e2[2]]);
   }
   return out;
+}
+// The task's placed waypoints: a ring on the ground under each, the one the
+// vehicle is currently flying to drawn in the target colour, with a post up to
+// its flying height so the marker reads in the 3-D view.
+function waypointSprites(k, f){
+  const w = run(k).waypoints; if (!w || !showWps) return [];
+  const g = goalTask(k, legOf(k, f)), muted = PAL.muted || PAL.warn;
+  const out = [];
+  for (const p of w){
+    const isGoal = Math.hypot(p[0]-g[0], p[1]-g[1]) < 0.3;
+    const col = isGoal ? PAL.target : muted;
+    out.push({pts: ringPts([p[0],p[1],0.02], [0,0,1], isGoal?0.7:0.45, 20),
+              fill: rgba(col, isGoal?0.35:0.10), stroke: rgba(col, isGoal?0.95:0.55),
+              width: isGoal?1.6:1, alpha:1});
+    out.push({pts:[[p[0],p[1],0.02],[p[0],p[1],p[2]]], line:true,
+              stroke: rgba(col, isGoal?0.6:0.3), width:1, alpha:1});
+  }
+  return out;
+}
+// The composer's live sub-goal: where the low level was TOLD to go this frame,
+// which is not the leg goal whenever a composer is in the loop.
+function subgoalSprites(k, f){
+  const s = run(k).subgoal; if (!s || !showSub) return [];
+  const i = Math.min(f, s.length/3 - 1) * 3, q = [s[i], s[i+1], s[i+2]];
+  const t = taskAt(k, f);
+  return [{pts:[[t[0],t[1],t[2]], q], line:true, stroke: rgba(PAL.ok,0.8), width:1.4, alpha:1},
+          {pts: ringPts(q, [0,0,1], 0.35, 14), fill: rgba(PAL.ok,0.3), stroke: rgba(PAL.ok,0.95), width:1.5, alpha:1}];
 }
 function obstacleSprites(k){
   const groups = run(k).obstacles; if (!groups) return [];
@@ -773,6 +802,8 @@ function render(){
     sp=sp.concat(bodyShapes(gp, PAL.tgt, 0.24, true));
   }
   sp=sp.concat(obstacleSprites(keys[keys.length-1]));
+  sp=sp.concat(waypointSprites(keys[keys.length-1], frame));
+  for (const k of keys) sp=sp.concat(subgoalSprites(k, frame));
   sp=sp.concat(footSprites(keys[keys.length-1], frame));
   sp=sp.concat(landmarkSprites(keys[keys.length-1], frame));
   for(const k of keys){
@@ -936,6 +967,8 @@ function buildLegend(){
   if(mode!=="prior") rows.push(["var(--accent)","Trained"]);
   if(mode!=="trained") rows.push(["var(--warn)","Untrained prior"]);
   if(showGhost) rows.push(["var(--target)","Target"]);
+  if(showWps && run("trained").waypoints) rows.push(["var(--muted, #8a8f96)","Waypoints (target ringed)"]);
+  if(showSub && run("trained").subgoal) rows.push(["var(--ok)","Composer sub-goal"]);
   if(hasCam()) rows.push(["var(--target)","Landmarks"]);
   if(hasRange()) rows.push(["var(--warn)","Range beams"]);
   const gg = run("trained").obstacles;
@@ -980,6 +1013,8 @@ $("scrub").oninput=e=>{ frame=+e.target.value; playing=false; $("play").textCont
 $("speed").onchange=e=>speed=+e.target.value;
 $("ghost").onclick=()=>{ showGhost=!showGhost; $("ghost").setAttribute("aria-pressed",showGhost);
   buildLegend(); };
+$("wps").onclick=()=>{ showWps=!showWps; $("wps").setAttribute("aria-pressed",showWps); buildLegend(); };
+$("sub").onclick=()=>{ showSub=!showSub; $("sub").setAttribute("aria-pressed",showSub); buildLegend(); };
 $("follow").onclick=()=>{ follow=!follow; $("follow").setAttribute("aria-pressed",follow);
   if(!follow) frameCamera(); };
 $("resetView").onclick=()=>{ follow=false; $("follow").setAttribute("aria-pressed","false");

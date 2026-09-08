@@ -175,7 +175,8 @@ class QuadrotorSE3(LagrangianSystem):
 
     # --- the underactuation seam --------------------------------------------
     def allocate(self, F_des: Tensor, s: State, phi: Tensor,
-                 goal: Optional[Tensor] = None) -> Tensor:
+                 goal: Optional[Tensor] = None, yaw: Optional[Tensor] = None,
+                 yaw_gate: Optional[Tensor] = None) -> Tensor:
         """Thrust along body z + a geometric SO(3) attitude loop.
 
         `phi` = (kR [3], kW [3]) raw; gains are used squared so they stay positive
@@ -263,13 +264,41 @@ class QuadrotorSE3(LagrangianSystem):
             # cannot outbid keeping the vehicle upright.
             cur = torch.atan2(R[..., 1, 0], R[..., 0, 0])
             des = torch.atan2(look[..., 1], look[..., 0])
-            dpsi = torch.atan2(torch.sin(des - cur), torch.cos(des - cur))
             # every cue faded and the hold term degenerate (nose straight up):
             # hold, rather than steer to the direction of the rounding error
             valid = (n[..., 0] / 1e-3).clamp(0.0, 1.0)
+            if yaw is not None:
+                # A COMMANDED heading from the task-level layer, blended in by
+                # `yaw_gate` (0 = the plant's own look-at, 1 = the command).
+                # The blend starts from whatever reference is valid -- the
+                # look-at where it has a norm, the current heading where it
+                # does not -- and a command counts as validity in its own
+                # right, or a learned agent whose look weights start at zero
+                # would drop every command on the floor.  Same slew below, so
+                # pointing the sensors can no more outbid staying upright than
+                # the look-at could.
+                g = torch.ones_like(cur) if yaw_gate is None else yaw_gate
+                base = cur + valid * torch.atan2(torch.sin(des - cur), torch.cos(des - cur))
+                dcmd = torch.atan2(torch.sin(yaw - base), torch.cos(yaw - base))
+                des = base + g * dcmd
+                valid = torch.maximum(valid, g)
+            dpsi = torch.atan2(torch.sin(des - cur), torch.cos(des - cur))
             psi = cur + (valid * dpsi).clamp(-self.yaw_slew, self.yaw_slew)
             b1c = torch.stack([torch.cos(psi), torch.sin(psi),
                                torch.zeros_like(psi)], dim=-1)
+        elif yaw is not None:
+            # No look-at of its own (yaw fixed at world x), but a heading has
+            # been COMMANDED from the task-level layer: slew toward it from the
+            # current heading, gated, under the same yaw slew.  With the gate
+            # at zero this is world x exactly, so the bare plant is unchanged.
+            cur = torch.atan2(R[..., 1, 0], R[..., 0, 0])
+            g = torch.ones_like(cur) if yaw_gate is None else yaw_gate
+            fixed = torch.zeros_like(cur)                       # world x
+            dcmd = torch.atan2(torch.sin(yaw - fixed), torch.cos(yaw - fixed))
+            des = fixed + g * dcmd
+            dpsi = torch.atan2(torch.sin(des - cur), torch.cos(des - cur))
+            psi = cur + dpsi.clamp(-self.yaw_slew, self.yaw_slew)
+            b1c = torch.stack([torch.cos(psi), torch.sin(psi), torch.zeros_like(psi)], dim=-1)
         else:
             b1c = torch.zeros_like(b3d) + self._e1
         b2d = torch.cross(b3d, b1c, dim=-1)

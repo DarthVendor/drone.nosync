@@ -74,6 +74,9 @@ LOADERS = {
     # within a 6 m sensor reach -- exact, and 2.5x less box SDF work per march
     # step than the 40 it defaults to.  Sized by measurement, and the soundness
     # condition is asserted in tests/test_citymap.py rather than assumed.
+    # every waypoint behind a wall from every other: the one skill the city
+    # measurement singled out (91% lost when occluded, 24% with line of sight)
+    "occluded": lambda: city_to_environment(MAPS / "occluded.json", name="occluded"),
     "singapore_cbd": lambda: city_to_environment(MAPS / "singapore_cbd.json",
                                                  cull_k=24,
                                                  name="singapore_cbd"),

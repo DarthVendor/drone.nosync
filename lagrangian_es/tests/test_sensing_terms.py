@@ -575,6 +575,9 @@ def test_range_vortex_certificate_declares_gyroscopic():
     assert c["gyroscopic"] and c["workless"] and c["zero_at_goal"]
 
 
+# Measured under a yaw-stabilised fan; with the fan bolted to the airframe
+# (the default now) the 0.05 margin it asserts is gone (0.551 vs 0.543), so the
+# finding is pinned to the mounting it was made under.
 def test_the_range_barrier_fights_the_task_on_a_hoop_course():
     """A hoop is an obstacle you have to fly THROUGH, and the barrier cannot
     tell that from one you have to fly around.
@@ -628,7 +631,7 @@ def test_the_range_barrier_fights_the_task_on_a_hoop_course():
                 break
             off += t.dim
         roll = Rollout(system, tr, task, cfg.rollout,
-                       (make_sensor("range", system),))
+                       (make_sensor("range", system, body_fixed=False),))
         t2 = th.clone()
         t2[off] = th[off] * scale
         return evaluate(system, tr, task, t2, cfg.rollout, n_tasks=n,

@@ -190,16 +190,37 @@ class EnergyShaping(Trainable):
         return out
 
     # --- the controller map -------------------------------------------------
-    def forward(self, theta: Tensor, s: State, goal: Tensor, obs=None) -> Tensor:
+    def forward(self, theta: Tensor, s: State, goal: Tensor, obs=None,
+                spec=None) -> Tensor:
+        """The controller map, optionally compiled against a `TaskSpec`.
+
+        With a spec the goal the terms see is shifted by its subgoal delta and
+        each term's gradient is scaled by its conic weight alpha_i * gate_i.
+        V_d = sum_i w_i V_i keeps every promise the terms make -- nonnegative,
+        stationary at the (sub)goal, PSD damping -- because the w_i are
+        nonnegative and, within a hold interval, constant in x.  With no spec
+        this is the bare controller, unchanged.
+
+        `spec` arrives as (delta, weight) tensors rather than the dataclass so
+        the call composes under vmap, which batches tensors and not objects.
+        """
         sysm = self.system
         x = sysm.task_position(s)
         v = sysm.task_velocity(s)
+        yaw = yaw_gate = None
+        if spec is not None:
+            delta, w = spec[0], spec[1]
+            yaw = spec[2] if len(spec) > 2 else None
+            yaw_gate = spec[3] if len(spec) > 3 else None
+            goal = goal + delta
         e = x - goal
 
         bracket = None
-        for t, th in zip(self.terms, self.term_slices(theta)):
+        for i, (t, th) in enumerate(zip(self.terms, self.term_slices(theta))):
             g = t.grad_potential(th, e, v, x, obs) if t.uses_obs \
                 else t.grad_potential(th, e, v, x)
+            if spec is not None:
+                g = g * w[..., i:i + 1]
             bracket = g if bracket is None else bracket + g
 
         Md = self.desired_mass(theta, s)
@@ -210,6 +231,8 @@ class EnergyShaping(Trainable):
 
         F_des = sysm.gravity_force(s) - bracket
         _, phi = self.split(theta)
+        if yaw is not None:
+            return sysm.allocate(F_des, s, phi, goal, yaw=yaw, yaw_gate=yaw_gate)
         return sysm.allocate(F_des, s, phi, goal)
 
     # --- reporting ----------------------------------------------------------

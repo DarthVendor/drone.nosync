@@ -71,10 +71,15 @@ class LearnedShaping(LagrangianTerm):
                  e_scale: float = 2.0, v_gate: bool = True,
                  init_gain: float = 0.4, damp0: float = 1.2,
                  gyro: bool = False, obs_transform: str = "linear",
-                 prox_scale: float = 1.0, damp_mode: str = "full"):
+                 prox_scale: float = 1.0, damp_mode: str = "full",
+                 n_beams: int = None):
         super().__init__(d)
         self.sensor_name = sensor_name
         self.n_obs, self.h, self.out = int(n_obs), int(hidden), int(out)
+        # the first `n_beams` channels are ranges; anything after is another
+        # sensor (a downward fan, the tilt) that reads through unscaled
+        self.n_beams = int(n_obs if n_beams is None else n_beams)
+        self.beam_name = sensor_name[0] if isinstance(sensor_name, (tuple, list)) else sensor_name
         self.obs_scale, self.e_scale = float(obs_scale), float(e_scale)
         self.init_gain, self.damp0 = float(init_gain), float(damp0)
         self.gyro = bool(gyro)
@@ -129,11 +134,28 @@ class LearnedShaping(LagrangianTerm):
         A[:, :self.d] = torch.eye(self.d, dtype=dtype)
         parts.append(A)
         # dissipation head starts at the hand-designed isotropic damper, so the
-        # prior is a controller that already works rather than noise
-        parts.append(torch.zeros(self.n_obs, self.d * self.d, dtype=dtype))
-        parts.append((self.damp0 ** 0.5
-                      * torch.eye(self.d, dtype=dtype)).reshape(-1))
-        return torch.cat([p.reshape(-1) for p in parts]).to(device)
+        # prior is a controller that already works rather than noise.  Laid
+        # out per MODE: the full head is (n_obs x d^2) + d^2 with an identity
+        # block, the isotropic and per-beam heads carry their own weight slot
+        # count and ONE scalar read through a softplus.  Building the full
+        # layout for every mode made `init()` 205 slots longer than `dim` in
+        # the per-beam mode, and the slices read the first `dim` of them
+        # without complaint -- a fresh genome that was silently the wrong one.
+        import math
+        wd = self._sl["Wd"][1] - self._sl["Wd"][0]
+        bd = self._sl["bd"][1] - self._sl["bd"][0]
+        parts.append(torch.zeros(wd, dtype=dtype))
+        if self.damp_mode == "full":
+            parts.append((self.damp0 ** 0.5
+                          * torch.eye(self.d, dtype=dtype)).reshape(-1))
+        else:
+            # softplus(b) = damp0  ->  b = log(exp(damp0) - 1)
+            parts.append(torch.full((bd,), math.log(math.expm1(self.damp0)), dtype=dtype))
+        out = torch.cat([p.reshape(-1) for p in parts])
+        if self.gyro:
+            out = torch.cat([out, torch.zeros(self.dim - out.numel(), dtype=dtype)])
+        assert out.numel() == self.dim, (out.numel(), self.dim)
+        return out.to(device)
 
     # --- heads --------------------------------------------------------------
     def _weights(self, theta):
@@ -203,6 +225,17 @@ class LearnedShaping(LagrangianTerm):
         flat = (z.unsqueeze(-2) @ Wd).squeeze(-2) + bd
         return flat.reshape(flat.shape[:-1] + (self.d, self.d))
 
+    def _obs_vec(self, obs):
+        """The observation the network reads: one sensor, or several named
+        sensors concatenated in the order given -- the front fan, a downward
+        fan, the tilt -- so the low level flies on what it senses about the
+        world AND about itself."""
+        names = self.sensor_name if isinstance(self.sensor_name, (tuple, list)) else (self.sensor_name,)
+        parts = [obs[n] for n in names if obs is not None and n in obs]
+        if len(parts) != len(names):
+            return None
+        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+
     def _read(self, obs):
         """Beam ranges, in the coordinate the network reasons in.
 
@@ -219,12 +252,15 @@ class LearnedShaping(LagrangianTerm):
         what to do with it, and the channel count is unchanged, which matters
         because dimension has measurably cost more than expressiveness here.
         """
-        if obs is None or self.sensor_name not in obs:
+        if obs is None or self._obs_vec(obs) is None:
             return None
-        d = obs[self.sensor_name]
+        d = self._obs_vec(obs)
+        beams, rest = d[..., :self.n_beams], d[..., self.n_beams:]
         if self.obs_transform == "proximity":
-            return self.prox_scale / (d.clamp_min(0.0) + self.prox_scale)
-        return (d / self.obs_scale).clamp(-4.0, 4.0)
+            beams = self.prox_scale / (beams.clamp_min(0.0) + self.prox_scale)
+        else:
+            beams = (beams / self.obs_scale).clamp(-4.0, 4.0)
+        return beams if rest.shape[-1] == 0 else torch.cat([beams, rest.clamp(-4.0, 4.0)], -1)
 
     # --- contributions ------------------------------------------------------
     def potential(self, theta, e, v, x, obs=None):
@@ -301,10 +337,11 @@ class LearnedShaping(LagrangianTerm):
         b2 = wd[..., 3 * H:3 * H + 1]
         s0 = torch.nn.functional.softplus(self._p(theta, "bd", (1,)))
         base = s0 * v
-        J = obs.get(self.sensor_name + "/J") if obs is not None else None
+        J = obs.get(self.beam_name + "/J") if obs is not None else None
         if J is None:
             return base                     # no geometry in view: floor only
-        t1 = torch.tanh(z.unsqueeze(-1) * W1 + b1)          # [..., n_obs, H]
+        z = z[..., :self.n_beams]                            # the beams, not the tilt
+        t1 = torch.tanh(z.unsqueeze(-1) * W1 + b1)          # [..., n_beams, H]
         w = torch.nn.functional.softplus((t1 * W2).sum(-1) + b2)   # [..., n_obs]
         c = -(J * v.unsqueeze(-2)).sum(-1)                  # closing speed
         eps = self.HINGE

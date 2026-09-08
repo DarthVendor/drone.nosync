@@ -48,8 +48,17 @@ class RangeSensor(Sensor):
 
     def __init__(self, system, n_beams: int = 24, max_range: float = 6.0,
                  spread: float = TWO_PI, sigma: float = 0.02,
-                 latency_steps: int = 1, elevations: tuple = (0.0,)):
+                 latency_steps: int = 1, elevations: tuple = (0.0,),
+                 name: str = "range", body_fixed: bool = True):
         self.system = system
+        # instance name: a downward fan and a forward fan are both range
+        # sensors and both have to live in one observation dict
+        self.name = str(name)
+        # `body_fixed`: the fan is bolted to the airframe and turns with yaw
+        # AND tilt (the default, the realistic mounting).  False keeps the fan
+        # yaw-stabilised in the world-vertical frame, the mounting the earlier
+        # hand-designed-stack findings were measured under.
+        self.body_fixed = bool(body_fixed)
         self.n_beams = int(n_beams)
         # A purely horizontal fan is blind to anything off its own altitude.
         # That is fine for extruded obstacles like pillars and walls, and
@@ -72,16 +81,32 @@ class RangeSensor(Sensor):
         return torch.atan2(R[..., 1, 0], R[..., 0, 0])
 
     def _dirs(self, s: State) -> Tensor:
-        yaw = self._yaw(s)
-        k = torch.arange(self.n_beams, dtype=yaw.dtype, device=yaw.device)
-        off = (k / self.n_beams - 0.5) * self.spread
-        ang = yaw[..., None] + off                      # [..., n_beams]
+        """Beam directions in the WORLD frame, from a body-fixed fan.
+
+        The fan is mounted on the vehicle, so it turns with yaw and dips with
+        tilt: a banking drone's forward beams look into the ground a little,
+        and a downward fan swings off vertical.  Built in the body frame --
+        forward is body +x, azimuth in the body xy plane, elevation out of it
+        -- then rotated by the full R, not by yaw alone.
+        """
+        R = s["R"]
+        k = torch.arange(self.n_beams, dtype=R.dtype, device=R.device)
+        off = (k / self.n_beams - 0.5) * self.spread    # [n_beams], body azimuth
         out = []
         for el in self.elevations:
             ce, se = math.cos(el), math.sin(el)
-            out.append(torch.stack([torch.cos(ang) * ce, torch.sin(ang) * ce,
-                                    torch.full_like(ang, se)], dim=-1))
-        return torch.cat(out, dim=-2)                   # [..., n_beams*n_elev, 3]
+            out.append(torch.stack([torch.cos(off) * ce, torch.sin(off) * ce,
+                                    torch.full_like(off, se)], dim=-1))
+        body = torch.cat(out, dim=-2)                   # [n_beams*n_elev, 3]
+        if not self.body_fixed:
+            # yaw-stabilised: rotate about world z by the yaw only
+            yaw = self._yaw(s); c, sn = torch.cos(yaw), torch.sin(yaw)
+            Rz = torch.stack([torch.stack([c, -sn, torch.zeros_like(c)], -1),
+                              torch.stack([sn, c, torch.zeros_like(c)], -1),
+                              torch.stack([torch.zeros_like(c), torch.zeros_like(c), torch.ones_like(c)], -1)], -2)
+            return torch.einsum("...ij,kj->...ki", Rz, body)
+        # world = R @ body, for every beam
+        return torch.einsum("...ij,kj->...ki", R, body)  # [..., n_beams*n_elev, 3]
 
     def observe(self, s: State, gen: torch.Generator) -> Tensor:
         rng, _ = self.system.raycast(s, self._dirs(s), self.max_range)

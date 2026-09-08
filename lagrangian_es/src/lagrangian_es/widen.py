@@ -144,3 +144,41 @@ def to_beam_damping(theta: Tensor, full, beams, floor: float,
     out[..., a0:b0] = t if t > 20 else math.log(math.expm1(t))
     out[..., beams.dim:] = theta[..., full.dim:]
     return out
+
+
+def extend_inputs(theta: Tensor, narrow, wide) -> Tensor:
+    """Give a learned term more observation channels without changing it.
+
+    New channels are appended after the existing observation block, so the
+    only difference in the genome layout is extra rows at the end of `W1`'s
+    input dimension.  Those rows start at zero: the term ignores the new
+    inputs until the search finds a use for them, and today's genome flies
+    exactly as it did -- which is the point of a warm start.
+    """
+    if wide.n_in < narrow.n_in or wide.h != narrow.h or wide.d != narrow.d:
+        raise ValueError("extend_inputs only appends observation channels")
+    extra = wide.n_in - narrow.n_in
+    lead = theta.shape[:-1]
+    out = torch.zeros(lead + (theta.shape[-1] - narrow.dim + wide.dim,),
+                      dtype=theta.dtype, device=theta.device)
+    # W1: (n_in, h) row-major -> append `extra` zero rows
+    a, b = narrow._sl["W1"]
+    W1 = theta[..., a:b].reshape(lead + (narrow.n_in, narrow.h))
+    W1n = torch.cat([W1, torch.zeros(lead + (extra, narrow.h), dtype=theta.dtype, device=theta.device)], -2)
+    a2, b2 = wide._sl["W1"]
+    out[..., a2:b2] = W1n.reshape(lead + (-1,))
+    # every other slot of the term is laid out identically after W1, offset by
+    # the extra rows -- except heads whose width depends on n_obs
+    for key in ("b1", "W2", "b2", "A", "Wd", "bd", "Wg", "bg"):
+        if key not in narrow._sl or key not in wide._sl:
+            continue
+        na, nb = narrow._sl[key]; wa, wb = wide._sl[key]
+        if nb - na == wb - wa:
+            out[..., wa:wb] = theta[..., na:nb]
+        else:
+            # an obs-width head (iso damping, full damping): old columns first,
+            # new columns zero
+            old = theta[..., na:nb]; out[..., wa:wa + (nb - na)] = old
+    # the allocator and anything after the term keep their values
+    out[..., wide.dim:] = theta[..., narrow.dim:]
+    return out

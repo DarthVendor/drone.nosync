@@ -152,7 +152,7 @@ class NavAgent(EmbodiedAgent):
                     harmonic_goal: bool = False,
                     learned: bool = True, hidden: int = 16,
                     gyro: bool = False, obs_transform: str = "linear",
-                    damp_mode: str = "full", **kw):
+                    damp_mode: str = "full", extra_obs: tuple = (), **kw):
         """Core, plus a barrier on POSITION and a damper on CLOSING SPEED.
 
         Both are needed, and for a reason that is structural rather than a matter
@@ -212,10 +212,15 @@ class NavAgent(EmbodiedAgent):
             # failure but a shape the potential may simply be unable to hold.
             # Widening it costs ES dimension, so whether it pays is an
             # experiment, and an experiment needs a knob.
-            return [LearnedShaping(system.task_dim, sensor_name, n_obs=n_beams,
-                                   hidden=hidden, gyro=gyro,
+            # `extra_obs`: further named channels the term reads after the
+            # beams, as (sensor name, width) pairs -- e.g. a downward fan and
+            # the tilt.  The per-beam damping head stays on the first `n_beams`.
+            names = (sensor_name,) + tuple(n for n, _ in extra_obs)
+            n_obs = n_beams + sum(int(w) for _, w in extra_obs)
+            return [LearnedShaping(system.task_dim, names if extra_obs else sensor_name,
+                                   n_obs=n_obs, hidden=hidden, gyro=gyro,
                                    obs_transform=obs_transform,
-                                   damp_mode=damp_mode)]
+                                   damp_mode=damp_mode, n_beams=n_beams)]
         elif harmonic_goal:
             # A harmonic SINK in place of the bowls, so the composed potential is
             # harmonic and not merely its obstacle half.  Measured: the field

@@ -68,14 +68,52 @@ def _init(spec: dict) -> None:
     if getattr(rc, "compile_forward", False):
         from dataclasses import replace
         rc = replace(rc, compile_forward=False)
-    _RIG = Rollout(system, trainable, task, rc, sensors)
+    from .es import build_composer
+    # the task-level layer, if the config names one: a worker that flew
+    # without it would rank a different controller from the one the parent
+    # evaluates, and the mismatch would be silent
+    _RIG = Rollout(system, trainable, task, rc, sensors,
+                   composer=build_composer(cfg, system, trainable))
 
 
 def _work(payload):
-    TH, goals, seed = payload
+    TH, goals, seed = payload[:3]
+    stochastic, record_frac, shard = (payload[3:] + (False, 0.0, 0))[:3] if len(payload) > 3 \
+        else (False, 0.0, 0)
+    comp = getattr(_RIG, "composer", None)
+    if comp is not None and hasattr(comp, "stochastic"):
+        # exploration noise is seeded per shard, so a batch is reproducible
+        # and two shards never draw the same noise
+        comp.stochastic = bool(stochastic); comp.records = []
+        torch.manual_seed(int(seed) * 1_000 + int(shard))
     r = _RIG.run(TH, goals, seed)
-    return (r.fitness, r.cost, r.alive, r.leg_err, r.final_err, r.success,
+    base = (r.fitness, r.cost, r.alive, r.leg_err, r.final_err, r.success,
             r.legs_done, r.finish_frac, r.saturation, r.effort, r.shaping, r.n_eps)
+    if comp is None or record_frac <= 0 or not getattr(comp, "records", None):
+        return base + (None,)
+    # Slim the composer's records to a fraction of rows, in float32: the
+    # tokens are the bulk of what crosses the process boundary, and the
+    # composer's update needs far fewer flights than the GA's ranking does.
+    B = r.cost.shape[0]
+    every = max(1, int(round(1.0 / record_frac)))
+    rows = torch.arange(0, B, every)
+    recs = [{"t": rc["t"], "act": rc["act"][rows].float(), "alive": rc["alive"][rows],
+             "tok": {k: (v[rows].float() if torch.is_tensor(v) and v.is_floating_point()
+                         else (v[rows] if torch.is_tensor(v) else v)) for k, v in rc["tok"].items()}}
+            for rc in comp.records]
+    chain = [{k: (v[rows] if torch.is_tensor(v) else v) for k, v in tok.items()} for tok in _RIG.chain]
+    comp.records = []
+    return base + ({"records": recs, "chain": chain, "rows": rows},)
+
+
+def _work_local(rig, payload):
+    """`_work` against a given rig, for the single-process fallback."""
+    global _RIG
+    saved = globals().get("_RIG"); _RIG = rig
+    try:
+        return _work(payload)
+    finally:
+        _RIG = saved
 
 
 def _merge(parts) -> RolloutResult:
@@ -84,6 +122,18 @@ def _merge(parts) -> RolloutResult:
         fitness=cat(0), cost=cat(1), alive=cat(2), leg_err=cat(3),
         final_err=cat(4), success=cat(5), legs_done=cat(6), finish_frac=cat(7),
         saturation=cat(8), effort=cat(9), shaping=cat(10), n_eps=parts[0][11])
+
+
+def _records(parts, step: int, n_eps: int):
+    """Per-shard composer records with their rows re-based to the whole batch.
+    Shards can end at different intervals (early exit), so their decision
+    lists are kept separate rather than concatenated."""
+    out = []
+    for i, p in enumerate(parts):
+        if len(p) > 12 and p[12] is not None:
+            rec = dict(p[12]); rec["rows"] = rec["rows"] + i * step * n_eps
+            out.append(rec)
+    return out
 
 
 def default_workers() -> int:
@@ -165,6 +215,21 @@ class ParallelRollout:
         chunks = [(TH[i * step:(i + 1) * step].contiguous(), goals, seed)
                   for i in range(n)]
         return _merge(list(self._pool_up().map(_work, chunks)))
+
+    def run_with_records(self, TH: Tensor, goals: Tensor, seed: int,
+                         stochastic: bool = True, record_frac: float = 0.125):
+        """`run`, and the composer's recorded decisions from every shard.
+
+        For co-training: the GA ranks every flight from the merged result while
+        the composer's update reads a fraction of rows -- each entry carries
+        `records`, `chain` and the global `rows` they belong to."""
+        P = TH.shape[0]
+        n = self._shards(P) if (self.workers > 1 and P >= self.min_pop) else 1
+        step = P // n
+        chunks = [(TH[i * step:(i + 1) * step].contiguous(), goals, seed, stochastic, record_frac, i)
+                  for i in range(n)]
+        parts = list(self._pool_up().map(_work, chunks)) if n > 1 else [_work_local(self._local_rig(), chunks[0])]
+        return _merge(parts), _records(parts, step, goals.shape[0])
 
     def _shards(self, P: int) -> int:
         """Largest worker count <= `workers` that divides P EXACTLY.

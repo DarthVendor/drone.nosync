@@ -114,6 +114,16 @@ def capture(system, roll, theta, goals, seed, stride=1, sensor=None):
                 grp[k] = (_r(v[0, b], 4) if isinstance(v, torch.Tensor)
                           else float(v))          # frame 0: geometry is constant
             rec.setdefault("obstacles", []).append(grp)
+        # the task's waypoints (static) and, when a composer is in the loop, the
+        # sub-goal it handed the low level at every frame -- so the page can show
+        # where the vehicle was TOLD to go, not only where the leg goal sits
+        wps = getattr(system.env, "waypoints", None) if hasattr(system, "env") else None
+        if wps:
+            rec["waypoints"] = [[round(float(c), 3) for c in w] for w in wps]
+        specs = getattr(roll, "last_specs", None)
+        if specs is not None:
+            sub = tr.goals + specs                              # [T, B, 3] world sub-goal
+            rec["subgoal"] = _r(sub[[min(i, T - 1) for i in sel], b], 3)
         if sensor is not None:
             f = sensor.render_frame(tr.states)
             if "uv" in f:
