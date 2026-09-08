@@ -114,6 +114,11 @@ class PolicyComposer(TransformerComposer):
         # compounding into a crash.
         self.noise_hold = int(kw.get("noise_hold", 5))
         self._eps = None; self._eps_age = 0
+        # Rows to record for the update, by full-batch id; None = every row.
+        # Set by the worker before a batch: recording every live row's full
+        # token set at every decision and slimming at the end held ~700 MB per
+        # worker for nothing, on a machine with 2 GB to spare.
+        self.record_rows = None
 
     def reset(self, B):
         super().reset(B)
@@ -124,10 +129,13 @@ class PolicyComposer(TransformerComposer):
         tok = self.tokens(ctx)
         pre, _ = self.net.pre(tok)
         if self.stochastic:
-            if self._eps is None or self._eps_age >= self.noise_hold or self._eps.shape[0] != pre.shape[0]:
-                self._eps = torch.randn_like(pre); self._eps_age = 0
+            rows = getattr(self, "_rows", None)
+            B = self._B if rows is not None else pre.shape[0]
+            if self._eps is None or self._eps_age >= self.noise_hold or self._eps.shape[0] != B:
+                self._eps = torch.randn(B, pre.shape[-1], dtype=pre.dtype, device=pre.device); self._eps_age = 0
             self._eps_age += 1
-            act = pre + self.net.std * self._eps
+            eps = self._eps if rows is None else self._eps[rows]
+            act = pre + self.net.std * eps
         else:
             act = pre
         sub, alpha, gate, (dpsi, yg) = self.net.activate(act, max(self.n_terms, 1))
@@ -137,24 +145,30 @@ class PolicyComposer(TransformerComposer):
         sub_world = torch.cat([sub_world[:, :2], sub_world[:, 2:].clamp_min(self.z_min)], -1)
         spec = TaskSpec(delta=sub_world - goal, alpha=alpha[:, :self.n_terms], gate=gate[:, :self.n_terms],
                         yaw=psi + dpsi, yaw_gate=yg)
-        self._instr.append((float(ctx.get("t", 0)), spec.delta.clone(), spec.weight.clone()))
-        if len(self._instr) > 4 * self.tok.kc:
-            self._instr = self._instr[-2 * self.tok.kc:]
+        self._remember(ctx, spec)
         if self.stochastic:
-            self.records.append({"t": float(ctx.get("t", 0)), "act": act.clone(),
-                                 "alive": ctx["alive"].clone(),
-                                 "tok": {k: (v.clone() if torch.is_tensor(v) else v) for k, v in tok.items()}})
+            rows = getattr(self, "_rows", None)
+            ids = rows.clone() if rows is not None else torch.arange(act.shape[0])
+            keep = torch.ones(ids.shape[0], dtype=torch.bool) if self.record_rows is None \
+                else torch.isin(ids, self.record_rows)
+            self.records.append({"t": float(ctx.get("t", 0)), "act": act[keep].clone(),
+                                 "alive": ctx["alive"][keep].clone(), "rows": ids[keep],
+                                 "tok": {k: (v[keep].clone() if torch.is_tensor(v) and v.ndim and v.shape[0] == act.shape[0]
+                                             else (v.clone() if torch.is_tensor(v) else v)) for k, v in tok.items()}})
         return spec
 
 
 def returns_from_stream(records: List[Dict], chain: List[Dict], gamma: float) -> Tensor:
-    """Per decision and episode, the discounted sum of the cost increments the
-    stream reported after it -- negated, so that lower cost is higher return."""
+    """Per decision and FULL-BATCH row, the discounted sum of the cost
+    increments the stream reported after it -- negated, so lower cost is higher
+    return.  Records may cover only the rows that were alive at that decision
+    (`rows`); the return is computed for every row and the update picks its
+    own rows out."""
     ts = [r["t"] for r in records]
     cost_at = {m["t"]: m["cost"] for m in chain}
     times = sorted(cost_at)
-    B = records[0]["alive"].shape[0]
-    zero = torch.zeros(B, dtype=records[0]["act"].dtype)
+    B = chain[0]["cost"].shape[0] if chain else records[0]["alive"].shape[0]
+    zero = torch.zeros(B, dtype=chain[0]["cost"].dtype if chain else records[0]["act"].dtype)
     # cost increment attributed to decision k: cost(next decision time) - cost(this one)
     def cost_at_or_before(t):
         prev = [u for u in times if u <= t]
@@ -179,21 +193,40 @@ def ppo_update(net: PolicyNet, records: List[Dict], returns: Tensor, n_terms: in
     # the update runs in float32 whatever the inference dtype: half gradients underflow
     infer_dtype = next(net.parameters()).dtype
     net.float()
+    # `records` may be one list with one returns tensor, or several groups --
+    # one per worker shard, each with its own decision count and kept rows
+    groups = list(zip(records, returns)) if (records and isinstance(records[0], list)) else [(records, returns)]
     samples, acts, rets = [], [], []
-    for k, rec in enumerate(records):
-        al = rec["alive"]
-        for b in al.nonzero().flatten().tolist():
-            samples.append({kk: (v[b].float() if torch.is_tensor(v) and v.is_floating_point() else (v[b] if torch.is_tensor(v) else v))
-                            for kk, v in rec["tok"].items()})
-            acts.append(rec["act"][b]); rets.append(returns[k, b])
+    for recs, R in groups:
+        for k, rec in enumerate(recs):
+            al = rec["alive"]; rows = rec.get("rows")
+            for j in al.nonzero().flatten().tolist():
+                b = int(rows[j]) if rows is not None else j         # the column of R this record's row is
+                samples.append({kk: (v[j].float() if torch.is_tensor(v) and v.is_floating_point() else (v[j] if torch.is_tensor(v) else v))
+                                for kk, v in rec["tok"].items()})
+                acts.append(rec["act"][j]); rets.append(R[k, b])
     if not samples:
         return {"n": 0}
     acts = torch.stack(acts).float(); rets = torch.stack(rets).float()
+    # a non-finite action or return is dropped and counted before it can reach
+    # a log-probability, which rejects it outright, or a gradient
+    ok = torch.isfinite(acts).all(-1) & torch.isfinite(rets)
+    dropped = int((~ok).sum())
+    if dropped:
+        keep = ok.nonzero().flatten().tolist()
+        samples = [samples[i] for i in keep]; acts = acts[ok]; rets = rets[ok]
+        if not samples:
+            return {"n": 0, "nonfinite": dropped}
     rets_n = (rets - rets.mean()) / rets.std().clamp_min(1e-6)
+    # Collate ONCE into padded tensors and minibatch by indexing.  Re-collating
+    # 512 Python dicts per minibatch was most of a 159 s update on 52k samples.
+    ALL = collate_tok(samples)
+    def take(idx):
+        return {k: (v[idx] if torch.is_tensor(v) else v) for k, v in ALL.items()}
     with torch.no_grad():
         old_lp = []
         for i in range(0, len(samples), batch):
-            b = collate_tok(samples[i:i + batch])
+            b = take(torch.arange(i, min(i + batch, len(samples))))
             pre, _ = net.pre(b)
             old_lp.append(net.dist(pre).log_prob(acts[i:i + batch]).sum(-1))
         old_lp = torch.cat(old_lp)
@@ -208,24 +241,24 @@ def ppo_update(net: PolicyNet, records: List[Dict], returns: Tensor, n_terms: in
     opt = torch.optim.Adam([{"params": body, "lr": lr}, {"params": head, "lr": 10 * lr}])
     net.train()
     stats = {"n": len(samples), "loss": 0.0, "v_loss": 0.0, "ent": 0.0, "nb": 0,
-             "kl": 0.0, "clipfrac": 0.0}
+             "kl": 0.0, "clipfrac": 0.0, "nonfinite": dropped}
     # value-head fit BEFORE the update: how much of the return the composer's
     # situation explains.  Near zero means the return is not varying with what
     # the composer sees and does, and no update can find a gradient in it.
     with torch.no_grad():
-        v0 = torch.cat([net.pre(collate_tok(samples[i:i + batch]))[1] for i in range(0, len(samples), batch)])
+        v0 = torch.cat([net.pre(take(torch.arange(i, min(i + batch, len(samples)))))[1] for i in range(0, len(samples), batch)])
         stats["ev"] = float(1.0 - (rets_n - v0).var() / rets_n.var().clamp_min(1e-9))
     for _ in range(epochs):
         perm = torch.randperm(len(samples), generator=gen)
         for i in range(0, len(samples), batch):
-            idx = perm[i:i + batch].tolist()
-            b = collate_tok([samples[j] for j in idx])
+            idx = perm[i:i + batch]
+            b = take(idx)
             pre, v = net.pre(b)
             d = net.dist(pre)
             lp = d.log_prob(acts[idx]).sum(-1)
             adv = rets_n[idx] - v.detach()
             adv = (adv - adv.mean()) / adv.std().clamp_min(1e-6)
-            ratio = (lp - old_lp[idx]).exp()
+            ratio = (lp - old_lp[idx]).clamp(-20.0, 20.0).exp()      # a stale sample cannot overflow the update
             pg = -torch.minimum(ratio * adv, ratio.clamp(1 - clip, 1 + clip) * adv).mean()
             with torch.no_grad():
                 stats["kl"] += float((old_lp[idx] - lp).mean())               # approx KL(old || new)
@@ -233,11 +266,16 @@ def ppo_update(net: PolicyNet, records: List[Dict], returns: Tensor, n_terms: in
             vl = ((v - rets_n[idx]) ** 2).mean()
             e = d.entropy().sum(-1).mean()
             loss = pg + vcoef * vl - ent * e
+            if not torch.isfinite(loss):
+                # a non-finite minibatch is skipped and counted, never stepped:
+                # one bad sample must not poison the weights
+                stats["nonfinite"] = stats.get("nonfinite", 0) + 1
+                continue
             opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(net.parameters(), 0.5); opt.step()
             stats["loss"] += pg.item(); stats["v_loss"] += vl.item(); stats["ent"] += e.item(); stats["nb"] += 1
     net.eval(); net.to(infer_dtype)
     nb = max(stats.pop("nb"), 1)
-    stats = {k: (v / nb if k != "n" else v) for k, v in stats.items()}      # per-minibatch means
+    stats = {k: (v / nb if k not in ("n", "nonfinite") else v) for k, v in stats.items()}   # per-minibatch means
     stats["sigma"] = float(net.std.mean())
     return stats
 

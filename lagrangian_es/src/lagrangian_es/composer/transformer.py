@@ -41,6 +41,12 @@ class Block(nn.Module):
         """`store`, if given, receives the head-averaged attention weights --
         what each query drew from each key -- for the decision explainer."""
         h = self.ln1(x)
+        # A padding mask that masks nothing still forces attention off the fast
+        # path; in a worker every row carries the same token count, so drop it.
+        if mask is not None and not bool(mask.any()):
+            mask = None
+        if mem_mask is not None and not bool(mem_mask.any()):
+            mem_mask = None
         a, w = self.attn(h, h, h, key_padding_mask=mask, attn_mask=attn_mask,
                          need_weights=store is not None, average_attn_weights=True)
         x = x + a
@@ -129,6 +135,7 @@ class ComposerNet(nn.Module):
 class TransformerComposer(Composer):
     """A `ComposerNet` behind the composer interface, with its own chain memory."""
     kind = "transformer"
+    live_only = True        # 1.68 s a call on 1152 rows; dead rows are not asked
 
     DTYPES = {"float64": torch.float64, "float32": torch.float32,
               "bfloat16": torch.bfloat16, "float16": torch.float16}
@@ -166,10 +173,12 @@ class TransformerComposer(Composer):
         self.tok.attach(sensors)
 
     def reset(self, B):
-        self._instr = []
+        self._instr = []; self._B = int(B); self._rows = None
 
     def tokens(self, ctx):
-        tok = self.tok(ctx, self._instr)
+        rows = getattr(self, "_rows", None)
+        instr = self._instr if rows is None else [(t, d[rows], w[rows]) for t, d, w in self._instr]
+        tok = self.tok(ctx, instr)
         return {k: (v.to(self.net_dtype) if torch.is_tensor(v) and v.is_floating_point() else v) for k, v in tok.items()}
 
     @torch.no_grad()
@@ -184,10 +193,26 @@ class TransformerComposer(Composer):
         sub_world = torch.cat([sub_world[:, :2], sub_world[:, 2:].clamp_min(self.z_min)], -1)
         dpsi, yg = (v.to(self.dtype) for v in self.net.last_yaw)
         spec = TaskSpec(delta=sub_world - goal, alpha=alpha, gate=gate, yaw=psi + dpsi, yaw_gate=yg)
-        self._instr.append((float(ctx.get("t", 0)), spec.delta.clone(), spec.weight.clone()))
+        self._remember(ctx, spec)
+        return spec
+
+    def _remember(self, ctx, spec):
+        """Append this instruction to the per-row memory.  When the rollout
+        asked only about live rows (`_rows` set), scatter into a full-batch
+        record so every row's history keeps its own shape."""
+        rows = getattr(self, "_rows", None)
+        if rows is None:
+            d, w = spec.delta.clone(), spec.weight.clone()
+        else:
+            if self._instr:
+                _, d, w = self._instr[-1]; d, w = d.clone(), w.clone()
+            else:
+                d = torch.zeros(self._B, spec.delta.shape[-1], dtype=spec.delta.dtype, device=spec.delta.device)
+                w = torch.ones(self._B, spec.weight.shape[-1], dtype=spec.weight.dtype, device=spec.weight.device)
+            d[rows] = spec.delta; w[rows] = spec.weight
+        self._instr.append((float(ctx.get("t", 0)), d, w))
         if len(self._instr) > 4 * self.tok.kc:
             self._instr = self._instr[-2 * self.tok.kc:]
-        return spec
 
 
 COMPOSERS["transformer"] = TransformerComposer

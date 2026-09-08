@@ -48,7 +48,7 @@ def test_sensor_conformance(sysname, name):
 
     v = sen.valid(s)
     assert v.shape == (6, sen.obs_dim) and v.dtype == torch.bool
-    assert sen.kind in ("position_like", "velocity_like", "range")
+    assert sen.kind in ("position_like", "velocity_like", "range", "attitude_like")
     assert sen.latency_steps >= 0
 
 

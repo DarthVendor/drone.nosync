@@ -76,9 +76,13 @@ LOADERS = {
     # condition is asserted in tests/test_citymap.py rather than assumed.
     # every waypoint behind a wall from every other: the one skill the city
     # measurement singled out (91% lost when occluded, 24% with line of sight)
-    "occluded": lambda: city_to_environment(MAPS / "occluded.json", name="occluded"),
+    # cull_k: exact iff it covers every block whose surface lies within a ray's
+    # reach.  Measured over 4096 free positions at 6 m: at most 7 blocks on the
+    # city, 3 on the occluded map, so 12 is exact with margin on both, and the
+    # slab test runs 2-3x fewer times per ray than it did at 24 and 40.
+    "occluded": lambda: city_to_environment(MAPS / "occluded.json", name="occluded", cull_k=12),
     "singapore_cbd": lambda: city_to_environment(MAPS / "singapore_cbd.json",
-                                                 cull_k=24,
+                                                 cull_k=12,
                                                  name="singapore_cbd"),
 }
 

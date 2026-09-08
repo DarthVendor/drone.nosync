@@ -35,6 +35,9 @@ _RIG = None          # per-worker Rollout, built once by the initializer
 
 
 def _init(spec: dict) -> None:
+    # `threads`: a composer in the loop is matmul-bound, and four single-
+    # threaded workers leave the efficiency cores idle
+    torch.set_num_threads(int(spec.get("threads", 1)))
     global _RIG
     torch.set_num_threads(1)          # workers must not fight each other for cores
     from .es import build, build_sensors
@@ -86,6 +89,10 @@ def _work(payload):
         # and two shards never draw the same noise
         comp.stochastic = bool(stochastic); comp.records = []
         torch.manual_seed(int(seed) * 1_000 + int(shard))
+        # record only the rows that will be kept, from the first decision on
+        B_rows = TH.shape[0] * goals.shape[0]
+        comp.record_rows = (torch.arange(0, B_rows, max(1, int(round(1.0 / record_frac))))
+                            if (stochastic and record_frac > 0) else None)
     r = _RIG.run(TH, goals, seed)
     base = (r.fitness, r.cost, r.alive, r.leg_err, r.final_err, r.success,
             r.legs_done, r.finish_frac, r.saturation, r.effort, r.shaping, r.n_eps)
@@ -96,14 +103,22 @@ def _work(payload):
     # composer's update needs far fewer flights than the GA's ranking does.
     B = r.cost.shape[0]
     every = max(1, int(round(1.0 / record_frac)))
-    rows = torch.arange(0, B, every)
-    recs = [{"t": rc["t"], "act": rc["act"][rows].float(), "alive": rc["alive"][rows],
-             "tok": {k: (v[rows].float() if torch.is_tensor(v) and v.is_floating_point()
-                         else (v[rows] if torch.is_tensor(v) else v)) for k, v in rc["tok"].items()}}
-            for rc in comp.records]
-    chain = [{k: (v[rows] if torch.is_tensor(v) else v) for k, v in tok.items()} for tok in _RIG.chain]
+    sel = torch.arange(0, B, every)                       # full-batch rows kept for the update
+    pos_of = torch.full((B,), -1, dtype=torch.long); pos_of[sel] = torch.arange(sel.numel())
+    recs = []
+    for rc in comp.records:
+        # a record holds only the rows that were flying at that decision;
+        # keep those among `sel`, and address them by POSITION within `sel`,
+        # which is how the returns over the kept rows are indexed
+        r = rc.get("rows", torch.arange(rc["act"].shape[0]))
+        keep = pos_of[r] >= 0
+        recs.append({"t": rc["t"], "act": rc["act"][keep].float(), "alive": rc["alive"][keep],
+                     "rows": pos_of[r[keep]],
+                     "tok": {k: (v[keep].float() if torch.is_tensor(v) and v.is_floating_point()
+                                 else (v[keep] if torch.is_tensor(v) else v)) for k, v in rc["tok"].items()}})
+    chain = [{k: (v[sel] if torch.is_tensor(v) else v) for k, v in tok.items()} for tok in _RIG.chain]
     comp.records = []
-    return base + ({"records": recs, "chain": chain, "rows": rows},)
+    return base + ({"records": recs, "chain": chain, "rows": sel},)
 
 
 def _work_local(rig, payload):
@@ -175,8 +190,17 @@ class ParallelRollout:
     """
 
     def __init__(self, spec: dict, workers: Optional[int] = None,
-                 min_pop: int = 32):
-        self.spec = spec
+                 min_pop: int = 32, threads: Optional[int] = None):
+        self.spec = dict(spec)
+        if threads is None:
+            # With a composer in the loop each worker is matmul-bound (the
+            # transformer at every decision), so two threads per worker use the
+            # efficiency cores the four single-threaded workers left idle.  A
+            # pure ES run is physics-bound and keeps the one thread its
+            # worker count was tuned for.
+            cfg = spec.get("cfg")
+            threads = 2 if (cfg is not None and getattr(cfg, "composer", "")) else 1
+        self.spec["threads"] = int(threads)
         self.workers = int(workers or default_workers())
         self.min_pop = int(min_pop)
         self._pool: Optional[ProcessPoolExecutor] = None

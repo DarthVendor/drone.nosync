@@ -142,9 +142,10 @@ def test_policy_learns_from_the_rollout_cost_alone():
     roll = Rollout(sysm, tr, task, cfg.rollout, build_sensors(cfg, sysm), composer=comp)
     comp.stochastic = True
     roll.run(tr.init()[None], task.sample(6, make_gen(21)), 22)
-    assert len(comp.records) == 120 // 10 and all("cost" in m for m in roll.chain)
+    # one record per interval while anyone is flying; none once everyone has died
+    assert 1 <= len(comp.records) <= 120 // 10 and all("cost" in m for m in roll.chain)
     R = returns_from_stream(comp.records, roll.chain, gamma=0.99)
-    assert R.shape == (12, 6) and torch.isfinite(R).all()
+    assert R.shape == (len(comp.records), 6) and torch.isfinite(R).all()
     before = torch.cat([p.detach().flatten().clone() for p in comp.net.parameters()])
     st = ppo_update(comp.net, comp.records, R, comp.n_terms, epochs=1, batch=64)
     after = torch.cat([p.detach().flatten() for p in comp.net.parameters()])
@@ -234,6 +235,90 @@ def test_records_come_back_from_the_workers_and_the_ranking_is_unchanged():
     for sh in shards:
         assert sh["records"] and sh["chain"] and sh["rows"].numel() == 4 * 2 // 2
         r0 = sh["records"][0]
-        assert r0["act"].shape[0] == sh["rows"].numel() and r0["tok"]["self"].dtype == torch.float32
+        assert r0["act"].shape[0] <= sh["rows"].numel() and r0["tok"]["self"].dtype == torch.float32
+        assert int(r0["rows"].max()) < sh["rows"].numel(), "record rows are positions within the kept rows"
         assert all("cost" in m for m in sh["chain"])
     rows = torch.cat([sh["rows"] for sh in shards]); assert rows.max() < P * 4 and rows.unique().numel() == rows.numel()
+
+
+def test_dropping_a_no_op_padding_mask_changes_nothing():
+    import torch
+    from lagrangian_es.composer import PolicyNet
+    net = PolicyNet(1).float().eval(); B, F = 8, 8
+    with torch.no_grad():                       # the identity prior's heads ignore every token; perturb them
+        for p_ in net.parameters(): p_.add_(0.05 * torch.randn_like(p_))
+    tok = {"self": torch.randn(B, F), "goal": torch.randn(B, F), "entities": torch.randn(B, 20, F), "ent_types": torch.full((B, 20), 2),
+           "ent_mask": torch.ones(B, 20, dtype=torch.bool), "chain": torch.randn(B, 6, F), "chain_types": torch.randint(4, 6, (B, 6)), "psi": torch.zeros(B)}
+    with torch.no_grad():
+        a = net.pre(tok)[0]
+        tok2 = dict(tok); tok2["ent_mask"] = torch.ones(B, 20, dtype=torch.bool)
+        b = net.pre(tok2)[0]
+    assert torch.allclose(a, b, atol=1e-6)
+    tok3 = dict(tok); tok3["ent_mask"] = tok["ent_mask"].clone(); tok3["ent_mask"][:, -5:] = False
+    with torch.no_grad(): c = net.pre(tok3)[0]
+    assert not torch.allclose(a, c), "a real mask must still mask"
+
+
+def test_a_nonfinite_minibatch_is_skipped_not_stepped():
+    import torch
+    from lagrangian_es.composer import PolicyNet, ppo_update
+    net = PolicyNet(1).float(); B, F = 16, 8
+    tok = {"self": torch.randn(B, F), "goal": torch.randn(B, F), "entities": torch.randn(B, 4, F), "ent_types": torch.full((B, 4), 2),
+           "ent_mask": torch.ones(B, 4, dtype=torch.bool), "chain": torch.zeros(B, 0, F), "chain_types": torch.zeros(B, 0, dtype=torch.long), "psi": torch.zeros(B)}
+    with torch.no_grad(): pre, _ = net.pre(tok)
+    act = pre.clone(); act[0, 0] = float("nan")                 # one poisoned action
+    recs = [{"t": 0.0, "act": act, "alive": torch.ones(B, dtype=torch.bool), "rows": torch.arange(B), "tok": tok}]
+    before = torch.cat([p.detach().flatten().clone() for p in net.parameters()])
+    st = ppo_update(net, recs, torch.randn(1, B, dtype=torch.float64), 1, epochs=1, batch=B, lr=1e-3)
+    after = torch.cat([p.detach().flatten() for p in net.parameters()])
+    # the poisoned sample is dropped and counted; the healthy ones still train, finitely
+    assert st.get("nonfinite", 0) == 1 and st["n"] == B - 1
+    assert torch.isfinite(after).all() and not torch.equal(before, after)
+
+
+def test_workers_default_to_two_threads_only_with_a_composer():
+    from lagrangian_es.parallel import ParallelRollout
+    from dataclasses import replace
+    assert ParallelRollout({"cfg": _cfg()}).spec["threads"] == 2                      # _cfg names the transformer
+    assert ParallelRollout({"cfg": replace(_cfg(), composer="")}).spec["threads"] == 1
+
+
+def test_update_accepts_ragged_per_shard_groups():
+    import torch
+    from lagrangian_es.composer import PolicyNet, ppo_update
+    net = PolicyNet(1).float(); F = 8
+    def rec(B, n_ent, t):
+        tok = {"self": torch.randn(B, F), "goal": torch.randn(B, F), "entities": torch.randn(B, n_ent, F), "ent_types": torch.full((B, n_ent), 2),
+               "ent_mask": torch.ones(B, n_ent, dtype=torch.bool), "chain": torch.zeros(B, 0, F), "chain_types": torch.zeros(B, 0, dtype=torch.long), "psi": torch.zeros(B)}
+        with torch.no_grad(): pre, _ = net.pre(tok)
+        return {"t": t, "act": pre, "alive": torch.ones(B, dtype=torch.bool), "rows": torch.arange(B), "tok": tok}
+    g1 = [rec(6, 0, 0.0), rec(6, 74, 10.0)]; g2 = [rec(4, 74, 0.0)]           # a blind first record, and two shards
+    st = ppo_update(net, [g1, g2], [torch.randn(2, 6, dtype=torch.float64), torch.randn(1, 4, dtype=torch.float64)], 1, epochs=1, batch=8)
+    assert st["n"] == 16 and abs(st["loss"]) < 1e6
+
+
+def test_the_first_decision_is_not_blind():
+    from dataclasses import replace
+    from lagrangian_es.config import RolloutCfg
+    from lagrangian_es.es import build_sensors
+    from lagrangian_es.rollout import Rollout
+    cfg = replace(_cfg(), composer="policy", composer_kw=(("reach", 10.0), ("every", 10), ("measure_every", 10)),
+                  rollout=RolloutCfg(n_eps=3, ep_steps=30, dead_mode="constant", dead_cost=6.0, goal_bonus=15.0))
+    sysm, tr, task = build(cfg); comp = build_composer(cfg, sysm, tr); comp.stochastic = True
+    Rollout(sysm, tr, task, cfg.rollout, build_sensors(cfg, sysm), composer=comp).run(tr.init()[None], task.sample(3, make_gen(2)), 3)
+    first = comp.records[0]["tok"]
+    assert first["entities"].shape[1] == 24 + 50, "the first decision must see beams and pixels"
+
+
+def test_recording_can_be_restricted_to_chosen_rows():
+    from dataclasses import replace
+    from lagrangian_es.config import RolloutCfg
+    from lagrangian_es.es import build_sensors
+    from lagrangian_es.rollout import Rollout
+    cfg = replace(_cfg(), composer="policy", composer_kw=(("reach", 10.0), ("every", 10), ("measure_every", 10)),
+                  rollout=RolloutCfg(n_eps=8, ep_steps=40, dead_mode="constant", dead_cost=6.0, goal_bonus=15.0))
+    sysm, tr, task = build(cfg); comp = build_composer(cfg, sysm, tr); comp.stochastic = True
+    comp.record_rows = torch.tensor([0, 4])
+    Rollout(sysm, tr, task, cfg.rollout, build_sensors(cfg, sysm), composer=comp).run(tr.init()[None], task.sample(8, make_gen(2)), 3)
+    for r in comp.records:
+        assert set(r["rows"].tolist()) <= {0, 4} and r["act"].shape[0] == r["rows"].numel() == r["tok"]["self"].shape[0]

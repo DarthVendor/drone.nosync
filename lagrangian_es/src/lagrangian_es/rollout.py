@@ -356,6 +356,44 @@ class Rollout:
                         sysm.device, omega_n=omega,
                         reach=float(getattr(comp, "reach", 10.0)))
 
+    def _emit_live(self, comp, s, goal, alive, arrived, leg, t, hold):
+        """Ask the composer only about rows still flying.
+
+        A dead or arrived row's state is frozen: its observations are never
+        read again and its decisions change nothing in the cost.  At worker
+        scale the composer cost 1.68 s per call on 1152 rows, 180 calls an
+        episode-batch, on every row to the last step -- with 70% of them dead
+        for most of it.  Rows not flying keep the target they had.
+        """
+        live = alive & ~arrived
+        n_live = int(live.sum())
+        B = alive.shape[0]
+        if n_live == B or not getattr(comp, "live_only", True):
+            return comp.emit(self._context(s, goal, self._last_obs, alive, arrived, leg, t))
+        if n_live == 0:
+            return hold.target
+        idx = live.nonzero().flatten()
+        sub = {k: (v[idx] if torch.is_tensor(v) and v.ndim and v.shape[0] == B else v) for k, v in s.items()}
+        obs = {k: (v[idx] if torch.is_tensor(v) and v.ndim and v.shape[0] == B else v) for k, v in self._last_obs.items()}
+        chain = [{k: (v[idx] if torch.is_tensor(v) and v.ndim and v.shape[0] == B else v) for k, v in tok.items()}
+                 for tok in self.chain]
+        ctx = {"x": self.system.task_position(sub), "v": self.system.task_velocity(sub), "goal": goal[idx],
+               "alive": alive[idx], "arrived": arrived[idx], "leg": leg[idx], "t": t, "state": sub, "chain": chain}
+        if obs:
+            ctx["obs"] = obs
+        comp._rows = idx                              # so the composer's own per-row memory can scatter
+        part = comp.emit(ctx)
+        comp._rows = None
+        full = hold.target.clone()
+        full.delta[idx] = part.delta; full.alpha[idx] = part.alpha; full.gate[idx] = part.gate
+        if part.yaw is not None:
+            if full.yaw is None:
+                full.yaw = torch.zeros(B, dtype=part.yaw.dtype, device=part.yaw.device)
+                full.yaw_gate = torch.zeros(B, dtype=part.yaw.dtype, device=part.yaw.device)
+            full.yaw[idx] = part.yaw
+            full.yaw_gate[idx] = part.yaw_gate if part.yaw_gate is not None else 1.0
+        return full
+
     def _context(self, s, goal, obs, alive, arrived, leg, t):
         """What the composer sees once an interval: the raw pieces.  Ego-centric
         framing is the composer's own job."""
@@ -465,6 +503,10 @@ class Rollout:
                 else task.goal_at(goals_b, t, T)
             spec = None
             if comp is not None:
+                # observe BEFORE asking: the composer's decision at this step is
+                # made on this step's beams and pixels, never on none at all
+                # (the first decision of every episode used to be blind)
+                self._last_obs = self._observe(s, sgen, t, ~arrived)
                 # the drone's measurement stream: a token every `m_every` steps,
                 # about the instruction in force since the last token
                 if t and t % m_every == 0:
@@ -480,8 +522,7 @@ class Rollout:
                     x_int = sysm.task_position(s)
                     beam_min = None
                 if t % every == 0:
-                    hold.set_target(comp.emit(self._context(
-                        s, goal, self._last_obs, alive, arrived, leg, t)))
+                    hold.set_target(self._emit_live(comp, s, goal, alive, arrived, leg, t, hold))
                 spec = hold.step()
             # Episodes whose sensors cannot see anything new, because their
             # state is frozen and will not change again.
@@ -495,7 +536,9 @@ class Rollout:
             # episode is frozen holding a perfectly ordinary state, so its
             # cached reading is exactly the reading a re-march would produce.
             awake = ~arrived          # `live` below is a COST, not a mask
-            obs = self._observe(s, sgen, t, awake)
+            # with a composer the observation for this step was taken above;
+            # taking it twice would advance the sensor buffers twice
+            obs = self._last_obs if comp is not None else self._observe(s, sgen, t, awake)
             self._last_obs = obs
             if comp is not None and obs:
                 rng = next((v for k, v in obs.items() if k.startswith("range")), None)

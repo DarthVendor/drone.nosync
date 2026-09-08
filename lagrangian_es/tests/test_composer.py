@@ -215,3 +215,19 @@ def test_sensors_no_term_reads_follow_the_composers_cadence():
     after = {s.name: int(getattr(s, "update_every", 1)) for s in sens}
     assert after["range"] == before["range"], "the low level reads the fan; its stride is not the composer's to change"
     assert after["depth_camera"] == 10, after
+
+
+def test_live_only_emit_is_identical_when_everyone_is_flying_and_dead_rows_keep_their_target():
+    """Skipping dead rows is exact: a batch with everyone alive is byte-identical,
+    and once rows die the survivors' decisions are unchanged by their absence."""
+    from dataclasses import replace
+    from lagrangian_es.config import RolloutCfg
+    cfg = replace(_cfg("policy"), composer_kw=(("reach", 10.0), ("every", 10), ("measure_every", 10)),
+                  rollout=RolloutCfg(n_eps=8, ep_steps=200, dead_mode="constant", dead_cost=6.0, goal_bonus=15.0))
+    sysm, tr, task = build(cfg)
+    goals = task.sample(8, make_gen(31)); th = tr.init()[None]
+    comp_a = build_composer(cfg, sysm, tr); comp_b = build_composer(cfg, sysm, tr)
+    comp_b.net.load_state_dict(comp_a.net.state_dict()); comp_b.live_only = False
+    ra = Rollout(sysm, tr, task, cfg.rollout, build_sensors(cfg, sysm), composer=comp_a).run(th, goals, 32)
+    rb = Rollout(sysm, tr, task, cfg.rollout, build_sensors(cfg, sysm), composer=comp_b).run(th, goals, 32)
+    assert torch.equal(ra.fitness, rb.fitness) and torch.equal(ra.cost, rb.cost), "live-only emit changed the cost"

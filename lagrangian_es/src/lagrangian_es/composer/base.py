@@ -19,6 +19,9 @@ class Composer:
     """Interface.  `emit` sees the context dict the rollout assembles once per
     interval and returns a target `TaskSpec` for every episode in the batch."""
     kind = "composer"
+    # the rollout may ask only about rows still flying; cheap composers (the
+    # identity, the oracle, the recorder) take the whole batch every time
+    live_only = False
 
     def __init__(self, system, trainable, **kw):
         self.system, self.trainable = system, trainable

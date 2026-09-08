@@ -52,3 +52,20 @@ def test_the_task_samples_legs_on_this_map():
     g = task.sample(8, make_gen(1))
     assert g.shape == (8, 2, 3)
     assert not torch.equal(g[:, 0], g[:, 1])
+
+
+def test_the_cull_covers_every_block_within_reach():
+    """Exact iff cull_k >= the blocks whose surface lies within a ray's reach,
+    checked over many free positions on both maps at the fan's 6 m."""
+    for env in ("singapore_cbd", "occluded"):
+        cfg = Config(system="quadrotor_nav", trainable="nav_agent", task="city_tour", environment=env, sensors=("range",),
+                     gating="arrival", seed=0, task_kw=(("n_legs", 2), ("max_leg", 0.0)), system_kw=(("free_start", True),),
+                     trainable_kw=(("learned", True), ("damp_mode", "beams")))
+        sysm, tr, task = build(cfg); s = sysm.reset(1024, make_gen(11)); grp = sysm.env.groups[0]
+        c, h, a = s["boxes/c"][0], s["boxes/h"][0], s["boxes/a"][0]; p = s["p"]
+        d = p[:, None, :2] - c[None]; ca, sa = torch.cos(a), torch.sin(a)
+        lx = d[..., 0] * ca + d[..., 1] * sa; ly = -d[..., 0] * sa + d[..., 1] * ca
+        qx = lx.abs() - h[None, :, 0]; qy = ly.abs() - h[None, :, 1]
+        surf = torch.sqrt(qx.clamp_min(0) ** 2 + qy.clamp_min(0) ** 2) + torch.maximum(qx, qy).clamp_max(0)
+        within = int((surf <= 6.0).sum(1).max())
+        assert within <= grp.cull_k, (env, within, grp.cull_k)
