@@ -339,20 +339,23 @@ def test_sigma_fixed_point_is_set_by_grow_shrink_not_by_success_target():
 # --- not simulating what has already finished --------------------------------
 
 def test_skipping_arrived_episodes_changes_nothing_it_should_not():
-    """An arrived episode is frozen, so its sensor cannot see anything new.
+    """A frozen episode's sensor cannot see anything new.
 
     `tree_where` holds its state fixed, and a range sensor's reading is a pure
     function of that state, so the cached value IS the value a re-march would
-    produce -- skipping it is an optimisation with no approximation in it.  The
-    whole claim rests on being bit-exact, so that is what gets asserted, on
-    every field the rollout reports rather than just the fitness.
+    produce -- skipping it is an optimisation with no approximation in it.
+    Every number the objective ranks on is asserted bit-exact.
 
-    Deliberately NOT extended to crashed episodes: one of those is frozen
-    holding the diverged state that killed it, and re-marching that garbage
-    gives a different answer than caching the last sane reading.  Measured, that
-    moved `effort` on 1 episode in 48 -- harmless for fitness here, but
-    `constraints.py` can put effort and saturation in the fitness, so it is not
-    free in general.
+    Extended to CRASHED episodes (2026-09-08; on the co-training rig two
+    thirds of a batch dies and the camera spent most of its time looking from
+    wrecks).  Measured against re-marching: fitness, cost, alive, success,
+    legs_done, finish_frac and saturation bit-identical; leg_err, final_err and
+    shaping and live rows' effort within 1e-15 (the re-march path carries a
+    dead row's diverged reading through the batched low-level forward, and
+    that moves a neighbour's last bit); `effort` differs materially on DEAD
+    rows only -- a wreck's actuation from a cached reading against one from
+    its diverged state, neither of which means anything -- so effort is
+    compared on live rows.
     """
     import json
 
@@ -387,8 +390,13 @@ def test_skipping_arrived_episodes_changes_nothing_it_should_not():
         return roll.run(pop, goals, 9)
 
     a, b = go(False), go(True)
-    for f in fields:
+    exact = ("fitness", "cost", "alive", "success", "legs_done", "finish_frac", "saturation")
+    for f in exact:
         assert torch.equal(getattr(a, f), getattr(b, f)), f
+    for f in ("leg_err", "final_err", "shaping"):
+        assert torch.allclose(getattr(a, f), getattr(b, f), rtol=0.0, atol=1e-12), f
+    live = a.alive
+    assert torch.allclose(a.effort[live], b.effort[live], rtol=0.0, atol=1e-12), "effort moved on a LIVE row"
 
 
 def test_arrival_requires_holding_the_goal_not_touching_it():

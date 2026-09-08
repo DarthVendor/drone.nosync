@@ -322,3 +322,79 @@ def test_recording_can_be_restricted_to_chosen_rows():
     Rollout(sysm, tr, task, cfg.rollout, build_sensors(cfg, sysm), composer=comp).run(tr.init()[None], task.sample(8, make_gen(2)), 3)
     for r in comp.records:
         assert set(r["rows"].tolist()) <= {0, 4} and r["act"].shape[0] == r["rows"].numel() == r["tok"]["self"].shape[0]
+
+
+def test_workers_reload_the_composer_when_its_weights_change(tmp_path):
+    """A persistent pool must not fly a stale composer: rewriting the weights
+    file must change the next batch's decisions in every worker."""
+    from dataclasses import replace
+    from lagrangian_es.config import RolloutCfg
+    from lagrangian_es.parallel import ParallelRollout
+    w = tmp_path / "c.pt"
+    cfg0 = replace(_cfg(), composer="policy", composer_kw=(("reach", 10.0), ("every", 10), ("measure_every", 10)),
+                   rollout=RolloutCfg(n_eps=3, ep_steps=40, dead_mode="constant", dead_cost=6.0, goal_bonus=15.0))
+    sysm, tr, task = build(cfg0); comp = build_composer(cfg0, sysm, tr); torch.save(comp.net.state_dict(), w)
+    cfg = replace(cfg0, composer_kw=cfg0.composer_kw + (("weights", str(w)),))
+    TH = tr.init().expand(2, -1).clone(); goals = task.sample(3, make_gen(5))
+    par = ParallelRollout({"cfg": cfg}, workers=2, min_pop=2)
+    try:
+        a, sa = par.run_with_records(TH, goals, 6, stochastic=False, record_frac=1.0)
+        with torch.no_grad():
+            for p_ in comp.net.parameters(): p_.add_(0.3 * torch.randn_like(p_))
+        import time; time.sleep(0.02); torch.save(comp.net.state_dict(), w)
+        b, sb = par.run_with_records(TH, goals, 6, stochastic=False, record_frac=1.0)
+    finally:
+        par.close()
+    assert not torch.allclose(a.cost, b.cost), "the workers flew the stale composer"
+
+
+def test_the_update_stops_once_it_has_moved_far_enough():
+    """With a large learning rate the policy leaves the batch's neighbourhood
+    quickly; the early-stop must end the epochs rather than keep stepping."""
+    import torch
+    from lagrangian_es.composer import PolicyNet, ppo_update
+    torch.manual_seed(0)
+    net = PolicyNet(1).float(); B, F = 64, 8
+    tok = {"self": torch.randn(B, F), "goal": torch.randn(B, F), "entities": torch.randn(B, 8, F), "ent_types": torch.full((B, 8), 2),
+           "ent_mask": torch.ones(B, 8, dtype=torch.bool), "chain": torch.zeros(B, 0, F), "chain_types": torch.zeros(B, 0, dtype=torch.long), "psi": torch.zeros(B)}
+    with torch.no_grad(): pre, _ = net.pre(tok)
+    recs = [{"t": 0.0, "act": pre + 0.05 * torch.randn_like(pre), "alive": torch.ones(B, dtype=torch.bool), "rows": torch.arange(B), "tok": tok}]
+    R = torch.randn(1, B, dtype=torch.float64)
+    st = ppo_update(net, recs, R, 1, epochs=30, batch=16, lr=5e-3, vcoef=0.0, ent=0.0, target_kl=0.02)
+    assert st["epochs"] < 30, "the early-stop never fired"
+    # the step is sized in policy space: a rate that overshoots is halved until
+    # the whole batch sits inside the trust region, and the rate that fit comes back
+    assert st["backtracks"] >= 1 and st["lr"] < 5e-3, st
+    assert st["kl"] <= 2.0 * 0.02, st
+    st2 = ppo_update(PolicyNet(1).float(), recs, R, 1, epochs=3, batch=16, lr=1e-5, vcoef=0.0, ent=0.0, target_kl=0.02)
+    assert st2["epochs"] == 3 and st2["backtracks"] == 0 and st2["lr"] == 1e-5, "a tiny step must run all its epochs"
+
+
+def test_the_fused_attention_path_matches_the_module_path():
+    """The worker path (fused kernel, last-query chain block) must give the
+    explainer path's numbers (the module's own forward, all queries): the two
+    differ only in what they compute, never in what they return."""
+    import torch
+    from lagrangian_es.composer import PolicyNet
+    torch.manual_seed(1)
+    B, F, n = 5, 8, 3
+    net = PolicyNet(n).float().eval()
+    tok = {"self": torch.randn(B, F), "goal": torch.randn(B, F), "entities": torch.randn(B, 12, F),
+           "ent_types": torch.randint(2, 4, (B, 12)), "ent_mask": torch.rand(B, 12) < 0.8,
+           "chain": torch.randn(B, 7, F), "chain_types": torch.randint(4, 6, (B, 7)), "psi": torch.zeros(B)}
+    tok["ent_mask"][:, :3] = True                                  # no row fully masked
+    with torch.no_grad():
+        fast, vf = net.pre(tok); slow, vs = net.pre(tok, store={})
+    assert torch.allclose(fast, slow, atol=1e-5), (fast - slow).abs().max()
+    assert torch.allclose(vf, vs, atol=1e-5)
+    # the block itself, both attention kinds, with a padding mask and a causal mask
+    from lagrangian_es.composer.transformer import Block
+    blk = Block(16, 4, cross=True).eval()
+    x = torch.randn(B, 9, 16); mem = torch.randn(B, 6, 16)
+    pad = torch.rand(B, 9) < 0.3; pad[:, 0] = False
+    mpad = torch.rand(B, 6) < 0.3; mpad[:, 0] = False
+    causal = torch.triu(torch.ones(9, 9, dtype=torch.bool), 1)
+    with torch.no_grad():
+        for kw in ({"mask": pad}, {"attn_mask": causal}, {"mask": pad, "mem": mem, "mem_mask": mpad}, {"attn_mask": causal, "last": True}):
+            a = blk(x, **kw); b = blk(x, store={}, **kw)
+            assert a.shape == b.shape and torch.allclose(a, b, atol=1e-5), (kw.keys(), (a - b).abs().max())

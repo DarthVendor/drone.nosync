@@ -39,10 +39,14 @@ class Recorder(Composer):
         self.samples: List[Dict[str, Tensor]] = []
 
     def reset(self, B):
-        self.teacher.reset(B); self._instr = []
+        self.teacher.reset(B); self._instr = []; self._B = int(B); self._rows = None
 
     def emit(self, ctx):
-        tok = self.tok(ctx, self._instr)
+        # asked about a subset of rows (`_rows`, as decisions are events):
+        # the memory is kept at full width and read for those rows
+        rows = getattr(self, "_rows", None)
+        instr = self._instr if rows is None else [(t, d[rows], w[rows]) for t, d, w in self._instr]
+        tok = self.tok(ctx, instr)
         spec = self.teacher.emit(ctx)
         sub_world = ctx["goal"] + spec.delta
         sub_ego = to_ego(sub_world - ctx["x"], tok["psi"]) / self.reach
@@ -53,7 +57,16 @@ class Recorder(Composer):
             self.samples.append({k: (v[b].clone() if torch.is_tensor(v) else v) for k, v in tok.items()}
                                 | {"y_sub": sub_ego[b].clone(), "y_alpha": spec.alpha[b].clone(),
                                    "y_gate": spec.gate[b].clone()})
-        self._instr.append((float(ctx.get("t", 0)), spec.delta.clone(), spec.weight.clone()))
+        d, w = spec.delta.clone(), spec.weight.clone()
+        if rows is not None:
+            B = int(getattr(self, "_B", 0)) or int(rows.shape[0])
+            if self._instr:
+                _, d0, w0 = self._instr[-1]; d0, w0 = d0.clone(), w0.clone()
+            else:
+                d0 = torch.zeros(B, d.shape[-1], dtype=d.dtype, device=d.device)
+                w0 = torch.ones(B, w.shape[-1], dtype=w.dtype, device=w.device)
+            d0[rows] = d; w0[rows] = w; d, w = d0, w0
+        self._instr.append((float(ctx.get("t", 0)), d, w))
         return spec
 
 

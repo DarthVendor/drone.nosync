@@ -231,3 +231,97 @@ def test_live_only_emit_is_identical_when_everyone_is_flying_and_dead_rows_keep_
     ra = Rollout(sysm, tr, task, cfg.rollout, build_sensors(cfg, sysm), composer=comp_a).run(th, goals, 32)
     rb = Rollout(sysm, tr, task, cfg.rollout, build_sensors(cfg, sysm), composer=comp_b).run(th, goals, 32)
     assert torch.equal(ra.fitness, rb.fitness) and torch.equal(ra.cost, rb.cost), "live-only emit changed the cost"
+
+
+def test_the_low_level_is_scored_on_the_placed_subgoal():
+    """`cost_sub` charges the distance to the subgoal the composer PLACED, with
+    the same bonus and death charge.  Without a composer, or under the
+    identity, it is the task cost to the bit; under a composer that places
+    the subgoal short of the goal, the low level's charge is to that nearer
+    point while the task's charge is unchanged."""
+    from lagrangian_es.composer import Composer, TaskSpec
+    a = _cfg(); b = _cfg("fixed")
+    sysm, tr, task = build(a)
+    th = tr.init()[None]; goals = task.sample(6, make_gen(1))
+    bare = Rollout(sysm, tr, task, a.rollout, build_sensors(a, sysm)).run(th, goals, 7)
+    assert bare.cost_sub is not None and torch.equal(bare.cost_sub, bare.cost)
+    assert torch.equal(bare.fitness_sub, bare.fitness)
+    ident = Rollout(sysm, tr, task, b.rollout, build_sensors(b, sysm), composer=build_composer(b, sysm, tr)).run(th, goals, 7)
+    assert torch.equal(ident.cost_sub, ident.cost), "the identity places the goal itself"
+
+    class Halfway(Composer):
+        kind = "halfway"
+        def emit(self, ctx):
+            sp = TaskSpec.identity(ctx["x"].shape[0], self.d, self.n_terms, ctx["x"].dtype, ctx["x"].device)
+            sp.delta = 0.5 * (ctx["x"] - ctx["goal"])      # the subgoal: halfway from the drone to the goal
+            return sp
+    half = Rollout(sysm, tr, task, b.rollout, build_sensors(b, sysm), composer=Halfway(sysm, tr)).run(th, goals, 7)
+    assert half.cost_sub.shape == half.cost.shape and torch.isfinite(half.cost_sub).all()
+    # the placed point is nearer than the goal at every step flown, and the
+    # death charge and bonus are the same, so the low level's charge is the
+    # smaller one on every row; the task's charge does not care where the
+    # composer pointed
+    assert bool((half.cost_sub < half.cost).all()), (half.cost_sub, half.cost)
+    assert half.fitness_sub.shape == half.fitness.shape == (1,)
+    assert float(half.fitness_sub) < float(half.fitness)
+
+
+def test_decisions_are_events_not_ticks():
+    """A row is asked again when its placed subgoal is achieved, when its leg
+    changes, or when the hold runs out -- never merely because a tick passed.
+    With a hold longer than the episode and the identity composer (subgoal =
+    goal), the count per row is one decision at the start plus one per leg
+    reached, and the report stream still runs every `measure_every` steps."""
+    from lagrangian_es.composer import Composer, TaskSpec
+    b = _cfg("fixed"); sysm, tr, task = build(b)
+    th = tr.init()[None]; goals = task.sample(6, make_gen(1))
+    comp = build_composer(b, sysm, tr); comp.every = 10_000; comp.measure_every = 10
+    roll = Rollout(sysm, tr, task, b.rollout, build_sensors(b, sysm), composer=comp)
+    r = roll.run(th, goals, 7)
+    n = roll.n_subgoals
+    assert n.shape == (6,) and bool((n >= 1).all())
+    assert bool((n <= 1 + r.legs_done).all()), (n, r.legs_done)
+    assert len(roll.chain) == b.rollout.ep_steps // 10 - 1 + (0 if b.rollout.ep_steps % 10 else 0) or len(roll.chain) >= 1
+    # a hold that runs out re-asks: with a 20-step hold every row is asked at
+    # least every 20 steps while it flies
+    comp.every = 20
+    roll.run(th, goals, 7)
+    assert bool((roll.n_subgoals >= n).all())
+
+    class HereOrGoal(Composer):
+        """Even rows get the subgoal where they are (achieved at once); odd
+        rows get the goal itself (nothing more to be told)."""
+        kind = "here_or_goal"; live_only = True
+        def __init__(self, system, trainable, **kw):
+            super().__init__(system, trainable, **kw); self.calls = []
+        def emit(self, ctx):
+            self.calls.append(int(ctx["x"].shape[0]))
+            B = ctx["x"].shape[0]
+            sp = TaskSpec.identity(B, self.d, self.n_terms, ctx["x"].dtype, ctx["x"].device)
+            rows = getattr(self, "_rows", None)
+            ids = torch.arange(B) if rows is None else rows
+            here = (ids % 2 == 0).unsqueeze(-1)
+            sp.delta = torch.where(here, ctx["x"] - ctx["goal"], torch.zeros_like(ctx["x"]))
+            return sp
+    hg = HereOrGoal(sysm, tr); hg.every = 10_000; hg.measure_every = 10
+    roll2 = Rollout(sysm, tr, task, b.rollout, build_sensors(b, sysm), composer=hg)
+    r2 = roll2.run(th, goals, 7)
+    n2 = roll2.n_subgoals
+    # the rows whose subgoal is achieved are asked again, and only they are
+    # asked; the rows told to go to the goal are never asked again
+    assert hg.calls[0] == 6 and len(hg.calls) > 1 and all(c <= 3 for c in hg.calls[1:]), hg.calls
+    assert bool((n2[1::2] == 1).all()), n2
+    assert int(n2[0::2].max()) > 1, n2
+
+
+def test_the_composer_pays_per_subgoal():
+    from lagrangian_es.composer import returns_from_stream
+    B = 4
+    chain = [{"t": 10.0, "cost": torch.tensor([1.0, 1.0, 1.0, 1.0])}, {"t": 20.0, "cost": torch.tensor([3.0, 3.0, 3.0, 3.0])}]
+    recs = [{"t": 0.0, "act": torch.zeros(B, 2), "alive": torch.ones(B, dtype=torch.bool), "rows": torch.arange(B)},
+            {"t": 10.0, "act": torch.zeros(2, 2), "alive": torch.ones(2, dtype=torch.bool), "rows": torch.tensor([0, 2])}]
+    R0 = returns_from_stream(recs, chain, 1.0)
+    R1 = returns_from_stream(recs, chain, 1.0, subgoal_cost=2.0)
+    # every row paid for its first subgoal; rows 0 and 2 paid for a second
+    assert torch.allclose(R1[0] - R0[0], torch.tensor([-4.0, -2.0, -4.0, -2.0])), R1[0] - R0[0]
+    assert torch.allclose(R1[1] - R0[1], torch.tensor([-2.0, 0.0, -2.0, 0.0]))

@@ -55,8 +55,9 @@ class PolicyNet(ComposerNet):
             ch = self.embed(tok["chain"]) + te(tok["chain_types"])
             L = ch.shape[1]
             causal = torch.triu(torch.ones(L, L, dtype=torch.bool, device=ch.device), 1)
-            for blk in self.chain:
-                ch = blk(ch, attn_mask=causal, store=None if store is None else store.setdefault("chain", {}))
+            for i, blk in enumerate(self.chain):
+                ch = blk(ch, attn_mask=causal, store=None if store is None else store.setdefault("chain", {}),
+                         last=i == len(self.chain) - 1)
             mem = torch.cat([mem, ch[:, -1:]], 1)
             mmask = torch.cat([mmask, torch.zeros(B, 1, dtype=torch.bool, device=ch.device)], 1)
         q = torch.cat([self.pool.expand(B, -1, -1), self.constraint.expand(B, -1, -1)], 1)
@@ -103,8 +104,11 @@ class PolicyComposer(TransformerComposer):
         n = max(self.n_terms, 1)
         self.net = PolicyNet(n, d=kw.get("d", 64), heads=kw.get("heads", 4)).to(self.net_dtype)
         self.net.goal_gain = self.tok.scale / self.reach
+        self.weights_path = kw.get("weights", "")
         if kw.get("weights"):
+            import os
             self.net.load_state_dict(torch.load(kw["weights"], map_location="cpu"))
+            self._weights_mtime = os.path.getmtime(kw["weights"])
         self.net.eval()
         self.stochastic = False
         self.records: List[Dict] = []          # per decision: tokens (per episode), action, t
@@ -158,12 +162,15 @@ class PolicyComposer(TransformerComposer):
         return spec
 
 
-def returns_from_stream(records: List[Dict], chain: List[Dict], gamma: float) -> Tensor:
+def returns_from_stream(records: List[Dict], chain: List[Dict], gamma: float,
+                        subgoal_cost: float = 0.0) -> Tensor:
     """Per decision and FULL-BATCH row, the discounted sum of the cost
     increments the stream reported after it -- negated, so lower cost is higher
     return.  Records may cover only the rows that were alive at that decision
     (`rows`); the return is computed for every row and the update picks its
-    own rows out."""
+    own rows out.  `subgoal_cost` is charged to a row for every decision it
+    was given (every subgoal placed for it), so the composer is asked to
+    reach the goal with the fewest."""
     ts = [r["t"] for r in records]
     cost_at = {m["t"]: m["cost"] for m in chain}
     times = sorted(cost_at)
@@ -180,6 +187,10 @@ def returns_from_stream(records: List[Dict], chain: List[Dict], gamma: float) ->
         c0 = cost_at_or_before(ts[k])
         c1 = cost_at_or_before(ts[k + 1]) if k + 1 < len(records) else last
         r = -(c1 - c0)
+        if subgoal_cost:
+            rows = records[k].get("rows")
+            r = r - subgoal_cost if rows is None else \
+                r.index_add(0, rows.to(torch.long), torch.full((rows.numel(),), -subgoal_cost, dtype=r.dtype))
         G = r + gamma * G
         R[k] = G
     return R
@@ -187,8 +198,20 @@ def returns_from_stream(records: List[Dict], chain: List[Dict], gamma: float) ->
 
 def ppo_update(net: PolicyNet, records: List[Dict], returns: Tensor, n_terms: int,
                epochs: int = 4, batch: int = 512, lr: float = 3e-4, clip: float = 0.2,
-               vcoef: float = 0.5, ent: float = 1e-3, gen=None) -> Dict[str, float]:
-    """Fit the recorded stream: clipped surrogate, value regression, entropy."""
+               vcoef: float = 0.5, ent: float = 1e-3, gen=None,
+               target_kl: float = 0.02, backtracks: int = 8) -> Dict[str, float]:
+    """Fit the recorded stream: clipped surrogate, value regression, entropy.
+
+    The step is sized in POLICY space.  After the epochs the exact KL from the
+    collecting policy is measured over the whole batch; if it is beyond the
+    trust region the weights go back to where they started and the step is
+    halved, up to `backtracks` times (a failed attempt is cheap: the early-stop
+    ends it within a minibatch or two).  Measured need: at sigma 0.05 a single
+    Adam step at lr 2e-4 moved the policy by KL 0.13-0.5 (the update's first
+    step moves every parameter by the full rate, and the zero-initialised
+    heads make the network more sensitive to that as they grow), and seven
+    such iterations took the judged reach from 0.25 to 0.  The returned `lr`
+    is the rate that fit, for the caller to start from next time."""
     gen = gen or torch.Generator().manual_seed(0)
     # the update runs in float32 whatever the inference dtype: half gradients underflow
     infer_dtype = next(net.parameters()).dtype
@@ -224,12 +247,24 @@ def ppo_update(net: PolicyNet, records: List[Dict], returns: Tensor, n_terms: in
     def take(idx):
         return {k: (v[idx] if torch.is_tensor(v) else v) for k, v in ALL.items()}
     with torch.no_grad():
-        old_lp = []
-        for i in range(0, len(samples), batch):
-            b = take(torch.arange(i, min(i + batch, len(samples))))
-            pre, _ = net.pre(b)
-            old_lp.append(net.dist(pre).log_prob(acts[i:i + batch]).sum(-1))
-        old_lp = torch.cat(old_lp)
+        old_pre = torch.cat([net.pre(take(torch.arange(i, min(i + batch, len(samples)))))[0]
+                             for i in range(0, len(samples), batch)])
+        old_std = net.std.detach().clone()
+        old_lp = torch.distributions.Normal(old_pre, old_std).log_prob(acts).sum(-1)
+
+    def kl_to_old(idx, pre):
+        # the exact KL(old || new) of the diagonal Gaussians, not a sampled estimate
+        return torch.distributions.kl_divergence(torch.distributions.Normal(old_pre[idx], old_std),
+                                                 net.dist(pre)).sum(-1).mean()
+
+    def batch_kl():
+        with torch.no_grad():
+            tot = 0.0
+            for i in range(0, len(samples), batch):
+                idx = torch.arange(i, min(i + batch, len(samples)))
+                tot += float(kl_to_old(idx, net.pre(take(idx))[0])) * len(idx)
+            return tot / len(samples)
+
     # The exploration scale gets its own learning rate.  Adam moves a
     # parameter by about `lr` per step whatever the gradient, so at the
     # network's rate `log_std` could change by at most ~0.7% an iteration and
@@ -238,45 +273,69 @@ def ppo_update(net: PolicyNet, records: List[Dict], returns: Tensor, n_terms: in
     # still keeps it from vanishing.
     head = [p for n, p in net.named_parameters() if n == "log_std"]
     body = [p for n, p in net.named_parameters() if n != "log_std"]
-    opt = torch.optim.Adam([{"params": body, "lr": lr}, {"params": head, "lr": 10 * lr}])
     net.train()
-    stats = {"n": len(samples), "loss": 0.0, "v_loss": 0.0, "ent": 0.0, "nb": 0,
-             "kl": 0.0, "clipfrac": 0.0, "nonfinite": dropped}
+    stats = {"n": len(samples), "nonfinite": dropped, "backtracks": 0}
     # value-head fit BEFORE the update: how much of the return the composer's
     # situation explains.  Near zero means the return is not varying with what
     # the composer sees and does, and no update can find a gradient in it.
     with torch.no_grad():
         v0 = torch.cat([net.pre(take(torch.arange(i, min(i + batch, len(samples)))))[1] for i in range(0, len(samples), batch)])
         stats["ev"] = float(1.0 - (rets_n - v0).var() / rets_n.var().clamp_min(1e-9))
-    for _ in range(epochs):
-        perm = torch.randperm(len(samples), generator=gen)
-        for i in range(0, len(samples), batch):
-            idx = perm[i:i + batch]
-            b = take(idx)
-            pre, v = net.pre(b)
-            d = net.dist(pre)
-            lp = d.log_prob(acts[idx]).sum(-1)
-            adv = rets_n[idx] - v.detach()
-            adv = (adv - adv.mean()) / adv.std().clamp_min(1e-6)
-            ratio = (lp - old_lp[idx]).clamp(-20.0, 20.0).exp()      # a stale sample cannot overflow the update
-            pg = -torch.minimum(ratio * adv, ratio.clamp(1 - clip, 1 + clip) * adv).mean()
-            with torch.no_grad():
-                stats["kl"] += float((old_lp[idx] - lp).mean())               # approx KL(old || new)
-                stats["clipfrac"] += float(((ratio - 1).abs() > clip).to(ratio.dtype).mean())
-            vl = ((v - rets_n[idx]) ** 2).mean()
-            e = d.entropy().sum(-1).mean()
-            loss = pg + vcoef * vl - ent * e
-            if not torch.isfinite(loss):
-                # a non-finite minibatch is skipped and counted, never stepped:
-                # one bad sample must not poison the weights
-                stats["nonfinite"] = stats.get("nonfinite", 0) + 1
-                continue
-            opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(net.parameters(), 0.5); opt.step()
-            stats["loss"] += pg.item(); stats["v_loss"] += vl.item(); stats["ent"] += e.item(); stats["nb"] += 1
+    start = {k: v.detach().clone() for k, v in net.state_dict().items()}
+    lr_used = lr
+    for attempt in range(backtracks + 1):
+        opt = torch.optim.Adam([{"params": body, "lr": lr_used}, {"params": head, "lr": 10 * lr_used}])
+        acc = {"loss": 0.0, "v_loss": 0.0, "ent": 0.0, "clipfrac": 0.0, "nb": 0, "epochs": 0}
+        stop = False
+        for _ in range(epochs):
+            if stop:
+                break
+            acc["epochs"] += 1
+            perm = torch.randperm(len(samples), generator=gen)
+            for i in range(0, len(samples), batch):
+                idx = perm[i:i + batch]
+                b = take(idx)
+                pre, v = net.pre(b)
+                d = net.dist(pre)
+                lp = d.log_prob(acts[idx]).sum(-1)
+                adv = rets_n[idx] - v.detach()
+                adv = (adv - adv.mean()) / adv.std().clamp_min(1e-6)
+                ratio = (lp - old_lp[idx]).clamp(-20.0, 20.0).exp()      # a stale sample cannot overflow the update
+                pg = -torch.minimum(ratio * adv, ratio.clamp(1 - clip, 1 + clip) * adv).mean()
+                with torch.no_grad():
+                    acc["clipfrac"] += float(((ratio - 1).abs() > clip).to(ratio.dtype).mean())
+                    # A STEP-SIZE limit, like the clip and the sigma floor, not
+                    # a loss factor: once the policy has moved `target_kl` from
+                    # where the batch was collected, further steps are steps on
+                    # stale samples.
+                    if target_kl and float(kl_to_old(idx, pre)) > target_kl:
+                        stop = True
+                vl = ((v - rets_n[idx]) ** 2).mean()
+                e = d.entropy().sum(-1).mean()
+                loss = pg + vcoef * vl - ent * e
+                if not torch.isfinite(loss):
+                    # a non-finite minibatch is skipped and counted, never stepped:
+                    # one bad sample must not poison the weights
+                    stats["nonfinite"] = stats.get("nonfinite", 0) + 1
+                    continue
+                if stop:
+                    break
+                opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(net.parameters(), 0.5); opt.step()
+                acc["loss"] += pg.item(); acc["v_loss"] += vl.item(); acc["ent"] += e.item(); acc["nb"] += 1
+        kl = batch_kl()
+        # The early-stop above lands the batch AT the target, give or take a
+        # minibatch; a step too large to be sized by stopping lands well past
+        # it (measured: 6-25x).  Only the latter is backtracked.
+        if not target_kl or kl <= 2.0 * target_kl or attempt == backtracks:
+            break
+        # beyond what the samples can vouch for: back to the start, half the step
+        net.load_state_dict(start); lr_used *= 0.5; stats["backtracks"] += 1
     net.eval(); net.to(infer_dtype)
-    nb = max(stats.pop("nb"), 1)
-    stats = {k: (v / nb if k not in ("n", "nonfinite") else v) for k, v in stats.items()}   # per-minibatch means
-    stats["sigma"] = float(net.std.mean())
+    nb = max(acc.pop("nb"), 1)
+    stats.update({k: (v / nb if k != "epochs" else v) for k, v in acc.items()})   # per-minibatch means
+    stats["kl"] = kl                                     # exact, whole batch, after the step
+    stats["lr"] = lr_used
+    stats["sigma"] = float(net.std.mean().detach())
     return stats
 
 

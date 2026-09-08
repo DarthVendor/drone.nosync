@@ -24,14 +24,51 @@ import subprocess
 import sys
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from typing import Optional
 
+import numpy as np
 import torch
 from torch import Tensor
 
 from .rollout import Rollout, RolloutResult
 
 _RIG = None          # per-worker Rollout, built once by the initializer
+
+
+def _ipc(x):
+    """Convert tensors to plain ndarray payloads before crossing a process pipe.
+
+    PyTorch's multiprocessing reducer sends CPU tensors through shared-memory
+    storage and may start `torch_shm_manager`.  The co-training record stream is
+    many small tensors, so plain pickle copies are more predictable and avoid
+    taking the whole pool down when the manager cannot be spawned.
+    """
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    if isinstance(x, dict):
+        return {k: _ipc(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_ipc(v) for v in x]
+    if isinstance(x, tuple):
+        return tuple(_ipc(v) for v in x)
+    return x
+
+
+def _tensor(x):
+    return torch.as_tensor(x) if isinstance(x, np.ndarray) else x
+
+
+def _from_ipc(x):
+    if isinstance(x, np.ndarray):
+        return torch.as_tensor(x)
+    if isinstance(x, dict):
+        return {k: _from_ipc(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_from_ipc(v) for v in x]
+    if isinstance(x, tuple):
+        return tuple(_from_ipc(v) for v in x)
+    return x
 
 
 def _init(spec: dict) -> None:
@@ -81,10 +118,17 @@ def _init(spec: dict) -> None:
 
 def _work(payload):
     TH, goals, seed = payload[:3]
+    TH, goals = _tensor(TH), _tensor(goals)
     stochastic, record_frac, shard = (payload[3:] + (False, 0.0, 0))[:3] if len(payload) > 3 \
         else (False, 0.0, 0)
     comp = getattr(_RIG, "composer", None)
     if comp is not None and hasattr(comp, "stochastic"):
+        # Reload the composer's weights if the file changed since this worker
+        # last read it.  The pool is forked ONCE, before the parent does any
+        # multithreaded work: re-forking each iteration from a parent with a
+        # live thread pool is how a worker "terminates abruptly" on the second
+        # iteration, every time.
+        _maybe_reload(comp)
         # exploration noise is seeded per shard, so a batch is reproducible
         # and two shards never draw the same noise
         comp.stochastic = bool(stochastic); comp.records = []
@@ -95,9 +139,10 @@ def _work(payload):
                             if (stochastic and record_frac > 0) else None)
     r = _RIG.run(TH, goals, seed)
     base = (r.fitness, r.cost, r.alive, r.leg_err, r.final_err, r.success,
-            r.legs_done, r.finish_frac, r.saturation, r.effort, r.shaping, r.n_eps)
+            r.legs_done, r.finish_frac, r.saturation, r.effort, r.shaping, r.n_eps,
+            r.cost_sub, r.fitness_sub)
     if comp is None or record_frac <= 0 or not getattr(comp, "records", None):
-        return base + (None,)
+        return _ipc(base + (None,))
     # Slim the composer's records to a fraction of rows, in float32: the
     # tokens are the bulk of what crosses the process boundary, and the
     # composer's update needs far fewer flights than the GA's ranking does.
@@ -118,7 +163,23 @@ def _work(payload):
                                  else (v[keep] if torch.is_tensor(v) else v)) for k, v in rc["tok"].items()}})
     chain = [{k: (v[sel] if torch.is_tensor(v) else v) for k, v in tok.items()} for tok in _RIG.chain]
     comp.records = []
-    return base + ({"records": recs, "chain": chain, "rows": sel},)
+    n_sub = getattr(_RIG, "n_subgoals", None)
+    return _ipc(base + ({"records": recs, "chain": chain, "rows": sel,
+                         "n_sub": None if n_sub is None else float(n_sub.to(torch.float64).mean())},))
+
+
+def _maybe_reload(comp) -> bool:
+    """True if the composer's weights file changed and was reloaded."""
+    import os
+    path = getattr(comp, "weights_path", "")
+    if not path or not os.path.exists(path):
+        return False
+    m = os.path.getmtime(path)
+    if m == getattr(comp, "_weights_mtime", None):
+        return False
+    comp.net.load_state_dict(torch.load(path, map_location="cpu"))
+    comp.net.eval(); comp._weights_mtime = m
+    return True
 
 
 def _work_local(rig, payload):
@@ -132,11 +193,14 @@ def _work_local(rig, payload):
 
 
 def _merge(parts) -> RolloutResult:
-    cat = lambda i: torch.cat([p[i] for p in parts], dim=0)
+    parts = [_from_ipc(p) for p in parts]
+    cat = lambda i: torch.cat([_tensor(p[i]) for p in parts], dim=0)
+    opt = lambda i: None if any(p[i] is None for p in parts) else cat(i)
     return RolloutResult(
         fitness=cat(0), cost=cat(1), alive=cat(2), leg_err=cat(3),
         final_err=cat(4), success=cat(5), legs_done=cat(6), finish_frac=cat(7),
-        saturation=cat(8), effort=cat(9), shaping=cat(10), n_eps=parts[0][11])
+        saturation=cat(8), effort=cat(9), shaping=cat(10), n_eps=parts[0][11],
+        cost_sub=opt(12), fitness_sub=opt(13))
 
 
 def _records(parts, step: int, n_eps: int):
@@ -144,9 +208,10 @@ def _records(parts, step: int, n_eps: int):
     Shards can end at different intervals (early exit), so their decision
     lists are kept separate rather than concatenated."""
     out = []
+    parts = [_from_ipc(p) for p in parts]
     for i, p in enumerate(parts):
-        if len(p) > 12 and p[12] is not None:
-            rec = dict(p[12]); rec["rows"] = rec["rows"] + i * step * n_eps
+        if len(p) > 14 and p[14] is not None:
+            rec = dict(p[14]); rec["rows"] = rec["rows"] + i * step * n_eps
             out.append(rec)
     return out
 
@@ -230,15 +295,26 @@ class ParallelRollout:
             self._local = _RIG
         return self._local
 
+    def _pool_map(self, chunks):
+        try:
+            return list(self._pool_up().map(_work, chunks))
+        except BrokenProcessPool:
+            print("ParallelRollout: worker pool broke; rerunning this batch in-process",
+                  file=sys.stderr, flush=True)
+            self.close()
+            rig = self._local_rig()
+            return [_work_local(rig, c) for c in chunks]
+
     def run(self, TH: Tensor, goals: Tensor, seed: int) -> RolloutResult:
         P = TH.shape[0]
         if self.workers <= 1 or P < self.min_pop:
             return self._local_rig().run(TH, goals, seed)
         n = self._shards(P)
         step = P // n
-        chunks = [(TH[i * step:(i + 1) * step].contiguous(), goals, seed)
+        goals_ipc = _ipc(goals)
+        chunks = [(_ipc(TH[i * step:(i + 1) * step].contiguous()), goals_ipc, seed)
                   for i in range(n)]
-        return _merge(list(self._pool_up().map(_work, chunks)))
+        return _merge(self._pool_map(chunks))
 
     def run_with_records(self, TH: Tensor, goals: Tensor, seed: int,
                          stochastic: bool = True, record_frac: float = 0.125):
@@ -250,9 +326,10 @@ class ParallelRollout:
         P = TH.shape[0]
         n = self._shards(P) if (self.workers > 1 and P >= self.min_pop) else 1
         step = P // n
-        chunks = [(TH[i * step:(i + 1) * step].contiguous(), goals, seed, stochastic, record_frac, i)
+        goals_ipc = _ipc(goals)
+        chunks = [(_ipc(TH[i * step:(i + 1) * step].contiguous()), goals_ipc, seed, stochastic, record_frac, i)
                   for i in range(n)]
-        parts = list(self._pool_up().map(_work, chunks)) if n > 1 else [_work_local(self._local_rig(), chunks[0])]
+        parts = self._pool_map(chunks) if n > 1 else [_work_local(self._local_rig(), chunks[0])]
         return _merge(parts), _records(parts, step, goals.shape[0])
 
     def _shards(self, P: int) -> int:

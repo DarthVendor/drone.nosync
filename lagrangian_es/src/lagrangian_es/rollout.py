@@ -41,6 +41,13 @@ class RolloutResult:
     effort: Tensor              # [B]  mean counterforce in the M^-1 metric
     shaping: Tensor             # [B]  mean plant-specific regularizer
     n_eps: int
+    # The LOW LEVEL's objective when a composer is in the loop: the same cost
+    # with the distance term measured to the subgoal the composer PLACED (the
+    # hold's target) instead of to the task goal.  Without a composer both
+    # are the task cost.  The composer is judged on `cost`; a co-training run
+    # ranks genomes on `fitness_sub`, so each layer answers for its own job.
+    cost_sub: Tensor = None     # [B]
+    fitness_sub: Tensor = None  # [P]
 
     def per_genome(self, x: Tensor) -> Tensor:
         """Aggregate an episode-level [B] quantity to a per-genome [P] mean.
@@ -67,6 +74,8 @@ class RolloutResult:
             success=self.success[ep], legs_done=self.legs_done[ep],
             finish_frac=self.finish_frac[ep], saturation=self.saturation[ep],
             effort=self.effort[ep], shaping=self.shaping[ep], n_eps=E,
+            cost_sub=None if self.cost_sub is None else self.cost_sub[ep],
+            fitness_sub=None if self.fitness_sub is None else self.fitness_sub[sl],
         )
 
     @property
@@ -176,7 +185,9 @@ class Rollout:
             for t in getattr(trainable, "terms", ()):
                 n = getattr(t, "sensor_name", None)
                 read_by_terms.update(n if isinstance(n, (tuple, list)) else ([n] if n else []))
-            every = int(getattr(composer, "every", 1))
+            # a decision can fall on any report step, so the composer's own
+            # sensors are cast at the report cadence
+            every = int(getattr(composer, "measure_every", getattr(composer, "every", 1)))
             for sen in self.sensors:
                 if sen.name not in read_by_terms and every > int(getattr(sen, "update_every", 1)):
                     sen.update_every = every
@@ -356,19 +367,20 @@ class Rollout:
                         sysm.device, omega_n=omega,
                         reach=float(getattr(comp, "reach", 10.0)))
 
-    def _emit_live(self, comp, s, goal, alive, arrived, leg, t, hold):
-        """Ask the composer only about rows still flying.
+    def _emit_live(self, comp, s, goal, alive, arrived, leg, t, hold, rows=None):
+        """Ask the composer only about rows still flying -- or, with `rows`,
+        exactly the rows whose turn it is.
 
         A dead or arrived row's state is frozen: its observations are never
         read again and its decisions change nothing in the cost.  At worker
         scale the composer cost 1.68 s per call on 1152 rows, 180 calls an
         episode-batch, on every row to the last step -- with 70% of them dead
-        for most of it.  Rows not flying keep the target they had.
+        for most of it.  Rows not asked keep the target they had.
         """
-        live = alive & ~arrived
+        live = (alive & ~arrived) if rows is None else rows
         n_live = int(live.sum())
         B = alive.shape[0]
-        if n_live == B or not getattr(comp, "live_only", True):
+        if n_live == B or (rows is None and not getattr(comp, "live_only", True)):
             return comp.emit(self._context(s, goal, self._last_obs, alive, arrived, leg, t))
         if n_live == 0:
             return hold.target
@@ -394,6 +406,61 @@ class Rollout:
             full.yaw_gate[idx] = part.yaw_gate if part.yaw_gate is not None else 1.0
         return full
 
+    def _composer_start(self, s):
+        """The task layer's state for a batch: the hold, the drone's report
+        stream, and the event clock that decides when the composer is asked."""
+        comp, sysm = self.composer, self.system
+        x = sysm.task_position(s); B = x.shape[0]
+        every = int(getattr(comp, "every", 50))
+        comp.reset(B); self.chain = []
+        return {"every": every, "m_every": int(getattr(comp, "measure_every", every)),
+                "hold": self._hold_for(B), "x_int": x, "beam_min": None,
+                "t_last": torch.full((B,), -every, dtype=torch.long, device=x.device),
+                "n_sub": torch.zeros(B, dtype=torch.long, device=x.device), "leg_last": None,
+                "tol": float(getattr(self.task, "tol", 1.0))}
+
+    def _composer_step(self, cs, s, goal, alive, arrived, leg, t, cost):
+        """The task layer's turn at step `t`: the drone's report, then -- for
+        the rows whose turn it is -- a decision.  Returns the spec in force.
+
+        A decision is an EVENT, not a tick.  A row is asked again when the
+        subgoal placed for it has been achieved (within the task's arrival
+        tolerance, and the subgoal was not the goal itself -- a drone dwelling
+        on the goal has nothing left to be told), when its leg changed (the
+        placed offset is relative to the goal), or when the hold has run
+        `every` steps -- and only at a report step, so the composer decides on
+        a fresh report.  Every decision is one subgoal; `n_sub` counts them,
+        and a co-training run charges the composer per subgoal so it reaches
+        the goal with the fewest.  The report stream is unconditional: the
+        composer keeps watching between decisions.
+        """
+        comp, sysm, hold = self.composer, self.system, cs["hold"]
+        m_every, every = cs["m_every"], cs["every"]
+        x = sysm.task_position(s)
+        if t and t % m_every == 0:
+            tok = self._token(cs["x_int"], x, goal + hold.target.delta, cs["beam_min"], alive, arrived)
+            tok["t"] = float(t)
+            # the objective itself, so a learner above reads the same cost the
+            # low level was evolved on and nothing shaped
+            tok["cost"] = cost.clone()
+            self.chain.append(tok)
+            kc = int(getattr(comp, "k_chain", 64))
+            if len(self.chain) > 4 * kc:
+                self.chain = self.chain[-2 * kc:]
+            cs["x_int"] = x; cs["beam_min"] = None
+        if t % m_every == 0:
+            if cs["leg_last"] is None:
+                cs["leg_last"] = leg.clone()
+            live = alive & ~arrived
+            placed = hold.target.delta
+            achieved = ((x - (goal + placed)).norm(dim=-1) < cs["tol"]) & (placed.norm(dim=-1) > cs["tol"])
+            due = live & (achieved | (t - cs["t_last"] >= every) | (leg != cs["leg_last"]))
+            if bool(due.any()):
+                hold.set_target(self._emit_live(comp, s, goal, alive, arrived, leg, t, hold, rows=due), rows=due)
+                cs["t_last"] = torch.where(due, torch.full_like(cs["t_last"], t), cs["t_last"])
+                cs["n_sub"] += due.to(cs["n_sub"].dtype); cs["leg_last"] = leg.clone()
+        return hold.step()
+
     def _context(self, s, goal, obs, alive, arrived, leg, t):
         """What the composer sees once an interval: the raw pieces.  Ego-centric
         framing is the composer's own job."""
@@ -404,6 +471,17 @@ class Rollout:
         if obs:
             ctx["obs"] = obs
         return ctx
+
+    @staticmethod
+    def _to_go(goals_b: Tensor):
+        """[B, n_legs] path length still to fly AFTER the current leg's
+        waypoint, indexed by leg: the sum of the later legs (padded legs
+        repeat their predecessor and add nothing).  None for a single goal."""
+        if goals_b.ndim != 3 or goals_b.shape[1] < 2:
+            return None
+        seg = (goals_b[:, 1:] - goals_b[:, :-1]).norm(dim=-1)          # [B, n-1]: length of leg k >= 1
+        suffix = seg.flip(1).cumsum(1).flip(1)                           # [B, n-1]: legs j+1 .. last
+        return torch.cat([suffix, torch.zeros_like(suffix[:, :1])], 1)  # [B, n]: to go after leg j
 
     @staticmethod
     def _token(x0, x1, sub, beam_min, alive, arrived):
@@ -447,6 +525,7 @@ class Rollout:
         B = P * E
 
         cost = torch.zeros(B, dtype=sysm.dtype, device=sysm.device)
+        cost_sub = torch.zeros(B, dtype=sysm.dtype, device=sysm.device)   # to the placed subgoal
         sat = torch.zeros(B, dtype=sysm.dtype, device=sysm.device)
         eff_acc = torch.zeros(B, dtype=sysm.dtype, device=sysm.device)
         shp_acc = torch.zeros(B, dtype=sysm.dtype, device=sysm.device)
@@ -459,6 +538,15 @@ class Rollout:
         # each episode's final leg -- a constant for most tasks, per-episode for
         # a tour whose length varies
         last_idx = task.last_leg(goals_b)
+        # DISTANCE TO GO, not distance to the current waypoint.  Charging the
+        # distance to the active waypoint means finishing a leg RAISES the
+        # charge, from ~0 to the next leg's length, for every second left.  A
+        # learned composer found that spot exactly: it placed its subgoal
+        # 0.28 m short of the first waypoint (tolerance 0.25 m) and parked
+        # there for the rest of the episode -- 0.000 reach at the best cost
+        # of the run.  With the later legs' lengths added, the charge is
+        # continuous through an arrival and only flying the tour lowers it.
+        to_go_tab = self._to_go(goals_b) if arrival else None
         finish = torch.full((B,), float(T), dtype=sysm.dtype, device=sysm.device)
         # The final leg never advances `leg`, so its arrival test keeps firing for
         # every step the vehicle sits inside tol -- paying the bonus per step
@@ -490,14 +578,7 @@ class Rollout:
 
         comp = self.composer
         self._last_obs = {}
-        if comp is not None:
-            every = int(getattr(comp, "every", 50))
-            m_every = int(getattr(comp, "measure_every", every))
-            hold = self._hold_for(goals_b.shape[0])
-            comp.reset(goals_b.shape[0])
-            self.chain = []
-            x_int = sysm.task_position(s)
-            beam_min = None
+        cs = self._composer_start(s) if comp is not None else None
         for t in range(T):
             goal = task.goal_for_leg(goals_b, leg) if arrival \
                 else task.goal_at(goals_b, t, T)
@@ -506,36 +587,19 @@ class Rollout:
                 # observe BEFORE asking: the composer's decision at this step is
                 # made on this step's beams and pixels, never on none at all
                 # (the first decision of every episode used to be blind)
-                self._last_obs = self._observe(s, sgen, t, ~arrived)
-                # the drone's measurement stream: a token every `m_every` steps,
-                # about the instruction in force since the last token
-                if t and t % m_every == 0:
-                    tok = self._token(x_int, sysm.task_position(s), goal + hold.target.delta,
-                                      beam_min, alive, arrived)
-                    tok["t"] = float(t)
-                    # the objective itself, so a learner above reads the same
-                    # cost the low level was evolved on and nothing shaped
-                    tok["cost"] = cost.clone()
-                    self.chain.append(tok)
-                    if len(self.chain) > 4 * int(getattr(comp, "k_chain", 64)):
-                        self.chain = self.chain[-2 * int(getattr(comp, "k_chain", 64)):]
-                    x_int = sysm.task_position(s)
-                    beam_min = None
-                if t % every == 0:
-                    hold.set_target(self._emit_live(comp, s, goal, alive, arrived, leg, t, hold))
-                spec = hold.step()
+                self._last_obs = self._observe(s, sgen, t, alive & ~arrived)
+                spec = self._composer_step(cs, s, goal, alive, arrived, leg, t, cost)
             # Episodes whose sensors cannot see anything new, because their
-            # state is frozen and will not change again.
-            #
-            # ARRIVED only, deliberately -- not `alive & ~arrived`.  A crashed
-            # episode is frozen too, but it is frozen holding the DIVERGED state
-            # that killed it, and re-marching that garbage is what the old path
-            # did.  Caching it instead changes the reported `effort` and
-            # `saturation` for dead episodes, and `constraints.py` can put both
-            # in the fitness, so skipping them would not be free.  An arrived
-            # episode is frozen holding a perfectly ordinary state, so its
-            # cached reading is exactly the reading a re-march would produce.
-            awake = ~arrived          # `live` below is a COST, not a mask
+            # state is frozen and will not change again: arrived OR crashed.
+            # Both are frozen by the `tree_where` below, and a stateless sensor
+            # is a pure function of the state, so its cached reading is the
+            # reading a re-march would produce -- for a crashed episode as much
+            # as for an arrived one (the sensing tests hold every acceptance
+            # number bit-identical across this).  Crashed rows used to be
+            # re-marched out of caution about their diverged state; on the
+            # co-training rig, where two thirds of a training batch dies, that
+            # was most of the camera's time spent looking from a wreck.
+            awake = alive & ~arrived  # `live` below is a COST, not a mask
             # with a composer the observation for this step was taken above;
             # taking it twice would advance the sensor buffers twice
             obs = self._last_obs if comp is not None else self._observe(s, sgen, t, awake)
@@ -544,7 +608,7 @@ class Rollout:
                 rng = next((v for k, v in obs.items() if k.startswith("range")), None)
                 if rng is not None:
                     m = rng.reshape(rng.shape[0], -1).min(-1).values
-                    beam_min = m if beam_min is None else torch.minimum(beam_min, m)
+                    cs["beam_min"] = m if cs["beam_min"] is None else torch.minimum(cs["beam_min"], m)
             u = self._u(TH_b, s, goal, obs, spec)
             s_new = sysm.step(s, u, dt, res_b)
             # crashed vehicles freeze; never integrate a diverged state
@@ -553,6 +617,9 @@ class Rollout:
             err = sysm.task_position(s) - goal
             pos = task.position_cost(sysm.task_position(s), goal,
                                      cfg.pos_eps)
+            if to_go_tab is not None:
+                to_go = to_go_tab.gather(1, leg.clamp(0, to_go_tab.shape[1] - 1)[:, None]).squeeze(1)
+                pos = pos + to_go
             eff = sysm.effort(u, s)
             shp = sysm.shaping_cost(s)
             live = pos + cfg.lambda_e * eff + cfg.lambda_s * shp
@@ -568,6 +635,16 @@ class Rollout:
                 live = live + cfg.lambda_occ * (1.0 - sysm.visibility(s, goal))
             if res_b is not None:
                 live = live + cfg.lambda_r * sysm.residual_penalty(res_b)
+            if comp is not None:
+                # the low level's own objective: the same charge, with the
+                # distance measured to the subgoal the composer PLACED -- the
+                # hold's target, not the slewed spec the low level is tracking
+                # this step, and not the task goal.  Achieving what it was
+                # asked is its job; where to ask for is the composer's.
+                pos_sub = task.position_cost(sysm.task_position(s), goal + cs["hold"].target.delta, cfg.pos_eps)
+                if to_go_tab is not None:
+                    pos_sub = pos_sub + to_go
+                live_sub = live - pos + pos_sub
             # in-place: this runs under no_grad, and the accumulators were each
             # allocating a fresh [B] tensor on every one of 250 steps
             # A dead vehicle is frozen at its crash site, so under "frozen" it
@@ -576,11 +653,17 @@ class Rollout:
             charge = (pos if frozen_dead
                       else start_err if forfeit_dead else dead)
             step_cost = torch.where(alive, live, charge)
+            if comp is not None:
+                step_sub = torch.where(alive, live_sub, pos_sub if frozen_dead else charge)
             if stop_early:
                 # a finished episode stops accruing; it is done, not hovering
                 step_cost = torch.where(arrived, torch.zeros_like(step_cost),
                                         step_cost)
+                if comp is not None:
+                    step_sub = torch.where(arrived, torch.zeros_like(step_sub), step_sub)
             cost.add_(step_cost, alpha=dt)
+            if comp is not None:
+                cost_sub.add_(step_sub, alpha=dt)
             sat.add_(sysm.saturation(u, s))
             eff_acc.add_(eff)
             shp_acc.add_(shp)
@@ -641,6 +724,10 @@ class Rollout:
                 # episode -- so it changes cost by zero and only saves work.
                 enough = bool(arrived.to(sysm.dtype).mean() >= q) or \
                     bool((arrived | ~alive).all())
+            fin = float(getattr(cfg, "stop_finished", 0.0) or 0.0)
+            if stop_early and fin > 0.0 and not enough:
+                # the adaptive cap: most of the batch is over, arrived or dead
+                enough = bool((arrived | ~alive).to(sysm.dtype).mean() >= fin)
             if stop_early and enough:
                 # every episode has finished or died; the tail is all zeros for
                 # the finished ones, and a constant rate for the dead ones, so
@@ -649,10 +736,17 @@ class Rollout:
                 if not frozen_dead and not forfeit_dead:
                     cost.add_((~alive).to(sysm.dtype),
                               alpha=cfg.dead_cost * dt * (T - 1 - t))
+                    if comp is not None:
+                        cost_sub.add_((~alive).to(sysm.dtype),
+                                      alpha=cfg.dead_cost * dt * (T - 1 - t))
                 elif frozen_dead or forfeit_dead:
                     tail = start_err if forfeit_dead else pos
                     cost.add_(torch.where(alive, torch.zeros_like(tail), tail),
                               alpha=dt * (T - 1 - t))
+                    if comp is not None:
+                        tail = start_err if forfeit_dead else pos_sub
+                        cost_sub.add_(torch.where(alive, torch.zeros_like(tail), tail),
+                                      alpha=dt * (T - 1 - t))
                 if q < 1.0:
                     # Anything still flying is charged as if it hovered here for
                     # the rest of the episode.  This is the approximation the
@@ -663,8 +757,12 @@ class Rollout:
                     flying = alive & ~arrived
                     cost.add_(torch.where(flying, pos, torch.zeros_like(pos)),
                               alpha=dt * (T - 1 - t))
+                    if comp is not None:
+                        cost_sub.add_(torch.where(flying, pos_sub, torch.zeros_like(pos_sub)),
+                                      alpha=dt * (T - 1 - t))
                 break
 
+        self.n_subgoals = cs["n_sub"] if cs is not None else None   # decisions per row
         final_goal = task.goal_for_leg(goals_b, leg) if arrival \
             else task.goal_at(goals_b, T - 1, T)
         # Bonus is paid at the END, and only to survivors.  Crediting it on
@@ -674,11 +772,16 @@ class Rollout:
         # metric it is judged by reads exactly like a plateau.
         if cfg.goal_bonus:
             cost.sub_(credits * alive.to(sysm.dtype), alpha=cfg.goal_bonus)
+            if comp is not None:
+                cost_sub.sub_(credits * alive.to(sysm.dtype), alpha=cfg.goal_bonus)
         done = (finish < T) if arrival else task.success(s, final_goal)
         if arrival:
             leg_err[:, -1] = torch.linalg.vector_norm(
                 sysm.task_position(s) - final_goal, dim=-1)
+        if comp is None:
+            cost_sub = cost                                  # one objective: the task's
         fit = cost.view(P, E).mean(dim=1)
+        fit_sub = cost_sub.view(P, E).mean(dim=1)
         if cfg.lambda_crash:
             # Per-GENOME, not per-episode: the point is to price the rate, and a
             # rate is not a property of one episode.  Shrunk toward a prior so
@@ -687,9 +790,12 @@ class Rollout:
             a = cfg.crash_prior * cfg.crash_prior_n
             p_hat = (died + a) / (E + cfg.crash_prior_n)
             fit = fit + cfg.lambda_crash * torch.log(p_hat)
+            fit_sub = fit_sub + cfg.lambda_crash * torch.log(p_hat)
         return RolloutResult(
             fitness=fit,
             cost=cost,
+            cost_sub=cost_sub,
+            fitness_sub=fit_sub,
             alive=alive,
             leg_err=leg_err,
             final_err=torch.linalg.vector_norm(
@@ -723,22 +829,23 @@ class Rollout:
         states, gs, us, al, lg = [s], [], [], [], []
         comp = self.composer
         self._last_obs = {}
-        if comp is not None:
-            every = int(getattr(comp, "every", 50))
-            hold = self._hold_for(goals_b.shape[0]); comp.reset(goals_b.shape[0])
+        cs = self._composer_start(s) if comp is not None else None
+        never = torch.zeros_like(alive)                  # the trace does not freeze arrivals
+        no_cost = torch.zeros(goals_b.shape[0], dtype=sysm.dtype, device=sysm.device)
         specs = []
         for t in range(T):
             goal = task.goal_for_leg(goals_b, leg) if arrival \
                 else task.goal_at(goals_b, t, T)
             spec = None
-            if comp is not None:
-                if t % every == 0:
-                    hold.set_target(comp.emit(self._context(
-                        s, goal, self._last_obs, alive, torch.zeros_like(alive),
-                        leg, t)))
-                spec = hold.step()
-                specs.append(spec.delta.clone())
+            # the same order as `run`: observe, report, decide, act
             obs = self._observe(s, sgen, t); self._last_obs = obs
+            if comp is not None:
+                spec = self._composer_step(cs, s, goal, alive, never, leg, t, no_cost)
+                specs.append(spec.delta.clone())
+                rng = next((v for k, v in obs.items() if k.startswith("range")), None)
+                if rng is not None:
+                    m = rng.reshape(rng.shape[0], -1).min(-1).values
+                    cs["beam_min"] = m if cs["beam_min"] is None else torch.minimum(cs["beam_min"], m)
             u = self._u(TH_b, s, goal, obs, spec)
             s = tree_where(alive, sysm.step(s, u, dt, res_b), s)
             gs.append(goal)
@@ -752,6 +859,7 @@ class Rollout:
                 leg = torch.where(reached & (leg < task.n_legs - 1), leg + 1, leg)
             alive = alive & sysm.alive(s)
         self.last_specs = torch.stack(specs) if specs else None
+        self.n_subgoals = cs["n_sub"] if cs is not None else None
         return Trace(
             states=tree_stack(states),
             goals=torch.stack(gs),
