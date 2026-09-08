@@ -201,3 +201,17 @@ def test_workers_build_the_composer_the_config_names():
     assert isinstance(parallel._RIG.composer, FixedWeights)
     parallel._init({"cfg": _cfg()})
     assert parallel._RIG.composer is None
+
+
+def test_sensors_no_term_reads_follow_the_composers_cadence():
+    """The depth camera is read by the composer alone, so it is cast at the
+    composer's interval; the range fan the low level reads keeps its stride."""
+    from dataclasses import replace
+    cfg = replace(_cfg("fixed"), sensors=("range", "depth_camera"), composer="transformer",
+                  composer_kw=(("reach", 10.0), ("every", 10)))
+    sysm, tr, task = build(cfg); sens = build_sensors(cfg, sysm)
+    before = {s.name: int(getattr(s, "update_every", 1)) for s in sens}
+    Rollout(sysm, tr, task, cfg.rollout, sens, composer=build_composer(cfg, sysm, tr))
+    after = {s.name: int(getattr(s, "update_every", 1)) for s in sens}
+    assert after["range"] == before["range"], "the low level reads the fan; its stride is not the composer's to change"
+    assert after["depth_camera"] == 10, after

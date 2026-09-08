@@ -118,3 +118,36 @@ def test_the_command_works_in_the_learned_yaw_mode_too():
     u_g1 = tr.forward(th, s, goal, obs, spec=(zero, one, cmd, torch.ones(B, dtype=torch.float64)))
     assert torch.allclose(u_plain, u_g0, atol=1e-12)
     assert not torch.allclose(u_plain, u_g1)
+
+
+def test_reset_yaw_spreads_headings_over_the_circle():
+    from lagrangian_es.systems import make_system
+    sysm = make_system("quadrotor_nav", dtype=torch.float64, environment="pillars", reset_yaw=3.14159265)
+    s = sysm.reset(512, make_gen(9))
+    R = s["R"]
+    assert torch.allclose(R @ R.transpose(-1, -2), torch.eye(3, dtype=torch.float64).expand(512, 3, 3), atol=1e-9)
+    psi = torch.atan2(R[:, 1, 0], R[:, 0, 0])
+    hist = torch.histc(psi, bins=8, min=-3.1416, max=3.1416)
+    assert float(hist.min()) > 512 / 8 * 0.5, hist        # every octant populated
+    sysm0 = make_system("quadrotor_nav", dtype=torch.float64, environment="pillars")
+    psi0 = torch.atan2(sysm0.reset(64, make_gen(9))["R"][:, 1, 0], sysm0.reset(64, make_gen(9))["R"][:, 0, 0])
+    assert float(psi0.abs().max()) < 0.2, "the default keeps the old small attitude noise"
+
+
+def test_the_plants_lookat_prior_turns_the_nose_toward_the_goal():
+    """With the look-at slots at the plant's prior (1, 0, 0), a vehicle facing
+    away from its goal gets a yaw reference toward it; with them at zero it
+    held heading -- which, with a forward fan, was flying blind."""
+    cfg = Config(system="quadrotor_nav", trainable="nav_agent", task="waypoint_pair", environment="pillars",
+                 sensors=("range",), gating="arrival", seed=0, system_kw=(("yaw_mode", "learned"), ("reset_yaw", 3.14159265)),
+                 trainable_kw=(("learned", True), ("damp_mode", "beams")))
+    sysm, tr, task = build(cfg)
+    s = sysm.reset(16, make_gen(21)); goal = task.sample(16, make_gen(22))[:, 0]
+    obs = {"range": build_sensors(cfg, sysm)[0].observe(s, make_gen(23))}
+    th = tr.init(); assert torch.equal(th[-3:], torch.tensor([1.0, 0.0, 0.0], dtype=torch.float64))
+    th0 = th.clone(); th0[-3:] = 0.0
+    u_prior = tr.forward(th, s, goal, obs); u_zero = tr.forward(th0, s, goal, obs)
+    # the two differ only in the yaw reference; a prior that looks at the goal must change the command
+    assert not torch.allclose(u_prior, u_zero)
+    # and the change is a yaw torque, not a thrust change
+    assert torch.allclose(u_prior[:, 0], u_zero[:, 0], atol=1e-9)

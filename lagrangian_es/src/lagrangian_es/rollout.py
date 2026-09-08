@@ -165,6 +165,21 @@ class Rollout:
         self.chain: list = []          # measurement tokens, one entry per interval
         self._last_obs: dict = {}
         self.sensors: List[Sensor] = list(sensors or [])
+        if composer is not None:
+            # A sensor nobody reads more often than the composer does is cast
+            # at the composer's cadence.  Profiled on the v2 rig: the depth
+            # camera was 70% of an iteration, cast every step, read every ten
+            # -- by the composer only, since no term names it.  Refresh and
+            # decision share the same phase (`step % k == 0`), so the composer
+            # still sees a frame fresh up to the sensor's own latency.
+            read_by_terms = set()
+            for t in getattr(trainable, "terms", ()):
+                n = getattr(t, "sensor_name", None)
+                read_by_terms.update(n if isinstance(n, (tuple, list)) else ([n] if n else []))
+            every = int(getattr(composer, "every", 1))
+            for sen in self.sensors:
+                if sen.name not in read_by_terms and every > int(getattr(sen, "update_every", 1)):
+                    sen.update_every = every
         # Per-sensor delay, not one global lag: flow and IMU run at ~2 ms, ToF at
         # 5-20 ms, vision at 30-80 ms, and collapsing them loses the very
         # timescale separation the allocator/potential split depends on.

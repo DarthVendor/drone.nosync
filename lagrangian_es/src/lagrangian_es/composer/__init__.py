@@ -15,6 +15,7 @@ from .transformer import ComposerNet, TransformerComposer
 from .tokens import Tokenizer
 from .distill import Recorder, collate, fit
 from .policy import PolicyComposer, PolicyNet, ppo_update, returns_from_stream
+from .explain import Tracer, explain_decision
 
 __all__ = ["TaskSpec", "SpecHold", "ground_release", "stale_fallback",
-           "Composer", "FixedWeights", "make_composer", "OracleSubgoal", "ComposerNet", "TransformerComposer", "Tokenizer", "Recorder", "collate", "fit", "PolicyComposer", "PolicyNet", "ppo_update", "returns_from_stream"]
+           "Composer", "FixedWeights", "make_composer", "OracleSubgoal", "ComposerNet", "TransformerComposer", "Tokenizer", "Recorder", "collate", "fit", "PolicyComposer", "PolicyNet", "ppo_update", "returns_from_stream", "Tracer", "explain_decision"]

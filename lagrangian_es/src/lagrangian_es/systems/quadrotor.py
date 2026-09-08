@@ -50,6 +50,7 @@ class QuadrotorSE3(LagrangianSystem):
         reset_pos_noise: float = 0.05,
         reset_vel_noise: float = 0.05,
         reset_att_noise: float = 0.03,
+        reset_yaw: float = 0.0,
         reset_om_noise: float = 0.05,
         # --- liveness envelope
         z_floor: float = 0.05,
@@ -91,6 +92,9 @@ class QuadrotorSE3(LagrangianSystem):
         self.reset_pos_noise = float(reset_pos_noise)
         self.reset_vel_noise = float(reset_vel_noise)
         self.reset_att_noise = float(reset_att_noise)
+        # half-range of a uniform random heading at reset; pi = any heading.  With a
+        # forward-mounted fan, facing where you are going is a skill, not a given.
+        self.reset_yaw = float(reset_yaw)
         self.reset_om_noise = float(reset_om_noise)
 
         self.z_floor = float(z_floor)
@@ -118,6 +122,11 @@ class QuadrotorSE3(LagrangianSystem):
         v = self.reset_vel_noise * torch.randn(B, 3, **kw)
         om = self.reset_om_noise * torch.randn(B, 3, **kw)
         R = rodrigues(self.reset_att_noise * torch.randn(B, 3, **kw))
+        if self.reset_yaw > 0.0:
+            psi = (2.0 * torch.rand(B, generator=gen, dtype=self.dtype, device=self.device) - 1.0) * self.reset_yaw
+            c, sn, z, o = torch.cos(psi), torch.sin(psi), torch.zeros_like(psi), torch.ones_like(psi)
+            Rz = torch.stack([torch.stack([c, -sn, z], -1), torch.stack([sn, c, z], -1), torch.stack([z, z, o], -1)], -2)
+            R = Rz @ R
         return {"p": p, "v": v, "R": R, "om": om}
 
     def step(self, s: State, u: Tensor, dt: float, params: Tensor = None) -> State:

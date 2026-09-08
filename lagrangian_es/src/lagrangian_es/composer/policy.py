@@ -40,27 +40,28 @@ class PolicyNet(ComposerNet):
         # it is a parameter, and may grow if exploring further ever pays.
         self.log_std = nn.Parameter(torch.full((3 + 2 * n_terms + 2,), -3.0))   # + heading delta, heading gate
 
-    def pre(self, tok):
-        """Pre-activations of every head, and the value, from the read tokens."""
+    def pre(self, tok, store=None):
+        """Pre-activations of every head, and the value, from the read tokens.
+        `store` collects attention weights for the explainer."""
         B = tok["self"].shape[0]; te = self.type_emb
         scene = torch.cat([self.embed(tok["self"])[:, None] + te.weight[0],
                            self.embed(tok["goal"])[:, None] + te.weight[1],
                            self.embed(tok["entities"]) + te(tok["ent_types"])], 1)
         smask = torch.cat([torch.zeros(B, 2, dtype=torch.bool, device=scene.device), ~tok["ent_mask"]], 1)
         for blk in self.scene:
-            scene = blk(scene, mask=smask)
+            scene = blk(scene, mask=smask, store=None if store is None else store.setdefault("scene", {}))
         mem, mmask = scene, smask
         if tok["chain"].shape[1]:
             ch = self.embed(tok["chain"]) + te(tok["chain_types"])
             L = ch.shape[1]
             causal = torch.triu(torch.ones(L, L, dtype=torch.bool, device=ch.device), 1)
             for blk in self.chain:
-                ch = blk(ch, attn_mask=causal)
+                ch = blk(ch, attn_mask=causal, store=None if store is None else store.setdefault("chain", {}))
             mem = torch.cat([mem, ch[:, -1:]], 1)
             mmask = torch.cat([mmask, torch.zeros(B, 1, dtype=torch.bool, device=ch.device)], 1)
         q = torch.cat([self.pool.expand(B, -1, -1), self.constraint.expand(B, -1, -1)], 1)
         for blk in self.read:
-            q = blk(q, mem=mem, mem_mask=mmask)
+            q = blk(q, mem=mem, mem_mask=mmask, store=None if store is None else store.setdefault("read", {}))
         q = self.ln(q)
         h_sub = self.head_sub(q[:, 0]) + tok["goal"][:, :3] * self.goal_gain   # residual on the goal
         aw = self.head_w(q[:, 1:])                           # [B, n, 2]
@@ -100,7 +101,7 @@ class PolicyComposer(TransformerComposer):
         super().__init__(system, trainable, **kw)
         kw["weights"] = weights
         n = max(self.n_terms, 1)
-        self.net = PolicyNet(n, d=kw.get("d", 64), heads=kw.get("heads", 4)).to(system.dtype)
+        self.net = PolicyNet(n, d=kw.get("d", 64), heads=kw.get("heads", 4)).to(self.net_dtype)
         self.net.goal_gain = self.tok.scale / self.reach
         if kw.get("weights"):
             self.net.load_state_dict(torch.load(kw["weights"], map_location="cpu"))
@@ -130,7 +131,8 @@ class PolicyComposer(TransformerComposer):
         else:
             act = pre
         sub, alpha, gate, (dpsi, yg) = self.net.activate(act, max(self.n_terms, 1))
-        x, goal, psi = ctx["x"], ctx["goal"], tok["psi"]
+        sub, alpha, gate, dpsi, yg = (v.to(self.dtype) for v in (sub, alpha, gate, dpsi, yg))
+        x, goal, psi = ctx["x"], ctx["goal"], tok["psi"].to(self.dtype)
         sub_world = x + to_world(sub * self.reach, psi)
         sub_world = torch.cat([sub_world[:, :2], sub_world[:, 2:].clamp_min(self.z_min)], -1)
         spec = TaskSpec(delta=sub_world - goal, alpha=alpha[:, :self.n_terms], gate=gate[:, :self.n_terms],
@@ -174,15 +176,19 @@ def ppo_update(net: PolicyNet, records: List[Dict], returns: Tensor, n_terms: in
                vcoef: float = 0.5, ent: float = 1e-3, gen=None) -> Dict[str, float]:
     """Fit the recorded stream: clipped surrogate, value regression, entropy."""
     gen = gen or torch.Generator().manual_seed(0)
+    # the update runs in float32 whatever the inference dtype: half gradients underflow
+    infer_dtype = next(net.parameters()).dtype
+    net.float()
     samples, acts, rets = [], [], []
     for k, rec in enumerate(records):
         al = rec["alive"]
         for b in al.nonzero().flatten().tolist():
-            samples.append({kk: (v[b] if torch.is_tensor(v) else v) for kk, v in rec["tok"].items()})
+            samples.append({kk: (v[b].float() if torch.is_tensor(v) and v.is_floating_point() else (v[b] if torch.is_tensor(v) else v))
+                            for kk, v in rec["tok"].items()})
             acts.append(rec["act"][b]); rets.append(returns[k, b])
     if not samples:
         return {"n": 0}
-    acts = torch.stack(acts); rets = torch.stack(rets)
+    acts = torch.stack(acts).float(); rets = torch.stack(rets).float()
     rets_n = (rets - rets.mean()) / rets.std().clamp_min(1e-6)
     with torch.no_grad():
         old_lp = []
@@ -229,7 +235,7 @@ def ppo_update(net: PolicyNet, records: List[Dict], returns: Tensor, n_terms: in
             loss = pg + vcoef * vl - ent * e
             opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(net.parameters(), 0.5); opt.step()
             stats["loss"] += pg.item(); stats["v_loss"] += vl.item(); stats["ent"] += e.item(); stats["nb"] += 1
-    net.eval()
+    net.eval(); net.to(infer_dtype)
     nb = max(stats.pop("nb"), 1)
     stats = {k: (v / nb if k != "n" else v) for k, v in stats.items()}      # per-minibatch means
     stats["sigma"] = float(net.std.mean())

@@ -37,12 +37,22 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(d)
         self.ff = nn.Sequential(nn.Linear(d, 2 * d), nn.GELU(), nn.Linear(2 * d, d))
 
-    def forward(self, x, mask=None, attn_mask=None, mem=None, mem_mask=None):
+    def forward(self, x, mask=None, attn_mask=None, mem=None, mem_mask=None, store=None):
+        """`store`, if given, receives the head-averaged attention weights --
+        what each query drew from each key -- for the decision explainer."""
         h = self.ln1(x)
-        x = x + self.attn(h, h, h, key_padding_mask=mask, attn_mask=attn_mask, need_weights=False)[0]
+        a, w = self.attn(h, h, h, key_padding_mask=mask, attn_mask=attn_mask,
+                         need_weights=store is not None, average_attn_weights=True)
+        x = x + a
+        if store is not None:
+            store.setdefault("self", []).append(w.detach())
         if self.cross and mem is not None:
             h = self.lnc(x)
-            x = x + self.xattn(h, mem, mem, key_padding_mask=mem_mask, need_weights=False)[0]
+            a, w = self.xattn(h, mem, mem, key_padding_mask=mem_mask,
+                              need_weights=store is not None, average_attn_weights=True)
+            x = x + a
+            if store is not None:
+                store.setdefault("cross", []).append(w.detach())
         return x + self.ff(self.ln2(x))
 
 
@@ -120,9 +130,12 @@ class TransformerComposer(Composer):
     """A `ComposerNet` behind the composer interface, with its own chain memory."""
     kind = "transformer"
 
+    DTYPES = {"float64": torch.float64, "float32": torch.float32,
+              "bfloat16": torch.bfloat16, "float16": torch.float16}
+
     def __init__(self, system, trainable, reach: float = 10.0, every: int = 5,
                  measure_every: int = 5, d: int = 64, heads: int = 4, k_chain: int = 32,
-                 weights: str = "", **kw):
+                 weights: str = "", dtype: str = "float32", **kw):
         super().__init__(system, trainable)
         # `every`: how often the composer runs over the stream; `measure_every`:
         # how often the drone appends a measurement token.  Both default to
@@ -132,7 +145,16 @@ class TransformerComposer(Composer):
         span = float(getattr(system.env, "span", 32.0)) if hasattr(system, "env") else 32.0
         self.tok = Tokenizer(scale=span, reach=self.reach, k_chain=k_chain)
         self.k_chain = int(k_chain)
-        self.net = ComposerNet(max(self.n_terms, 1), d=d, heads=heads).to(system.dtype)
+        # Inference dtype.  The composer's decisions need none of the plant's
+        # float64.  Measured per call at 192 rows on this CPU: float64 332 ms,
+        # float32 151 ms, bfloat16 510 ms, float16 453 ms -- the half formats
+        # are emulated here, so float32 is the default; `dtype="float16"` is
+        # one keyword away on hardware with the units.  Tokens are cast in,
+        # outputs cast back to the plant's dtype; the policy update always runs
+        # in float32, since half-precision gradients underflow.
+        self.dtype = system.dtype
+        self.net_dtype = self.DTYPES[dtype]
+        self.net = ComposerNet(max(self.n_terms, 1), d=d, heads=heads).to(self.net_dtype)
         self.net.goal_gain = span / self.reach
         if weights:
             self.net.load_state_dict(torch.load(weights, map_location="cpu"))
@@ -147,18 +169,20 @@ class TransformerComposer(Composer):
         self._instr = []
 
     def tokens(self, ctx):
-        return self.tok(ctx, self._instr)
+        tok = self.tok(ctx, self._instr)
+        return {k: (v.to(self.net_dtype) if torch.is_tensor(v) and v.is_floating_point() else v) for k, v in tok.items()}
 
     @torch.no_grad()
     def emit(self, ctx):
         tok = self.tokens(ctx)
         sub, alpha, gate = self.net(tok)
-        x, goal, psi = ctx["x"], ctx["goal"], tok["psi"]
+        sub, alpha, gate = sub.to(self.dtype), alpha.to(self.dtype), gate.to(self.dtype)
+        x, goal, psi = ctx["x"], ctx["goal"], tok["psi"].to(self.dtype)
         sub_world = x + to_world(sub * self.reach, psi)              # inside the reach ball
         # a subgoal below the floor is not in the reachable set; this is an
         # interlock like the ground release, not something to learn
         sub_world = torch.cat([sub_world[:, :2], sub_world[:, 2:].clamp_min(self.z_min)], -1)
-        dpsi, yg = self.net.last_yaw
+        dpsi, yg = (v.to(self.dtype) for v in self.net.last_yaw)
         spec = TaskSpec(delta=sub_world - goal, alpha=alpha, gate=gate, yaw=psi + dpsi, yaw_gate=yg)
         self._instr.append((float(ctx.get("t", 0)), spec.delta.clone(), spec.weight.clone()))
         if len(self._instr) > 4 * self.tok.kc:
