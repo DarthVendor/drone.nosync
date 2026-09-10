@@ -83,8 +83,8 @@ def _r(x, nd=3):
     return [round(float(v), nd) for v in x.reshape(-1)]
 
 
-def capture(system, roll, theta, goals, seed, stride=1, sensor=None):
-    tr = roll.trace(theta[None], goals, seed)
+def capture(system, roll, theta, goals, seed, stride=1, sensor=None, freeze_arrivals=False):
+    tr = roll.trace(theta[None], goals, seed, freeze_arrivals=freeze_arrivals)
     T, B = tr.goals.shape[0], tr.goals.shape[1]
     poses = system.render_poses(tr.states)                    # [T+1, B, nb, K]
     task = system.task_position(tr.states)                    # [T+1, B, task_dim]

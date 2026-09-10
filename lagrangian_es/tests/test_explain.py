@@ -1,5 +1,5 @@
 """The decision explainer's promises: attention rows are distributions over
-the keys it names, saliency is a gradient norm, counterfactuals are metres,
+the keys it names, saliency is a gradient norm, counterfactuals are probability shifts,
 and the tracer explains exactly the decisions it flew."""
 import torch
 
@@ -29,12 +29,14 @@ def test_explain_one_decision():
            "obs": {x.name: x.observe(s, make_gen(3)) for x in sens}}
     ex = explain_decision(comp, ctx, b=1)
     a = ex["attention"]; assert a is not None
-    assert len(a["keys"]) == 2 + 24 + 50 and abs(sum(a["subgoal_query"]) - 1.0) < 1e-6
+    assert len(a["keys"]) == 2 + 24 + 50 and abs(sum(a["action_query"]) - 1.0) < 1e-6
     assert all(abs(sum(q) - 1.0) < 1e-6 for q in a["constraint_queries"])
     sal = ex["saliency"]; assert len(sal["entities"]) == 74 and min(sal["entities"]) >= 0.0
-    cf = ex["counterfactual_shift_m"]
-    assert set(cf) == {"no_beams", "no_camera", "no_stream", "no_goal"} and all(v >= 0 for v in cf.values())
-    o = ex["outputs"]; assert o["sub_ego"].shape == (3,) and float(o["sub_ego"].norm()) <= 10.0 + 1e-9
+    cf = ex["counterfactual_shift_p"]
+    assert set(cf) == {"no_beams", "no_camera", "no_stream", "no_goal"} and all(-1.0 <= v <= 1.0 for v in cf.values())
+    o = ex["outputs"]; V = comp.net.vocab
+    assert o["probs"].shape == (V.V,) and abs(float(o["probs"].sum()) - 1.0) < 1e-5
+    assert isinstance(o["chosen_name"], str) and len(o["top"]) == 5 and o["top"][0][1] >= o["top"][1][1]
 
 
 def test_tracer_explains_every_decision_it_flew():
@@ -42,6 +44,6 @@ def test_tracer_explains_every_decision_it_flew():
     assert isinstance(comp, Tracer)
     roll = Rollout(sysm, tr, task, cfg.rollout, build_sensors(cfg, sysm), composer=comp)
     roll.run(tr.init()[None], task.sample(3, make_gen(4)), 5)
-    assert 1 <= len(comp.trace) <= 60 // 10
+    assert 1 <= len(comp.trace) <= 60 // 10 + 1
     assert comp.trace[-1]["t"] > comp.trace[0]["t"] or len(comp.trace) == 1
-    assert "attention" in comp.trace[0] and "counterfactual_shift_m" in comp.trace[0]
+    assert "attention" in comp.trace[0] and "counterfactual_shift_p" in comp.trace[0]

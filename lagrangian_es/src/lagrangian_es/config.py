@@ -92,11 +92,10 @@ class RolloutCfg:
                                   # freeze scored 0.9868 either way.
     stop_quantile: float = 1.0    # end the batch once this fraction of episodes
     stop_finished: float = 0.0   # end a TRAINING batch once this fraction of
-                                  # episodes has finished, arrived OR crashed;
-                                  # the rest are charged as hovering.  0 = off.
-                                  # Unlike stop_quantile it counts crashes, so
-                                  # it fires on a batch that mostly dies -- the
-                                  # batch that costs the most to keep simulating.
+                              # the flights still alive has arrived; the rest
+                              # are charged as hovering.  0 = off.  Crashes do
+                              # not count toward it (they never bring the end
+                              # closer), unlike the whole-batch quantile.
                                   # have ARRIVED (crashes do not count -- see
                                   # rollout.run), instead of waiting for the last
                                   # straggler.

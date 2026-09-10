@@ -52,6 +52,7 @@ from __future__ import annotations
 
 from typing import Dict, Optional
 
+import math
 import torch
 from torch import Tensor
 
@@ -72,8 +73,21 @@ class LearnedShaping(LagrangianTerm):
                  init_gain: float = 0.4, damp0: float = 1.2,
                  gyro: bool = False, obs_transform: str = "linear",
                  prox_scale: float = 1.0, damp_mode: str = "full",
-                 n_beams: int = None):
+                 pull_max: float = 0.0,
+                 n_beams: int = None, part: str = "all"):
         super().__init__(d)
+        # `part`: "all" is the whole term; "potential" carries only the shaped
+        # potential (W1, b1, W2, b2, A) and "damping" only the dissipation
+        # head (Wd, bd, the gyro).  Two parts laid end to end are the whole
+        # term's genome exactly, so a controller splits into a PULL term and a
+        # BRAKE term with separate priorities without changing a flight.
+        # "heading" is a third kind: a small net from the observation to a
+        # heading OFFSET the allocator's look-at is rotated by, so the low
+        # level can turn the body -- and the body-fixed sensors -- from what
+        # its beams see.  Zero at init: the look-at prior is unchanged.
+        if part not in ("all", "potential", "damping", "heading"):
+            raise ValueError(f"unknown part {part!r}")
+        self.part = part
         self.sensor_name = sensor_name
         self.n_obs, self.h, self.out = int(n_obs), int(hidden), int(out)
         # the first `n_beams` channels are ranges; anything after is another
@@ -90,14 +104,26 @@ class LearnedShaping(LagrangianTerm):
             raise ValueError(f"unknown obs_transform {obs_transform!r}")
         self.obs_transform = obs_transform
         self.prox_scale = float(prox_scale)
+        # The pull's force budget (0 = unbounded).  V = |g|^2 near the goal and
+        # Huber beyond: linear in |g| once 2|g| would exceed `pull_max`, so the
+        # gradient's magnitude saturates at the budget instead of growing with
+        # distance.  Same potential, same learned trunk; only the far field
+        # changes, and it changes so that a brake CAN win -- see
+        # `Quadrotor.pull_budget`.
+        self.r0 = 0.5 * float(pull_max) if pull_max else None
         self.n_in = self.d + self.n_obs
-        slots = [("W1", self.n_in * self.h), ("b1", self.h),
-                 ("W2", self.h * self.out), ("b2", self.out),
-                 ("A", self.d * self.out),
-                 ("Wd", {"iso": self.n_obs, "beams": 3 * self.BEAM_H + 1}
-                        .get(damp_mode, self.n_obs * self.d * self.d)),
-                 ("bd", 1 if damp_mode in ("iso", "beams") else self.d * self.d)]
-        if self.gyro:
+        slots = []
+        if self.part in ("all", "potential"):
+            slots += [("W1", self.n_in * self.h), ("b1", self.h),
+                      ("W2", self.h * self.out), ("b2", self.out),
+                      ("A", self.d * self.out)]
+        if self.part in ("all", "damping"):
+            slots += [("Wd", {"iso": self.n_obs, "beams": 3 * self.BEAM_H + 1}
+                             .get(damp_mode, self.n_obs * self.d * self.d)),
+                      ("bd", 1 if damp_mode in ("iso", "beams") else self.d * self.d)]
+        if self.part == "heading":
+            slots += [("Wy", self.n_obs * self.BEAM_H), ("by", self.BEAM_H), ("Wy2", self.BEAM_H), ("by2", 1)]
+        if self.gyro and self.part in ("all", "damping"):
             # LAST, so a genome trained without the head extends to one with it
             # by appending zeros -- which is the same controller exactly, since
             # a zero G gives a zero S.
@@ -120,19 +146,30 @@ class LearnedShaping(LagrangianTerm):
     def init(self, dtype=torch.float64, device="cpu") -> Tensor:
         g = torch.Generator(device="cpu").manual_seed(0)
         parts = []
-        for key, shape in (("W1", (self.n_in, self.h)), ("b1", (self.h,)),
-                           ("W2", (self.h, self.out)), ("b2", (self.out,))):
-            if key.startswith("W"):
-                fan = shape[0]
-                parts.append(self.init_gain * torch.randn(*shape, generator=g,
-                                                          dtype=dtype)
-                             / fan ** 0.5)
-            else:
-                parts.append(torch.zeros(*shape, dtype=dtype))
-        # linear skip = identity: the prior is the quadratic bowl
-        A = torch.zeros(self.d, self.out, dtype=dtype)
-        A[:, :self.d] = torch.eye(self.d, dtype=dtype)
-        parts.append(A)
+        if self.part == "heading":
+            Wy = self.init_gain * torch.randn(self.n_obs, self.BEAM_H, generator=g, dtype=dtype) / self.n_obs ** 0.5
+            out = torch.cat([Wy.reshape(-1), torch.zeros(self.BEAM_H, dtype=dtype),
+                             torch.zeros(self.BEAM_H, dtype=dtype), torch.zeros(1, dtype=dtype)])   # output weights zero: no offset
+            assert out.numel() == self.dim
+            return out.to(device)
+        if self.part in ("all", "potential"):
+            for key, shape in (("W1", (self.n_in, self.h)), ("b1", (self.h,)),
+                               ("W2", (self.h, self.out)), ("b2", (self.out,))):
+                if key.startswith("W"):
+                    fan = shape[0]
+                    parts.append(self.init_gain * torch.randn(*shape, generator=g,
+                                                              dtype=dtype)
+                                 / fan ** 0.5)
+                else:
+                    parts.append(torch.zeros(*shape, dtype=dtype))
+            # linear skip = identity: the prior is the quadratic bowl
+            A = torch.zeros(self.d, self.out, dtype=dtype)
+            A[:, :self.d] = torch.eye(self.d, dtype=dtype)
+            parts.append(A)
+        if self.part == "potential":
+            out = torch.cat([p.reshape(-1) for p in parts])
+            assert out.numel() == self.dim, (out.numel(), self.dim)
+            return out.to(device)
         # dissipation head starts at the hand-designed isotropic damper, so the
         # prior is a controller that already works rather than noise.  Laid
         # out per MODE: the full head is (n_obs x d^2) + d^2 with an identity
@@ -193,6 +230,121 @@ class LearnedShaping(LagrangianTerm):
         dt = 1.0 - t1 * t1
         J = A + ((W1[..., :self.d, :] * dt.unsqueeze(-2)) @ W2) / self.e_scale
         return y, J
+
+    def _h_z(self, theta, e, z, w=None):
+        """Trunk value and its Jacobians with respect to the error AND the
+        observation, one pass: (y, J_e [..., d, out], J_z [..., n_obs, out])."""
+        W1, b1, W2, b2, A = self._weights(theta) if w is None else w
+        inp = torch.cat([e / self.e_scale, z], dim=-1)
+        a1 = (inp.unsqueeze(-2) @ W1).squeeze(-2) + b1
+        t1 = torch.tanh(a1)
+        y = (t1.unsqueeze(-2) @ W2).squeeze(-2) + b2 + (e.unsqueeze(-2) @ A).squeeze(-2)
+        dt = (1.0 - t1 * t1).unsqueeze(-2)
+        Je = A + ((W1[..., :self.d, :] * dt) @ W2) / self.e_scale
+        Jz = (W1[..., self.d:, :] * dt) @ W2
+        return y, Je, Jz
+
+    def _h_z2(self, theta, e, z, w=None):
+        """The trunk at e AND at e = 0 in ONE pass (the two rows share the
+        weights, so they go through the batched matmuls together): returns
+        (y, Je, Jz, y0, Jz0).  The potential is |y - y0|^2, so every hot path
+        needed both, and two separate passes were 1.0 s of small-op overhead
+        per 51k flight-steps."""
+        W1, b1, W2, b2, A = self._weights(theta) if w is None else w
+        zero = torch.zeros_like(e)
+        inp = torch.stack([torch.cat([e / self.e_scale, z], dim=-1), torch.cat([zero, z], dim=-1)], dim=-2)   # [..., 2, n_in]
+        a1 = inp @ W1 + b1.unsqueeze(-2)
+        t1 = torch.tanh(a1)                                                                                  # [..., 2, h]
+        lin = torch.stack([(e.unsqueeze(-2) @ A).squeeze(-2), torch.zeros_like(e[..., :1]).expand(*e.shape[:-1], A.shape[-1])], dim=-2)
+        yy = t1 @ W2 + b2.unsqueeze(-2) + lin                                                               # [..., 2, out]
+        dt = 1.0 - t1 * t1
+        Je = A + ((W1[..., :self.d, :] * dt[..., 0:1, :]) @ W2) / self.e_scale
+        Jz = (W1[..., self.d:, :] * dt[..., 0:1, :]) @ W2
+        Jz0 = (W1[..., self.d:, :] * dt[..., 1:2, :]) @ W2
+        return yy[..., 0, :], Je, Jz, yy[..., 1, :], Jz0
+
+    def _pull_fac(self, g):
+        """dH/d(s^2) for the Huber potential H(s), s = |g|: 1 inside r0, r0/s
+        beyond -- multiplies g wherever V = |g|^2 would use it."""
+        if self.r0 is None:
+            return None
+        s = torch.linalg.vector_norm(g, dim=-1, keepdim=True)
+        return (self.r0 / s.clamp_min(1e-12)).clamp(max=1.0)
+
+    def _dz_dpsi(self, obs):
+        """dz/dpsi for every body-fixed observation, in `_obs_vec` order."""
+        names = self.sensor_name if isinstance(self.sensor_name, (tuple, list)) else (self.sensor_name,)
+        parts = []
+        for k, name in enumerate(names):
+            raw = obs[name]; width = raw.shape[-1]
+            J = obs.get(name + "/J"); dirs = obs.get(name + "/dir")
+            if J is not None and dirs is not None:
+                if k == 0 and self.obs_transform == "proximity":
+                    dzdr = -self.prox_scale / (raw.clamp_min(0.0) + self.prox_scale) ** 2
+                elif k == 0:
+                    dzdr = ((raw / self.obs_scale).abs() < 4.0).to(raw.dtype) / self.obs_scale
+                else:
+                    dzdr = (raw.abs() < 4.0).to(raw.dtype)
+                parts.append(dzdr * raw * (J[..., 1] * dirs[..., 0] - J[..., 0] * dirs[..., 1]))
+            elif width == 3:
+                inside = (raw.abs() < 4.0).to(raw.dtype)
+                parts.append(inside * torch.stack([-raw[..., 1], raw[..., 0], torch.zeros_like(raw[..., 2])], -1))
+            else:
+                parts.append(torch.zeros_like(raw))
+        return torch.cat(parts, -1)
+
+    def grad_potential_both(self, theta, e, v, x, obs=None):
+        """(dV/de + dR/dv, dV/dpsi) from ONE pair of trunk passes -- the hot
+        path calls this rather than the two gradients separately."""
+        zero_psi = torch.zeros(theta.shape[:-1], dtype=theta.dtype, device=theta.device)
+        z = self._read(obs)
+        if z is None or self.part == "heading":
+            return torch.zeros_like(e), zero_psi
+        out = torch.zeros_like(e); dpsi = zero_psi
+        if self.part in ("all", "potential"):
+            w = self._weights(theta)
+            y, Je, Jz, y0, Jz0 = self._h_z2(theta, e, z, w)
+            g = y - y0
+            fac = self._pull_fac(g)
+            if fac is not None:
+                g = g * fac
+            out = out + 2.0 * (Je @ g.unsqueeze(-1)).squeeze(-1)
+            if obs is not None and (self.beam_name + "/J") in obs:
+                dVdz = 2.0 * ((Jz - Jz0) @ g.unsqueeze(-1)).squeeze(-1)
+                dpsi = (dVdz * self._dz_dpsi(obs)).sum(-1)
+        if self.part == "potential":
+            return out, dpsi
+        if self.damp_mode == "beams":
+            dRdv = self._dRdv_beams(theta, z, v, obs)
+        else:
+            L = self._L(theta, z)
+            Lv = (v.unsqueeze(-2) @ L).squeeze(-2)
+            dRdv = (L @ Lv.unsqueeze(-1)).squeeze(-1)
+        out = out + dRdv
+        if self.gyro:
+            out = out + (self._S(theta, z) @ v.unsqueeze(-1)).squeeze(-1)
+        return out, dpsi
+
+    def grad_potential_yaw(self, theta, e, v, x, obs=None):
+        """dV/dpsi: how the potential changes when the body -- and with it the
+        front fan -- rotates about world z.  Implicit in the Lagrangian: V reads
+        the beams, the beams depend on the heading, so the same potential that
+        pulls and brakes also turns.  Through the ray-cast's own Jacobian,
+        dr_i/dpsi = r_i (J_i . (e_z x d_i)); nothing is added to V."""
+        zero = torch.zeros(theta.shape[:-1], dtype=theta.dtype, device=theta.device)
+        if self.part not in ("all", "potential") or obs is None:
+            return zero
+        z = self._read(obs)
+        if z is None or (self.beam_name + "/J") not in obs:
+            return zero
+        w = self._weights(theta)
+        y, _, Jz, y0, Jz0 = self._h_z2(theta, e, z, w)
+        g = y - y0
+        fac = self._pull_fac(g)
+        if fac is not None:
+            g = g * fac
+        dVdz = 2.0 * ((Jz - Jz0) @ g.unsqueeze(-1)).squeeze(-1)                          # V = |y - y0|^2, [..., n_obs]
+        return (dVdz * self._dz_dpsi(obs)).sum(-1)
 
     def _L(self, theta, z):
         """The dissipation factor, R = L L^T.
@@ -263,33 +415,55 @@ class LearnedShaping(LagrangianTerm):
         return beams if rest.shape[-1] == 0 else torch.cat([beams, rest.clamp(-4.0, 4.0)], -1)
 
     # --- contributions ------------------------------------------------------
+    def heading(self, theta, obs=None):
+        """A heading offset in radians from the observation, [...]; zero for
+        parts without the head or with nothing observed."""
+        z = self._read(obs) if self.part == "heading" else None
+        if z is None:
+            return torch.zeros(theta.shape[:-1], dtype=theta.dtype, device=theta.device)
+        Wy = self._p(theta, "Wy", (self.n_obs, self.BEAM_H)); by = self._p(theta, "by", (self.BEAM_H,))
+        Wy2 = self._p(theta, "Wy2", (self.BEAM_H,)); by2 = self._p(theta, "by2", (1,))
+        h = torch.tanh((z.unsqueeze(-2) @ Wy).squeeze(-2) + by)
+        return math.pi * torch.tanh((h * Wy2).sum(-1) + by2[..., 0])
+
     def potential(self, theta, e, v, x, obs=None):
         z = self._read(obs)
-        if z is None:
+        if z is None or self.part in ("damping", "heading"):
             return torch.zeros_like(e[..., 0])
         w = self._weights(theta)
         y, _ = self._h(theta, e, z, w)
         y0, _ = self._h(theta, torch.zeros_like(e), z, w)
         g = y - y0
-        return (g * g).sum(-1)
+        s2 = (g * g).sum(-1)
+        if self.r0 is None:
+            return s2
+        s = s2.clamp_min(0.0).sqrt()
+        return torch.where(s <= self.r0, s2, 2.0 * self.r0 * s - self.r0 ** 2)
 
     def grad_potential(self, theta, e, v, x, obs=None):
         z = self._read(obs)
-        if z is None:
+        if z is None or self.part == "heading":
             return torch.zeros_like(e)
-        w = self._weights(theta)
-        y, J = self._h(theta, e, z, w)
-        y0, _ = self._h(theta, torch.zeros_like(e), z, w)
-        g = y - y0
-        # grad_e ||g||^2 = 2 J g ; vanishes at e = 0 because g does
-        gradV = 2.0 * (J @ g.unsqueeze(-1)).squeeze(-1)
+        out = torch.zeros_like(e)
+        if self.part in ("all", "potential"):
+            w = self._weights(theta)
+            y, J = self._h(theta, e, z, w)
+            y0, _ = self._h(theta, torch.zeros_like(e), z, w)
+            g = y - y0
+            fac = self._pull_fac(g)
+            if fac is not None:
+                g = g * fac
+            # grad_e ||g||^2 = 2 J g ; vanishes at e = 0 because g does
+            out = out + 2.0 * (J @ g.unsqueeze(-1)).squeeze(-1)
+        if self.part == "potential":
+            return out
         if self.damp_mode == "beams":
             dRdv = self._dRdv_beams(theta, z, v, obs)
         else:
             L = self._L(theta, z)
             Lv = (v.unsqueeze(-2) @ L).squeeze(-2)
             dRdv = (L @ Lv.unsqueeze(-1)).squeeze(-1)      # (L L^T) v
-        out = gradV + dRdv
+        out = out + dRdv
         if self.gyro:
             # The workless head.  A gradient plus a Rayleigh dissipation flows
             # downhill into the nearest critical point, and on this map 94% of
@@ -361,6 +535,8 @@ class LearnedShaping(LagrangianTerm):
 
     def damping(self, theta: Tensor) -> Tensor:
         """Reported at zero observation, for `describe`."""
+        if self.part in ("potential", "heading"):
+            return torch.zeros(theta.shape[:-1] + (self.d, self.d), dtype=theta.dtype, device=theta.device)
         if self.damp_mode == "beams":
             s0 = torch.nn.functional.softplus(self._p(theta, "bd", (1,)))
             eye = torch.eye(self.d, dtype=theta.dtype, device=theta.device)

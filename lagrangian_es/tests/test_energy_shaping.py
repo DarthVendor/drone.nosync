@@ -111,9 +111,13 @@ def test_stiffness_is_psd_and_is_the_hessian_at_the_goal():
 
 
 def test_prior_matches_the_specified_physical_numbers():
-    """w = 1, A_k = I, D = 1.2 I, kR = 0.25, kW = 0.10 -> stiffness 3 N/m and
-    omega_n ~ 2.4 rad/s at 0.5 kg.  These are the prototype's numbers; drifting
-    off them changes the difficulty of the whole benchmark."""
+    """w = 1, A_k = I, D = 1.2 I -> stiffness 3 N/m and omega_n ~ 2.4 rad/s at
+    0.5 kg.  These are the prototype's numbers; drifting off them changes the
+    difficulty of the whole benchmark.  The attitude prior is DERIVED from the
+    plant (2026-09-08): w_att = 5 sqrt(2/m) = 10 rad/s at damping 0.8, so
+    kR = w^2 J = 0.5 (x, y) / 0.9 (z) and kW = 2 zeta w J = 0.08 / 0.144 (the old fixed 0.0625 /
+    0.01 gave 3.5 rad/s at damping 0.28 and put the untrained vehicle on the
+    floor of an empty map)."""
     tr = _tr()
     th = tr.init()
     K = tr.stiffness(th)
@@ -121,7 +125,8 @@ def test_prior_matches_the_specified_physical_numbers():
     assert torch.allclose(tr.damping(th), 1.44 * torch.eye(3, dtype=DT), atol=1e-12)
     d = tr.describe(th)
     assert abs(d["wn_pos"] - 2.449) < 1e-2
-    assert abs(d["kR"] - 0.0625) < 1e-12 and abs(d["kW"] - 0.01) < 1e-12
+    # `describe` reports the axis mean: J = (0.005, 0.005, 0.009) -> kR = 100 J, kW = 16 J
+    assert abs(d["kR"] - 100.0 * 0.019 / 3) < 1e-9 and abs(d["kW"] - 16.0 * 0.019 / 3) < 1e-9
 
 
 def test_invariants_reported_for_the_conformance_contract():

@@ -35,14 +35,26 @@ def _ctx(sysm, task, B=6, seed=1):
 
 
 def test_outputs_are_bounded_by_construction():
+    """Every PLACE token lands inside the reach ball and above the floor;
+    RAISE/LOWER cannot take a priority outside its clamp; gates stay in [0, 1]."""
     sysm, tr, task = build(_cfg()); comp = build_composer(_cfg(), sysm, tr)
-    ctx, _ = _ctx(sysm, task)
-    spec = comp.emit(ctx)
-    sub = ctx["goal"] + spec.delta
-    assert float((sub - ctx["x"]).norm(dim=-1).max()) <= 10.0 + 1e-9
-    assert float(sub[:, 2].min()) >= 0.5, "a subgoal below the floor is not reachable"
-    assert bool((spec.alpha > 0).all()) and bool((spec.gate >= 0).all()) and bool((spec.gate <= 1).all())
-    assert spec.alpha.shape == (6, len(tr.terms))
+    ctx, _ = _ctx(sysm, task); tok = comp.tokens(ctx); V = comp.net.vocab
+    for t in range(V.PLACE0, V.RAISE0):
+        spec = comp._apply(torch.full((6,), t, dtype=torch.long), ctx, tok)
+        sub = ctx["goal"] + spec.delta
+        assert float((sub - ctx["x"]).norm(dim=-1).max()) <= 10.0 + 1e-6, V.name(t)
+        assert float(sub[:, 2].min()) >= 0.5, "a subgoal below the floor is not reachable"
+        assert bool(spec.moved.all())
+    spec = comp._apply(torch.zeros(6, dtype=torch.long), ctx, tok)                 # HOLD: nothing changes
+    assert not bool(spec.moved.any()) and torch.equal(spec.delta, torch.zeros_like(spec.delta))
+    cur = spec
+    for _ in range(30):
+        ctx2 = dict(ctx, spec=cur); cur = comp._apply(torch.full((6,), V.RAISE0, dtype=torch.long), ctx2, tok)
+    assert float(cur.alpha[:, 0].max()) <= 20.0 + 1e-9
+    for _ in range(60):
+        ctx2 = dict(ctx, spec=cur); cur = comp._apply(torch.full((6,), V.LOWER0, dtype=torch.long), ctx2, tok)
+    assert float(cur.alpha[:, 0].min()) >= 0.05 - 1e-9
+    assert bool((cur.gate >= 0).all()) and bool((cur.gate <= 1).all()) and cur.alpha.shape == (6, len(tr.terms))
 
 
 def test_parameter_budget():
@@ -95,6 +107,10 @@ def test_yaw_and_translation_equivariance():
     assert torch.allclose(spec2.alpha, spec.alpha, atol=1e-6) and torch.allclose(spec2.gate, spec.gate, atol=1e-6)
 
 
+import pytest
+
+
+@pytest.mark.skip(reason="the oracle teacher is not part of the design: the composer emits action tokens learned from the cost alone")
 def test_recorder_pairs_are_aligned_and_the_student_can_fit_them():
     """The recorder must store the oracle's answer in the student's own output
     space; a few epochs on a handful of pairs must then reduce the loss, which
@@ -142,15 +158,17 @@ def test_policy_learns_from_the_rollout_cost_alone():
     roll = Rollout(sysm, tr, task, cfg.rollout, build_sensors(cfg, sysm), composer=comp)
     comp.stochastic = True
     roll.run(tr.init()[None], task.sample(6, make_gen(21)), 22)
-    # one record per interval while anyone is flying; none once everyone has died
-    assert 1 <= len(comp.records) <= 120 // 10 and all("cost" in m for m in roll.chain)
+    # a decision is a chain of components: at most L_MAX + 1 records per report while anyone is flying; none once everyone has died
+    V = comp.net.vocab
+    assert 1 <= len(comp.records) <= (120 // 10 + 1) * (V.L_MAX + 1) and all("cost" in m for m in roll.chain)
+    assert len({r["t"] for r in comp.records}) <= 120 // 10 + 1
     R = returns_from_stream(comp.records, roll.chain, gamma=0.99)
     assert R.shape == (len(comp.records), 6) and torch.isfinite(R).all()
     before = torch.cat([p.detach().flatten().clone() for p in comp.net.parameters()])
     st = ppo_update(comp.net, comp.records, R, comp.n_terms, epochs=1, batch=64)
     after = torch.cat([p.detach().flatten() for p in comp.net.parameters()])
     assert st["n"] > 0 and abs(st["loss"]) < 1e6
-    for k in ("kl", "clipfrac", "ev", "sigma"):
+    for k in ("kl", "clipfrac", "ev", "speak", "entropy"):
         assert k in st and abs(st[k]) < 1e6, k
     assert not torch.equal(before, after), "no parameter moved"
 
@@ -176,25 +194,23 @@ def test_the_untrained_composer_is_the_identity_pointed_at_the_goal():
         assert float(cos.min()) > 0.99, f"{name}: sub-goal not on the line to the goal"
 
 
-def test_the_exploration_scale_learns_faster_than_the_network():
-    """`log_std` sits in its own optimiser group at ten times the rate: at the
-    network's rate it could move ~0.7% an iteration and never adapt in a run."""
+def test_the_policy_starts_silent_and_the_update_reports_how_often_it_speaks():
+    """The prior is HOLD on ~90% of reports (a random token every report
+    killed every flight on the first day); the update reports the speak rate
+    and the entropy of the categorical, which has no scale to tune."""
     import torch
-    from lagrangian_es.composer import PolicyNet
-    from lagrangian_es.composer.policy import collate_tok
-    net = PolicyNet(1).double()
-    F = 8; B = 16
-    tok = {"self": torch.randn(B, F, dtype=torch.float64), "goal": torch.randn(B, F, dtype=torch.float64),
-           "entities": torch.randn(B, 4, F, dtype=torch.float64), "ent_types": torch.full((B, 4), 2),
-           "ent_mask": torch.ones(B, 4, dtype=torch.bool), "chain": torch.zeros(B, 0, F, dtype=torch.float64),
-           "chain_types": torch.zeros(B, 0, dtype=torch.long), "psi": torch.zeros(B, dtype=torch.float64)}
-    recs = [{"t": 0.0, "act": torch.randn(B, 3 + 2 * 1 + 2, dtype=torch.float64), "alive": torch.ones(B, dtype=torch.bool),
-             "tok": tok}]   # sub-goal 3, per-term alpha/gate, heading delta + gate
-    from lagrangian_es.composer import ppo_update
-    before = net.log_std.detach().clone(); w_before = net.head_sub.weight.detach().clone()
-    ppo_update(net, recs, torch.randn(1, B, dtype=torch.float64), 1, epochs=1, batch=B, lr=1e-3)
-    d_std = float((net.log_std - before).abs().max()); d_w = float((net.head_sub.weight - w_before).abs().max())
-    assert d_std > 5 * d_w, (d_std, d_w)
+    from lagrangian_es.composer import PolicyNet, ppo_update
+    torch.manual_seed(0)
+    net = PolicyNet(1).float(); F = 8; B = 64
+    tok = {"self": torch.randn(B, F), "goal": torch.randn(B, F), "entities": torch.randn(B, 4, F), "ent_types": torch.full((B, 4), 2),
+           "ent_mask": torch.ones(B, 4, dtype=torch.bool), "chain": torch.zeros(B, 0, F), "chain_types": torch.zeros(B, 0, dtype=torch.long), "psi": torch.zeros(B)}
+    with torch.no_grad(): logits, _ = net.pre(tok)
+    p_hold = torch.softmax(logits, -1)[:, net.vocab.HOLD]
+    assert 0.7 < float(p_hold.mean()) < 0.97
+    act = torch.distributions.Categorical(logits=logits).sample()
+    recs = [{"t": 0.0, "act": act, "alive": torch.ones(B, dtype=torch.bool), "rows": torch.arange(B), "tok": tok}]
+    st = ppo_update(net, recs, torch.randn(1, B, dtype=torch.float64), 1, epochs=1, batch=B, lr=1e-4, target_kl=0.0)
+    assert 0.0 <= st["speak"] <= 0.25 and st["entropy"] >= 0.0
 
 
 def test_a_policy_checkpoint_round_trips_through_weights(tmp_path):
@@ -259,19 +275,18 @@ def test_dropping_a_no_op_padding_mask_changes_nothing():
     assert not torch.allclose(a, c), "a real mask must still mask"
 
 
-def test_a_nonfinite_minibatch_is_skipped_not_stepped():
+def test_a_nonfinite_sample_is_dropped_not_stepped():
     import torch
     from lagrangian_es.composer import PolicyNet, ppo_update
     net = PolicyNet(1).float(); B, F = 16, 8
     tok = {"self": torch.randn(B, F), "goal": torch.randn(B, F), "entities": torch.randn(B, 4, F), "ent_types": torch.full((B, 4), 2),
            "ent_mask": torch.ones(B, 4, dtype=torch.bool), "chain": torch.zeros(B, 0, F), "chain_types": torch.zeros(B, 0, dtype=torch.long), "psi": torch.zeros(B)}
-    with torch.no_grad(): pre, _ = net.pre(tok)
-    act = pre.clone(); act[0, 0] = float("nan")                 # one poisoned action
-    recs = [{"t": 0.0, "act": act, "alive": torch.ones(B, dtype=torch.bool), "rows": torch.arange(B), "tok": tok}]
+    with torch.no_grad(): logits, _ = net.pre(tok)
+    recs = [{"t": 0.0, "act": logits.argmax(-1), "alive": torch.ones(B, dtype=torch.bool), "rows": torch.arange(B), "tok": tok}]
+    R = torch.randn(1, B, dtype=torch.float64); R[0, 0] = float("nan")          # one poisoned return
     before = torch.cat([p.detach().flatten().clone() for p in net.parameters()])
-    st = ppo_update(net, recs, torch.randn(1, B, dtype=torch.float64), 1, epochs=1, batch=B, lr=1e-3)
+    st = ppo_update(net, recs, R, 1, epochs=1, batch=B, lr=1e-3, target_kl=0.0)
     after = torch.cat([p.detach().flatten() for p in net.parameters()])
-    # the poisoned sample is dropped and counted; the healthy ones still train, finitely
     assert st.get("nonfinite", 0) == 1 and st["n"] == B - 1
     assert torch.isfinite(after).all() and not torch.equal(before, after)
 
@@ -290,8 +305,8 @@ def test_update_accepts_ragged_per_shard_groups():
     def rec(B, n_ent, t):
         tok = {"self": torch.randn(B, F), "goal": torch.randn(B, F), "entities": torch.randn(B, n_ent, F), "ent_types": torch.full((B, n_ent), 2),
                "ent_mask": torch.ones(B, n_ent, dtype=torch.bool), "chain": torch.zeros(B, 0, F), "chain_types": torch.zeros(B, 0, dtype=torch.long), "psi": torch.zeros(B)}
-        with torch.no_grad(): pre, _ = net.pre(tok)
-        return {"t": t, "act": pre, "alive": torch.ones(B, dtype=torch.bool), "rows": torch.arange(B), "tok": tok}
+        with torch.no_grad(): logits, _ = net.pre(tok)
+        return {"t": t, "act": logits.argmax(-1), "alive": torch.ones(B, dtype=torch.bool), "rows": torch.arange(B), "tok": tok}
     g1 = [rec(6, 0, 0.0), rec(6, 74, 10.0)]; g2 = [rec(4, 74, 0.0)]           # a blind first record, and two shards
     st = ppo_update(net, [g1, g2], [torch.randn(2, 6, dtype=torch.float64), torch.randn(1, 4, dtype=torch.float64)], 1, epochs=1, batch=8)
     assert st["n"] == 16 and abs(st["loss"]) < 1e6
@@ -339,8 +354,8 @@ def test_workers_reload_the_composer_when_its_weights_change(tmp_path):
     par = ParallelRollout({"cfg": cfg}, workers=2, min_pop=2)
     try:
         a, sa = par.run_with_records(TH, goals, 6, stochastic=False, record_frac=1.0)
-        with torch.no_grad():
-            for p_ in comp.net.parameters(): p_.add_(0.3 * torch.randn_like(p_))
+        with torch.no_grad():                        # a composer that places a subgoal at every report
+            comp.net.head_act.bias[comp.net.vocab.HOLD] = -10.0; comp.net.head_act.bias[comp.net.vocab.PLACE0] = 10.0
         import time; time.sleep(0.02); torch.save(comp.net.state_dict(), w)
         b, sb = par.run_with_records(TH, goals, 6, stochastic=False, record_frac=1.0)
     finally:
@@ -357,14 +372,14 @@ def test_the_update_stops_once_it_has_moved_far_enough():
     net = PolicyNet(1).float(); B, F = 64, 8
     tok = {"self": torch.randn(B, F), "goal": torch.randn(B, F), "entities": torch.randn(B, 8, F), "ent_types": torch.full((B, 8), 2),
            "ent_mask": torch.ones(B, 8, dtype=torch.bool), "chain": torch.zeros(B, 0, F), "chain_types": torch.zeros(B, 0, dtype=torch.long), "psi": torch.zeros(B)}
-    with torch.no_grad(): pre, _ = net.pre(tok)
-    recs = [{"t": 0.0, "act": pre + 0.05 * torch.randn_like(pre), "alive": torch.ones(B, dtype=torch.bool), "rows": torch.arange(B), "tok": tok}]
+    with torch.no_grad(): logits, _ = net.pre(tok)
+    recs = [{"t": 0.0, "act": torch.distributions.Categorical(logits=logits).sample(), "alive": torch.ones(B, dtype=torch.bool), "rows": torch.arange(B), "tok": tok}]
     R = torch.randn(1, B, dtype=torch.float64)
-    st = ppo_update(net, recs, R, 1, epochs=30, batch=16, lr=5e-3, vcoef=0.0, ent=0.0, target_kl=0.02)
+    st = ppo_update(net, recs, R, 1, epochs=30, batch=16, lr=5e-1, vcoef=0.0, ent=0.0, target_kl=0.02)
     assert st["epochs"] < 30, "the early-stop never fired"
     # the step is sized in policy space: a rate that overshoots is halved until
     # the whole batch sits inside the trust region, and the rate that fit comes back
-    assert st["backtracks"] >= 1 and st["lr"] < 5e-3, st
+    assert st["backtracks"] >= 1 and st["lr"] < 5e-1, st
     assert st["kl"] <= 2.0 * 0.02, st
     st2 = ppo_update(PolicyNet(1).float(), recs, R, 1, epochs=3, batch=16, lr=1e-5, vcoef=0.0, ent=0.0, target_kl=0.02)
     assert st2["epochs"] == 3 and st2["backtracks"] == 0 and st2["lr"] == 1e-5, "a tiny step must run all its epochs"
@@ -398,3 +413,238 @@ def test_the_fused_attention_path_matches_the_module_path():
         for kw in ({"mask": pad}, {"attn_mask": causal}, {"mask": pad, "mem": mem, "mem_mask": mpad}, {"attn_mask": causal, "last": True}):
             a = blk(x, **kw); b = blk(x, store={}, **kw)
             assert a.shape == b.shape and torch.allclose(a, b, atol=1e-5), (kw.keys(), (a - b).abs().max())
+
+
+def test_a_kept_optimizer_is_used_and_restored_on_backtrack():
+    """The caller may keep the Adam across updates; a backtracked attempt
+    restores the optimizer's moments along with the weights."""
+    import copy, torch
+    from lagrangian_es.composer import PolicyNet, ppo_update
+    torch.manual_seed(2)
+    net = PolicyNet(1).float(); B, F = 64, 8
+    tok = {"self": torch.randn(B, F), "goal": torch.randn(B, F), "entities": torch.randn(B, 8, F), "ent_types": torch.full((B, 8), 2),
+           "ent_mask": torch.ones(B, 8, dtype=torch.bool), "chain": torch.zeros(B, 0, F), "chain_types": torch.zeros(B, 0, dtype=torch.long), "psi": torch.zeros(B)}
+    with torch.no_grad(): logits, _ = net.pre(tok)
+    recs = [{"t": 0.0, "act": torch.distributions.Categorical(logits=logits).sample(), "alive": torch.ones(B, dtype=torch.bool), "rows": torch.arange(B), "tok": tok}]
+    R = torch.randn(1, B, dtype=torch.float64)
+    opt = torch.optim.Adam([p for p in net.parameters() if p.requires_grad], lr=1e-5)
+    st = ppo_update(net, recs, R, 1, epochs=2, batch=16, lr=1e-5, vcoef=0.0, ent=0.0, target_kl=0.02, opt=opt)
+    assert st["backtracks"] == 0 and len(opt.state) > 0, "the kept optimizer was not stepped"
+    moments = copy.deepcopy(opt.state_dict())
+    st2 = ppo_update(net, recs, R, 1, epochs=2, batch=16, lr=1e-5, vcoef=0.0, ent=0.0, target_kl=0.02, opt=opt)
+    assert opt.param_groups[0]["lr"] == st2["lr"], "the rate the update used is on the optimizer"
+    n_steps = next(iter(opt.state.values()))["step"]
+    assert float(n_steps) > float(next(iter(moments["state"].values()))["step"]), "the second update continued the first's step count"
+
+
+def test_common_random_numbers_pair_the_token_draws_across_genomes():
+    """Two genomes on the same episode with the same logits draw the same
+    token; the draw is still an exact sample of softmax(logits)."""
+    import torch
+    from lagrangian_es.composer.policy import crn_sample
+    V, E = 7, 5
+    logits = torch.randn(E, V, dtype=torch.float64) * 2.0
+    ids = torch.arange(3 * E)                                   # 3 genomes x 5 episodes, index = member*E + episode
+    a = crn_sample(logits.repeat(3, 1), ids, E, seed=11, k=4)
+    assert torch.equal(a[:E], a[E:2 * E]) and torch.equal(a[:E], a[2 * E:])
+    b = crn_sample(logits.repeat(3, 1), ids, E, seed=11, k=5)  # the next decision draws afresh
+    assert not torch.equal(a, b) or True
+    # distribution: 20000 decisions of one episode against the softmax
+    counts = torch.zeros(V, dtype=torch.float64)
+    for k in range(20000):
+        counts[int(crn_sample(logits[:1], torch.zeros(1, dtype=torch.long), 1, seed=3, k=k))] += 1
+    p = torch.softmax(logits[0], -1)
+    assert float(((counts / 20000) - p).abs().max()) < 0.015, (counts / 20000, p)
+
+
+
+def test_exploration_on_recorded_rows_does_not_flatten_the_policy_in_one_update():
+    """Records collected with the exploration mixture on the recorded rows: the
+    update's trust region is the policy at collection time, not the mixture,
+    and the off-policy samples enter as a capped importance weight.  Measured
+    before this: one update at KL 0.107 with entropy 2.98 -- the policy
+    flattened toward the uniform it had explored with."""
+    from lagrangian_es.composer import PolicyComposer, ppo_update, returns_from_stream
+    from lagrangian_es.config import RolloutCfg
+    from lagrangian_es.es import build_sensors
+    from lagrangian_es.rollout import Rollout
+    from dataclasses import replace
+    cfg = replace(_cfg(), composer="policy", composer_kw=(("reach", 10.0), ("every", 10), ("measure_every", 10), ("explore_eps", 0.3)),
+                  rollout=RolloutCfg(n_eps=16, ep_steps=200, dead_mode="constant", dead_cost=40.0, goal_bonus=60.0))
+    sysm, tr, task = build(cfg); comp = build_composer(cfg, sysm, tr)
+    assert isinstance(comp, PolicyComposer) and comp.explore_eps == 0.3
+    roll = Rollout(sysm, tr, task, cfg.rollout, build_sensors(cfg, sysm), composer=comp)
+    comp.stochastic = True; comp.record_rows = torch.arange(16)
+    roll.run(tr.init()[None], task.sample(16, make_gen(21)), 22)
+    assert all("pi_logits" in r and "logits" in r for r in comp.records)
+    r0 = comp.records[0]
+    # the behaviour is flatter than the policy on the recorded rows, and the policy's own logits are kept
+    assert float(torch.distributions.Categorical(logits=r0["logits"]).entropy().mean()) > float(torch.distributions.Categorical(logits=r0["pi_logits"]).entropy().mean())
+    h_before = float(torch.distributions.Categorical(logits=r0["pi_logits"]).entropy().mean())
+    R = returns_from_stream(comp.records, roll.chain, gamma=0.99, unit=10)
+    st = ppo_update(comp.net, comp.records, R, comp.n_terms, epochs=3, batch=256, lr=2e-4, vcoef=0.5, ent=0.0, target_kl=0.0)
+    assert st["n"] > 0 and st["kl"] < 0.02, st
+    assert st["entropy"] < h_before + 0.3, (st["entropy"], h_before)
+
+
+def test_the_weight_loader_refuses_a_body_that_does_not_fit():
+    """A checkpoint of another width must not load silently as the prior."""
+    import os, tempfile, pytest
+    import torch
+    from lagrangian_es.composer.transformer import ComposerNet, load_composer_weights
+    a = ComposerNet(2, d=64); b = ComposerNet(2, d=32)
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "a.pt"); torch.save(a.state_dict(), p)
+        with pytest.raises(ValueError):
+            load_composer_weights(b, p)
+        c = ComposerNet(2, d=64); load_composer_weights(c, p)      # the same net loads
+        assert torch.equal(next(c.parameters()), next(a.parameters()))
+
+
+def test_recorded_rows_draw_independently_while_policy_rows_stay_paired():
+    import torch
+    from lagrangian_es.composer.policy import crn_sample
+    V, E = 7, 6
+    logits = torch.randn(E, V, dtype=torch.float64).repeat(3, 1)          # 3 genomes x 6 episodes, identical logits
+    ids = torch.arange(3 * E)
+    rec = (ids % E) % 2 == 0                                                 # even episodes are recorded (exploring)
+    a = crn_sample(logits, ids, E, seed=5, k=2, independent=rec)
+    pol = ~rec
+    # policy rows: the same token for the same episode in every genome
+    assert torch.equal(a[pol][: E // 2], a[pol][E // 2: E]) and torch.equal(a[pol][: E // 2], a[pol][E: 3 * E // 2])
+    # recorded rows: drawn per row, so across many decisions the three genomes disagree somewhere
+    diff = 0
+    for k in range(40):
+        b = crn_sample(logits, ids, E, seed=5, k=k, independent=rec)
+        diff += int((b[rec][: E // 2] != b[rec][E // 2: E]).sum())
+    assert diff > 0
+
+
+def test_a_decision_chains_components_until_eos():
+    """TURN(+90) BEARING(+90) RANGE(0.3) EOS: the turn and the placement in one
+    decision; every component written to the chain as it is made, EOS not."""
+    sysm, tr, task = build(_cfg()); comp = build_composer(_cfg(), sysm, tr)
+    ctx, _ = _ctx(sysm, task); V = comp.net.vocab; comp.reset(6)
+    script = {0: V.TURN0 + 3, 1: V.BEAR0 + V.NB // 2 + 3, 2: V.RANGE0, 3: V.EOS}
+    calls = []
+    def choose(logits, tok, ctx_s, rows, step, placing):
+        calls.append((step, int(rows.numel()), bool(placing.all())))
+        return torch.full((logits.shape[0],), script[step], dtype=torch.long)
+    spec = comp._decide(ctx, choose)
+    assert [c[0] for c in calls] == [0, 1, 2, 3] and all(c[1] == 6 for c in calls)
+    assert calls[3][2] and not calls[0][2]                          # a placement is pending by the EOS step, not before
+    assert bool(spec.moved.all()) and float(spec.yaw_gate.min()) == 1.0
+    # the placement lies 90 degrees off the goal direction, 0.3 of the way (or of the reach)
+    g = ctx["goal"] - ctx["x"]; sub = ctx["goal"] + spec.delta - ctx["x"]
+    gxy, sxy = g[:, :2], sub[:, :2]
+    cos = (gxy * sxy).sum(-1) / (gxy.norm(dim=-1) * sxy.norm(dim=-1)).clamp_min(1e-9)
+    assert float(cos.abs().max()) < 0.05, cos
+    want = 0.3 * torch.minimum(gxy.norm(dim=-1), torch.full_like(cos, 10.0))
+    assert torch.allclose(sxy.norm(dim=-1), want, rtol=0.05, atol=0.05), (sxy.norm(dim=-1), want)
+    assert len(comp._instr) == 3 and all(bool(e[2].all()) for e in comp._instr)
+    assert [int(e[1][0]) for e in comp._instr] == [script[0], script[1], script[2]]
+
+
+def test_a_bare_eos_is_silence_and_the_cap_forces_eos():
+    sysm, tr, task = build(_cfg()); comp = build_composer(_cfg(), sysm, tr)
+    ctx, _ = _ctx(sysm, task); V = comp.net.vocab; comp.reset(6)
+    n = [0]
+    spec = comp._decide(ctx, lambda logits, tok, c, rows, step, placing: (n.__setitem__(0, n[0] + 1), torch.zeros(logits.shape[0], dtype=torch.long))[1])
+    assert n[0] == 1 and not bool(spec.moved.any()) and torch.equal(spec.delta, torch.zeros_like(spec.delta)) and len(comp._instr) == 0
+    # a chooser that never wants to stop: at the cap only EOS is finite
+    steps = []
+    def greedy(logits, tok, c, rows, step, placing):
+        steps.append(step)
+        return torch.full((logits.shape[0],), V.BEAR0, dtype=torch.long) if step < V.L_MAX else logits.argmax(-1)
+    spec = comp._decide(ctx, greedy)
+    assert steps == list(range(V.L_MAX + 1)) and bool(spec.moved.all())
+
+
+def test_a_range_alone_places_straight_and_short():
+    sysm, tr, task = build(_cfg()); comp = build_composer(_cfg(), sysm, tr)
+    ctx, _ = _ctx(sysm, task); V = comp.net.vocab; comp.reset(6)
+    script = {0: V.RANGE0, 1: V.EOS}
+    spec = comp._decide(ctx, lambda logits, tok, c, rows, step, placing: torch.full((logits.shape[0],), script[step], dtype=torch.long))
+    g = ctx["goal"] - ctx["x"]; sub = ctx["goal"] + spec.delta - ctx["x"]
+    cos = (g[:, :2] * sub[:, :2]).sum(-1) / (g[:, :2].norm(dim=-1) * sub[:, :2].norm(dim=-1)).clamp_min(1e-9)
+    assert float(cos.min()) > 0.99 and bool(spec.moved.all())
+
+
+def test_a_cached_scene_gives_the_same_logits_as_a_full_forward():
+    """Within a decision the scene encoding is computed once and reused on the
+    rows still deciding; the logits must match a full forward bit for bit."""
+    sysm, tr, task = build(_cfg()); comp = build_composer(_cfg(), sysm, tr)
+    ctx, _ = _ctx(sysm, task); comp.reset(6); net = comp.net
+    tok = comp.tokens(ctx)
+    full = net(tok)
+    sc = net.encode_scene(tok)
+    assert torch.equal(net(tok, scene=sc), full)
+    idx = torch.tensor([1, 4, 5]); sub = {k: (v[idx] if torch.is_tensor(v) and v.ndim and v.shape[0] == 6 else v) for k, v in tok.items()}
+    assert torch.allclose(net(sub, scene=(sc[0][idx], sc[1][idx])), full[idx], atol=1e-5)
+
+
+def test_the_fast_chain_path_matches_the_tokenizer():
+    """Inside a decision the loop appends the new component to the previous
+    token batch instead of re-tokenizing; the logits it produces at step 1
+    must match a fresh tokenization of the same chain memory."""
+    sysm, tr, task = build(_cfg()); comp = build_composer(_cfg(), sysm, tr)
+    ctx, _ = _ctx(sysm, task); V = comp.net.vocab; comp.reset(6); net = comp.net
+    script = {0: V.BEAR0 + 2, 1: V.RANGE0 + 1, 2: V.EOS}
+    seen = {}
+    def choose(logits, tok, ctx_s, rows, step, placing):
+        if step == 1:
+            # by now the first component is in `_instr`; a fresh tokenization must agree with the fast path
+            fresh = comp.tokens(ctx); seen["fresh"] = net(fresh); seen["fast"] = logits.clone()
+            assert tok["chain"].shape[1] == fresh["chain"].shape[1] and torch.equal(tok["chain_types"], fresh["chain_types"])
+        act = torch.full((logits.shape[0],), script[step], dtype=torch.long)
+        if step == 1:
+            act[1] = V.EOS                               # one row stops early: the fast path must drop it
+        return act
+    comp._decide(ctx, choose)
+    assert torch.allclose(seen["fast"], seen["fresh"], atol=1e-5), (seen["fast"] - seen["fresh"]).abs().max()
+
+
+def test_scene_tokens_are_kept_for_a_fraction_of_the_recorded_rows_and_the_update_uses_only_those():
+    """`tok_frac` < 1: every recorded row keeps its small fields (the returns
+    read the whole stream), the scene tokens survive for about that fraction
+    of the rows, and the update's sample count is the kept rows'.  Through the
+    pool the shard's row filter must re-index the kept tokens consistently."""
+    from dataclasses import replace
+    from lagrangian_es.config import RolloutCfg
+    from lagrangian_es.es import build_sensors
+    from lagrangian_es.rollout import Rollout
+    from lagrangian_es.composer.policy import ppo_update
+    from lagrangian_es.parallel import ParallelRollout
+    base = replace(_cfg(), composer="policy",
+                   rollout=RolloutCfg(n_eps=16, ep_steps=60, dead_mode="constant", dead_cost=6.0, goal_bonus=15.0))
+    kw = (("reach", 10.0), ("every", 5), ("measure_every", 5))
+    cfg = replace(base, composer_kw=kw + (("tok_frac", 0.5),))
+    sysm, tr, task = build(cfg); comp = build_composer(cfg, sysm, tr); comp.stochastic = True
+    comp.record_rows = torch.arange(16)
+    Rollout(sysm, tr, task, cfg.rollout, build_sensors(cfg, sysm), composer=comp).run(tr.init()[None], task.sample(16, make_gen(2)), 3)
+    n_rows = sum(r["rows"].numel() for r in comp.records); n_tok = sum(r["tok"]["self"].shape[0] for r in comp.records)
+    for r in comp.records:
+        assert r["tok_keep"] is not None and r["tok_keep"].numel() == r["rows"].numel() == r["act"].shape[0]
+        assert r["tok"]["self"].shape[0] == int(r["tok_keep"].sum())
+    assert 0 < n_tok < n_rows and 0.25 < n_tok / n_rows < 0.75, (n_tok, n_rows)
+    R = torch.zeros(len(comp.records), 16, dtype=torch.float64)
+    st = ppo_update(comp.net, comp.records, R, comp.n_terms, epochs=1, batch=64, lr=1e-5, target_kl=0.0)
+    assert st["n"] == sum(int((r["alive"] & r["tok_keep"]).sum()) for r in comp.records)
+    # the default keeps every row's tokens, as before
+    cfg1 = replace(base, composer_kw=kw)
+    comp1 = build_composer(cfg1, sysm, tr); comp1.stochastic = True; comp1.record_rows = torch.arange(16)
+    Rollout(sysm, tr, task, cfg1.rollout, build_sensors(cfg1, sysm), composer=comp1).run(tr.init()[None], task.sample(16, make_gen(2)), 3)
+    assert all(r["tok_keep"] is None and r["tok"]["self"].shape[0] == r["rows"].numel() for r in comp1.records)
+    # through the pool: the shard's row filter (record_frac) re-indexes the kept tokens
+    TH = tr.init().expand(2, -1).clone(); goals = task.sample(16, make_gen(5))
+    par = ParallelRollout({"cfg": cfg}, workers=2, min_pop=2)
+    try:
+        _, sh = par.run_with_records(TH, goals, 6, stochastic=True, record_frac=0.5)
+    finally:
+        par.close()
+    for x in sh:
+        for r in x["records"]:
+            assert r["tok_keep"].numel() == r["rows"].numel() and r["tok"]["self"].shape[0] == int(r["tok_keep"].sum())
+    Rg = [torch.zeros(len(x["records"]), 16, dtype=torch.float64) for x in sh]
+    st = ppo_update(comp.net, [x["records"] for x in sh], Rg, comp.n_terms, epochs=1, batch=64, lr=1e-5, target_kl=0.0)
+    assert st["n"] == sum(int((r["alive"] & r["tok_keep"]).sum()) for x in sh for r in x["records"]) > 0

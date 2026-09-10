@@ -32,6 +32,7 @@ class TaskSpec:
     gate: Tensor
     yaw: Optional[Tensor] = None      # [B] commanded heading, world frame; None = the plant's own look-at
     yaw_gate: Optional[Tensor] = None # [B] in [0, 1]: 0 = the plant's look-at, 1 = the command
+    moved: Optional[Tensor] = None    # [B] bool: rows given a NEW subgoal by this call; None = every row
 
     @property
     def weight(self) -> Tensor:
@@ -49,16 +50,24 @@ class TaskSpec:
     def clone(self) -> "TaskSpec":
         return TaskSpec(self.delta.clone(), self.alpha.clone(), self.gate.clone(),
                         None if self.yaw is None else self.yaw.clone(),
-                        None if self.yaw_gate is None else self.yaw_gate.clone())
+                        None if self.yaw_gate is None else self.yaw_gate.clone(),
+                        None if self.moved is None else self.moved.clone())
 
     def where(self, mask: Tensor, other: "TaskSpec") -> "TaskSpec":
         """Rows where `mask` is true from self, the rest from `other`."""
         m = mask.unsqueeze(-1)
         yaw = None if self.yaw is None or other.yaw is None else torch.where(mask, self.yaw, other.yaw)
         yg = None if self.yaw_gate is None or other.yaw_gate is None else torch.where(mask, self.yaw_gate, other.yaw_gate)
-        return TaskSpec(torch.where(m, self.delta, other.delta),
-                        torch.where(m, self.alpha, other.alpha),
-                        torch.where(m, self.gate, other.gate), yaw, yg)
+        out = TaskSpec(torch.where(m, self.delta, other.delta),
+                       torch.where(m, self.alpha, other.alpha),
+                       torch.where(m, self.gate, other.gate), yaw, yg)
+        a, b = getattr(self, "moved", None), getattr(other, "moved", None)
+        if a is not None and b is not None:
+            out.moved = torch.where(mask, a, b)
+        elif a is not None or b is not None:
+            z = torch.zeros_like(mask)
+            out.moved = torch.where(mask, a if a is not None else z, b if b is not None else z)
+        return out
 
 
 class SpecHold:
@@ -88,6 +97,15 @@ class SpecHold:
         else:
             self.target = spec.where(rows, self.target)
             self.age = torch.where(rows, torch.zeros_like(self.age), self.age)
+
+    def snap(self, rows: Tensor) -> None:
+        """Realize the target at once on `rows`, with no slew.  For a placement
+        that follows a leg change: the hold rate-limits the composer's own
+        moves, but a leg change is the TASK's step input, which the controller
+        without a composer sees as a jump -- slewing it here made the identity
+        composer differ from no composer by 2.8e-2 in cost on the leg that
+        changed inside the episode."""
+        self.realized = self.target.where(rows, self.realized)
 
     def step(self) -> TaskSpec:
         """Advance the realized spec one control step toward the target."""

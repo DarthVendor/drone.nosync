@@ -24,7 +24,7 @@ from torch import Tensor, nn
 
 from .base import COMPOSERS, Composer
 from .spec import TaskSpec
-from .tokens import F, N_TYPES, Tokenizer, to_world
+from .tokens import ACT_SCALE, F, INSTR, N_TYPES, Tokenizer, to_world
 
 
 class Block(nn.Module):
@@ -101,73 +101,86 @@ class Block(nn.Module):
 
 
 class ComposerNet(nn.Module):
+    """The composer as a language model over the flight: the scene tokens,
+    the chain of measurement and action tokens, and one ACTION TOKEN out."""
+
     def __init__(self, n_terms: int, d: int = 64, heads: int = 4, n_scene: int = 2,
                  n_chain: int = 2, n_read: int = 1, n_types: int = N_TYPES):
         super().__init__()
+        from .actions import Vocab
+        self.vocab = Vocab(n_terms); V = self.vocab.V
         self.embed = nn.Linear(F, d); self.type_emb = nn.Embedding(n_types, d)
+        self.act_emb = nn.Embedding(V, d)                            # an action token in the chain, by id
         self.scene = nn.ModuleList([Block(d, heads) for _ in range(n_scene)])
         self.chain = nn.ModuleList([Block(d, heads) for _ in range(n_chain)])
         self.constraint = nn.Parameter(torch.randn(n_terms, d) * 0.02)
-        self.pool = nn.Parameter(torch.randn(1, d) * 0.02)          # reads the subgoal
+        self.pool = nn.Parameter(torch.randn(1, d) * 0.02)          # the query the action is read from
         self.read = nn.ModuleList([Block(d, heads, cross=True) for _ in range(n_read)])
         self.ln = nn.LayerNorm(d)
-        self.head_w = nn.Linear(d, 2)                                # per constraint: alpha, gate
-        self.head_sub = nn.Linear(d, 3)                              # from the pool token
-        self.head_yaw = nn.Linear(d, 2)                              # heading delta (ego), gate logit
+        self.head_act = nn.Linear(d, V)                              # logits over the vocabulary
         self.n_terms = n_terms
-        # The IDENTITY prior.  Fresh heads emit random term weights -- a gate
-        # of 0.3 runs the low level at 30% strength -- and a random sub-goal,
-        # and measured, that killed every flight (0.000 reach / 1.000 crash
-        # against 0.227 / 0.773 with no composer).  So the heads start at the
-        # composer Stage A trained with: unit priorities, open gates, and a
-        # sub-goal toward the goal; learning is a deviation from that.
-        nn.init.zeros_(self.head_w.weight); nn.init.zeros_(self.head_sub.weight); nn.init.zeros_(self.head_yaw.weight)
+        nn.init.normal_(self.act_emb.weight, std=0.02)
+        # The prior: HOLD.  A fresh head would emit a random token every
+        # report -- measured on the first day, a random composer killed every
+        # flight.  So the head starts silent: the subgoal is the goal itself,
+        # the straight line, and every other token is a learned deviation.
+        nn.init.zeros_(self.head_act.weight)
         with torch.no_grad():
-            self.head_w.bias.copy_(torch.tensor([math.log(math.expm1(1.0)), 4.0]))   # softplus -> 1, sigmoid -> 0.98
-            self.head_sub.bias.zero_()
-            # heading: no delta, gate ~ 0.02 -> the plant keeps its look-at until the composer takes over
-            self.head_yaw.bias.copy_(torch.tensor([0.0, -4.0]))
+            # ~80% HOLD, ~11% "continue straight at full reach", the other 47
+            # tokens ~0.2% each.  Measured with straight at the same prior as the
+            # rest: a sampled flight speaks a random token every ~2 s and none
+            # survived 36 s (0.000 / 1.000); with continuing the default word,
+            # sampled flights mostly fly on and the update can learn WHEN to
+            # say it, and what else to say, from flights that arrive.
+            self.head_act.bias.zero_(); self.head_act.bias[self.vocab.HOLD] = 6.0; self.head_act.bias[self.vocab.straight] = 4.0
 
-    goal_gain = 4.0    # scale/reach, so the residual base is the goal in reach units
+    goal_gain = 4.0    # scale/reach, so the goal token reads in reach units
 
-    def forward(self, tok: Dict[str, Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
-        B = tok["self"].shape[0]
-        te = self.type_emb
+    def goal_ego(self, tok):
+        """The goal offset in the ego frame, in units of the reach."""
+        return tok["goal"][:, :3] * self.goal_gain
+
+    def _chain_in(self, tok):
+        ch = self.embed(tok["chain"]) + self.type_emb(tok["chain_types"])
+        ids = (tok["chain"][..., 0] * ACT_SCALE).round().long().clamp(0, self.vocab.V - 1)
+        return ch + self.act_emb(ids) * (tok["chain_types"] == INSTR).to(ch.dtype)[..., None]
+
+    def encode_scene(self, tok: Dict[str, Tensor], store=None):
+        """The scene encoding (self, goal, entities through the scene blocks)
+        and its padding mask.  It does not depend on the chain, so within one
+        decision it is computed once and reused for every component step
+        (measured: the chain loop ran the whole net five times per report)."""
+        B = tok["self"].shape[0]; te = self.type_emb
         scene = torch.cat([self.embed(tok["self"])[:, None] + te.weight[0],
                            self.embed(tok["goal"])[:, None] + te.weight[1],
                            self.embed(tok["entities"]) + te(tok["ent_types"])], 1)
         smask = torch.cat([torch.zeros(B, 2, dtype=torch.bool, device=scene.device), ~tok["ent_mask"]], 1)
         for blk in self.scene:
-            scene = blk(scene, mask=smask)
-        mem, mmask = scene, smask
+            scene = blk(scene, mask=smask, store=None if store is None else store.setdefault("scene", {}))
+        return scene, smask
+
+    def read_out(self, tok: Dict[str, Tensor], store=None, scene=None) -> Tensor:
+        """The pool query after the read layer, [B, d].  `scene`: a
+        precomputed (encoding, mask) from `encode_scene` for these rows."""
+        B = tok["self"].shape[0]
+        mem, mmask = scene if scene is not None else self.encode_scene(tok, store)
         if tok["chain"].shape[1]:
-            ch = self.embed(tok["chain"]) + te(tok["chain_types"])
+            ch = self._chain_in(tok)
             L = ch.shape[1]
             causal = torch.triu(torch.ones(L, L, dtype=torch.bool, device=ch.device), 1)
             for i, blk in enumerate(self.chain):
-                ch = blk(ch, attn_mask=causal, last=i == len(self.chain) - 1)
+                ch = blk(ch, attn_mask=causal, mask=tok.get("chain_mask"), store=None if store is None else store.setdefault("chain", {}),
+                         last=i == len(self.chain) - 1)
             mem = torch.cat([mem, ch[:, -1:]], 1)                   # the latest chain state
             mmask = torch.cat([mmask, torch.zeros(B, 1, dtype=torch.bool, device=ch.device)], 1)
         q = torch.cat([self.pool.expand(B, -1, -1), self.constraint.expand(B, -1, -1)], 1)
         for blk in self.read:
-            q = blk(q, mem=mem, mem_mask=mmask)
-        q = self.ln(q)
-        # Radial tanh: a per-component tanh bounds a CUBE whose corner sits at
-        # sqrt(3) * reach, and a sample was measured 5.6 m underground.  Bounding
-        # the norm keeps the subgoal inside the reach BALL by construction.
-        # residual on the goal direction: the goal token's first three
-        # features are the ego-frame goal offset over the scale; at init the
-        # head is zero and the sub-goal points at the goal
-        g = tok["goal"][:, :3] * self.goal_gain
-        h = self.head_sub(q[:, 0]) + g
-        n = h.norm(dim=-1, keepdim=True).clamp_min(1e-9)
-        sub = torch.tanh(n) * h / n                                  # |sub| < 1, ego frame
-        aw = self.head_w(q[:, 1:])
-        alpha = nn.functional.softplus(aw[..., 0]) + 1e-3
-        gate = torch.sigmoid(aw[..., 1])
-        hy = self.head_yaw(q[:, 0])
-        self.last_yaw = (math.pi * torch.tanh(hy[:, 0]), torch.sigmoid(hy[:, 1]))   # ego delta, gate
-        return sub, alpha, gate
+            q = blk(q, mem=mem, mem_mask=mmask, store=None if store is None else store.setdefault("read", {}))
+        return self.ln(q)[:, 0]
+
+    def forward(self, tok: Dict[str, Tensor], store=None, scene=None) -> Tensor:
+        """Logits over the action vocabulary, [B, V]."""
+        return self.head_act(self.read_out(tok, store, scene))
 
 
 class TransformerComposer(Composer):
@@ -208,10 +221,10 @@ class TransformerComposer(Composer):
         self.weights_path = weights
         if weights:
             import os
-            self.net.load_state_dict(torch.load(weights, map_location="cpu"))
+            load_composer_weights(self.net, weights)
             self._weights_mtime = os.path.getmtime(weights)
         self.net.eval()
-        self._instr: List[Tuple[float, Tensor, Tensor]] = []     # (t, delta, weight)
+        self._instr: List[Tuple[float, Tensor, Tensor]] = []     # (t, action token per row, valid rows)
 
     def attach(self, sensors):
         """The rollout hands over its sensors so bearings come from them."""
@@ -222,42 +235,150 @@ class TransformerComposer(Composer):
 
     def tokens(self, ctx):
         rows = getattr(self, "_rows", None)
-        instr = self._instr if rows is None else [(t, d[rows], w[rows]) for t, d, w in self._instr]
+        instr = self._instr if rows is None else [tuple([e[0]] + [v[rows] for v in e[1:]]) for e in self._instr]
         tok = self.tok(ctx, instr)
         return {k: (v.to(self.net_dtype) if torch.is_tensor(v) and v.is_floating_point() else v) for k, v in tok.items()}
 
-    @torch.no_grad()
-    def emit(self, ctx):
-        tok = self.tokens(ctx)
-        sub, alpha, gate = self.net(tok)
-        sub, alpha, gate = sub.to(self.dtype), alpha.to(self.dtype), gate.to(self.dtype)
+    monitors = True         # asked at every report; a HOLD token changes nothing
+
+    def _current(self, ctx, B):
+        """The rows' current target spec, from the rollout when it has one."""
+        cur = ctx.get("spec")
+        if cur is None:
+            cur = TaskSpec.identity(B, self.d, self.n_terms, self.dtype, ctx["x"].device)
+        return cur
+
+    def _apply(self, ids, ctx, tok):
         x, goal, psi = ctx["x"], ctx["goal"], tok["psi"].to(self.dtype)
-        sub_world = x + to_world(sub * self.reach, psi)              # inside the reach ball
-        # a subgoal below the floor is not in the reachable set; this is an
-        # interlock like the ground release, not something to learn
-        sub_world = torch.cat([sub_world[:, :2], sub_world[:, 2:].clamp_min(self.z_min)], -1)
-        dpsi, yg = (v.to(self.dtype) for v in self.net.last_yaw)
-        spec = TaskSpec(delta=sub_world - goal, alpha=alpha, gate=gate, yaw=psi + dpsi, yaw_gate=yg)
-        self._remember(ctx, spec)
+        spec = self.net.vocab.apply(ids, self._current(ctx, x.shape[0]), x, goal, psi, self.net.goal_ego(tok).to(self.dtype),
+                                    self.reach, self.z_min)
+        self._remember(ctx, ids)
         return spec
 
-    def _remember(self, ctx, spec):
-        """Append this instruction to the per-row memory.  When the rollout
-        asked only about live rows (`_rows` set), scatter into a full-batch
-        record so every row's history keeps its own shape."""
+    @staticmethod
+    def _sub_ctx(ctx, idx, B):
+        """The context restricted to rows `idx` (tensors with a leading dim
+        of B, nested dicts and lists of them, and the TaskSpec)."""
+        def take(v):
+            if torch.is_tensor(v):
+                return v[idx] if v.ndim and v.shape[0] == B else v
+            if isinstance(v, TaskSpec):
+                return TaskSpec(v.delta[idx], v.alpha[idx], v.gate[idx],
+                                None if v.yaw is None else v.yaw[idx], None if v.yaw_gate is None else v.yaw_gate[idx],
+                                None if getattr(v, "moved", None) is None else v.moved[idx])
+            if isinstance(v, dict):
+                return {k: take(w) for k, w in v.items()}
+            if isinstance(v, list):
+                return [take(w) for w in v]
+            return v
+        return {k: take(v) for k, v in ctx.items()}
+
+    def _decide(self, ctx, choose):
+        """A DECISION per row: components chained until EOS (or L_MAX, when
+        EOS is the only token left), each chosen by `choose(logits, tok,
+        ctx_s, rows_ids, step, placing)` over the rows still deciding.  A
+        component is written to the chain as soon as it is made, so the next
+        one is chosen in sight of it; at EOS the pending placement is made.
+
+        Only step 0 tokenizes and encodes the scene.  Every later step keeps
+        the previous token batch, drops the rows that emitted EOS, appends
+        the component they just made as one chain row (age 0, valid), and
+        reuses the scene encoding -- the scene, the measurement events and
+        the older instructions cannot change inside a decision.  (Re-running
+        the tokenizer and the whole net per step was 5 net calls a report.)"""
+        x, goal = ctx["x"], ctx["goal"]; B = x.shape[0]
+        rows_full = getattr(self, "_rows", None)
+        ids_full = rows_full if rows_full is not None else torch.arange(B, device=x.device)
+        if rows_full is None:
+            self._B = B                                    # the chain memory's width, when called without a reset
+        V = self.net.vocab
+        tok0 = self.tokens(ctx); psi = tok0["psi"].to(self.dtype); g_ego = self.net.goal_ego(tok0).to(self.dtype)
+        out, pb, pr = V.begin(self._current(ctx, B), psi)
+        active = torch.ones(B, dtype=torch.bool, device=x.device)
+        alive0 = ctx["alive"]; t_now = ctx.get("t", 0)
+        saved = getattr(self, "_rows", None)
+        tok_cur, cur_pos, last_act, scene0 = tok0, torch.arange(B, device=x.device), None, None
+        try:
+            for step in range(V.L_MAX + 1):
+                idx = active.nonzero().flatten()
+                if idx.numel() == 0:
+                    break
+                if step == 0:
+                    tok = tok0; scene0 = self.net.encode_scene(tok0); sc = scene0
+                else:
+                    keep = torch.isin(cur_pos, idx)                          # rows still deciding, in `idx` order
+                    n_prev = cur_pos.numel()
+                    tok = {k: (v[keep] if torch.is_tensor(v) and v.ndim and v.shape[0] == n_prev else v) for k, v in tok_cur.items()}
+                    ch = tok["chain"]; n = idx.numel()
+                    row = torch.zeros(n, 1, ch.shape[-1], dtype=ch.dtype, device=ch.device)
+                    row[:, 0, 0] = last_act[keep].to(ch.dtype) / ACT_SCALE       # the component just made: id, age 0
+                    chain = torch.cat([ch, row], 1)
+                    ctypes = torch.cat([tok["chain_types"], torch.full((n, 1), INSTR, dtype=torch.long, device=ch.device)], 1)
+                    cmask = torch.cat([tok["chain_mask"], torch.zeros(n, 1, dtype=torch.bool, device=ch.device)], 1)
+                    kc = self.tok.kc
+                    if chain.shape[1] > kc:
+                        chain, ctypes, cmask = chain[:, -kc:], ctypes[:, -kc:], cmask[:, -kc:]
+                    tok["chain"], tok["chain_types"], tok["chain_mask"] = chain, ctypes, cmask
+                    sc = (scene0[0][idx], scene0[1][idx])
+                self._rows = ids_full[idx]
+                logits = self.net.pre(tok, scene=sc)[0] if hasattr(self.net, "pre") else self.net(tok, scene=sc)
+                if step == V.L_MAX:                                   # the cap: only EOS is left
+                    forced = torch.full_like(logits, float("-inf")); forced[:, V.EOS] = 0.0; logits = forced
+                placing = (pb[idx] >= 0) | (pr[idx] >= 0)
+                ctx_s = {"alive": alive0[idx], "t": t_now}
+                act = choose(logits, tok, ctx_s, ids_full[idx], step, placing)
+                V.step(act, out, pb, pr, psi, rows=idx)
+                self._remember(ctx_s, act)
+                tok_cur, cur_pos, last_act = tok, idx, act
+                active[idx[act == V.EOS]] = False
+        finally:
+            self._rows = saved
+        return V.finish(out, pb, pr, x, goal, psi, g_ego, self.reach, self.z_min)
+
+    @torch.no_grad()
+    def emit(self, ctx):
+        return self._decide(ctx, lambda logits, tok, ctx_s, rows, step, placing: logits.argmax(-1))
+
+    def _remember(self, ctx, ids):
+        """Append the action tokens to the per-row chain memory: one entry
+        per report, valid for the rows that spoke (HOLD is silence).  When
+        only some rows were asked (`_rows`), scatter into full width."""
         rows = getattr(self, "_rows", None)
-        if rows is None:
-            d, w = spec.delta.clone(), spec.weight.clone()
-        else:
-            if self._instr:
-                _, d, w = self._instr[-1]; d, w = d.clone(), w.clone()
-            else:
-                d = torch.zeros(self._B, spec.delta.shape[-1], dtype=spec.delta.dtype, device=spec.delta.device)
-                w = torch.ones(self._B, spec.weight.shape[-1], dtype=spec.weight.dtype, device=spec.weight.device)
-            d[rows] = spec.delta; w[rows] = spec.weight
-        self._instr.append((float(ctx.get("t", 0)), d, w))
+        B = ids.shape[0] if rows is None else self._B
+        dev = ids.device
+        full = torch.zeros(B, dtype=torch.long, device=dev); valid = torch.zeros(B, dtype=torch.bool, device=dev)
+        spoke = ids != self.net.vocab.HOLD
+        sel = spoke.nonzero().flatten() if rows is None else rows[spoke]
+        full[sel] = ids[spoke]; valid[sel] = True
+        if not bool(valid.any()):
+            return
+        self._instr.append((float(ctx.get("t", 0)), full, valid))
         if len(self._instr) > 4 * self.tok.kc:
             self._instr = self._instr[-2 * self.tok.kc:]
+
+
+def load_composer_weights(net: nn.Module, path: str) -> None:
+    """Load a checkpoint into a `ComposerNet`.  One written before the action
+    vocabulary carries continuous heads this net no longer has; its body
+    (embeddings, blocks) is taken and the action head keeps its prior."""
+    sd = torch.load(path, map_location="cpu")
+    sd = {k: v for k, v in sd.items() if not k.startswith(("head_w", "head_sub", "head_yaw", "head_move", "log_std"))}
+    own = net.state_dict()
+    # a checkpoint from a different term count or vocabulary: the parameters
+    # whose shape changed (constraint queries, action head, action embedding)
+    # keep their prior; the body is what carries over
+    sd = {k: v for k, v in sd.items() if k in own and tuple(own[k].shape) == tuple(v.shape)}
+    # The heads may keep their prior (a vocabulary change, a checkpoint
+    # without a value head); the BODY may not.  A body key that fails to
+    # load means the checkpoint is for another net, and loading it silently
+    # would fly the untrained prior while claiming the weights were loaded.
+    heads = ("head_act", "value", "act_emb")          # vocabulary-sized: the action head, the value head, the action embedding
+    body_skipped = [k for k in own if k not in sd and not k.startswith(heads)]
+    if body_skipped:
+        raise ValueError(f"{path}: {len(body_skipped)} body parameters do not match this net (e.g. {body_skipped[:3]}); "
+                         f"a different width, depth or token layout -- refusing to load a checkpoint that would leave the body at its prior")
+    missing, unexpected = net.load_state_dict(sd, strict=False)
+    assert not unexpected, unexpected
 
 
 COMPOSERS["transformer"] = TransformerComposer

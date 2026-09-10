@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -74,9 +75,10 @@ def _from_ipc(x):
 def _init(spec: dict) -> None:
     # `threads`: a composer in the loop is matmul-bound, and four single-
     # threaded workers leave the efficiency cores idle
+    # (an unconditional reset to 1 used to follow this line, so every worker
+    # ran single-threaded whatever the setting; measured ~97% CPU a worker)
     torch.set_num_threads(int(spec.get("threads", 1)))
     global _RIG
-    torch.set_num_threads(1)          # workers must not fight each other for cores
     from .es import build, build_sensors
 
     cfg = spec["cfg"]
@@ -104,10 +106,24 @@ def _init(spec: dict) -> None:
     # `compile_forward` measured a genuine 3.16x SINGLE-PROCESS and stays
     # available for that.  Here it is forced off rather than left to whoever
     # writes the config, because the failure is silent.
+    #
+    # Sept 10 2026: that hang looked exactly like the swap thrash seen the same
+    # day (load 40-100 with every worker at 0-30% CPU, 64 MB free, 5 GB in the
+    # compressor).  Inductor's default compile pool is `compile_threads` = 10
+    # SUBPROCESSES per worker, each a full torch import: eight workers spawn
+    # eighty of them, and this 16 GB machine goes to swap.  So compilation in a
+    # worker is opt-in (`spec["compile_workers"]`) and runs with ONE compile
+    # thread, in-process, no pool; the shard batch is one fixed shape, so each
+    # worker compiles once per shard size and the on-disk FX graph cache lets
+    # later workers and relaunches skip the code generation.
     rc = cfg.rollout
     if getattr(rc, "compile_forward", False):
-        from dataclasses import replace
-        rc = replace(rc, compile_forward=False)
+        if spec.get("compile_workers"):
+            import torch._inductor.config as _ic
+            _ic.compile_threads = 1
+        else:
+            from dataclasses import replace
+            rc = replace(rc, compile_forward=False)
     from .es import build_composer
     # the task-level layer, if the config names one: a worker that flew
     # without it would rank a different controller from the one the parent
@@ -119,8 +135,12 @@ def _init(spec: dict) -> None:
 def _work(payload):
     TH, goals, seed = payload[:3]
     TH, goals = _tensor(TH), _tensor(goals)
-    stochastic, record_frac, shard = (payload[3:] + (False, 0.0, 0))[:3] if len(payload) > 3 \
-        else (False, 0.0, 0)
+    stochastic, record_frac, shard, difficulty = (payload[3:] + (False, 0.0, 0, None))[:4] if len(payload) > 3 \
+        else (False, 0.0, 0, None)
+    if difficulty is not None and hasattr(_RIG.system, "difficulty"):
+        # a curriculum on the scene: the fraction of obstacles left active this
+        # batch, set on the worker's own plant (the pool is forked once)
+        _RIG.system.difficulty = float(difficulty)
     comp = getattr(_RIG, "composer", None)
     if comp is not None and hasattr(comp, "stochastic"):
         # Reload the composer's weights if the file changed since this worker
@@ -137,10 +157,14 @@ def _work(payload):
         B_rows = TH.shape[0] * goals.shape[0]
         comp.record_rows = (torch.arange(0, B_rows, max(1, int(round(1.0 / record_frac))))
                             if (stochastic and record_frac > 0) else None)
+    _t0, _c0 = time.perf_counter(), time.process_time()
     r = _RIG.run(TH, goals, seed)
+    if os.environ.get("LES_WORK_TIMING"):
+        print(f"[work pid {os.getpid()} shard {shard} rows {TH.shape[0] * goals.shape[0]}: wall {time.perf_counter() - _t0:.1f}s cpu {time.process_time() - _c0:.1f}s]",
+              file=sys.stderr, flush=True)
     base = (r.fitness, r.cost, r.alive, r.leg_err, r.final_err, r.success,
             r.legs_done, r.finish_frac, r.saturation, r.effort, r.shaping, r.n_eps,
-            r.cost_sub, r.fitness_sub)
+            r.cost_sub, r.fitness_sub, r.death_step)
     if comp is None or record_frac <= 0 or not getattr(comp, "records", None):
         return _ipc(base + (None,))
     # Slim the composer's records to a fraction of rows, in float32: the
@@ -157,10 +181,15 @@ def _work(payload):
         # which is how the returns over the kept rows are indexed
         r = rc.get("rows", torch.arange(rc["act"].shape[0]))
         keep = pos_of[r] >= 0
-        recs.append({"t": rc["t"], "act": rc["act"][keep].float(), "alive": rc["alive"][keep],
-                     "rows": pos_of[r[keep]],
-                     "tok": {k: (v[keep].float() if torch.is_tensor(v) and v.is_floating_point()
-                                 else (v[keep] if torch.is_tensor(v) else v)) for k, v in rc["tok"].items()}})
+        tk = rc.get("tok_keep")                            # the rows whose scene tokens were kept (see PolicyComposer.tok_frac)
+        keep_t = keep if tk is None else keep[tk]          # the same filter, over the token rows
+        recs.append({"t": rc["t"], "act": rc["act"][keep], "alive": rc["alive"][keep],
+                     "rows": pos_of[r[keep]], "moved": rc["moved"][keep] if "moved" in rc else None,
+                     "logits": rc["logits"][keep] if "logits" in rc else None,
+                     "pi_logits": rc["pi_logits"][keep] if "pi_logits" in rc else None,   # the policy at collection: the update's trust region
+                     "tok_keep": None if tk is None else tk[keep],
+                     "tok": {k: (v[keep_t].float() if torch.is_tensor(v) and v.is_floating_point()
+                                 else (v[keep_t] if torch.is_tensor(v) else v)) for k, v in rc["tok"].items()}})
     chain = [{k: (v[sel] if torch.is_tensor(v) else v) for k, v in tok.items()} for tok in _RIG.chain]
     comp.records = []
     n_sub = getattr(_RIG, "n_subgoals", None)
@@ -200,7 +229,7 @@ def _merge(parts) -> RolloutResult:
         fitness=cat(0), cost=cat(1), alive=cat(2), leg_err=cat(3),
         final_err=cat(4), success=cat(5), legs_done=cat(6), finish_frac=cat(7),
         saturation=cat(8), effort=cat(9), shaping=cat(10), n_eps=parts[0][11],
-        cost_sub=opt(12), fitness_sub=opt(13))
+        cost_sub=opt(12), fitness_sub=opt(13), death_step=opt(14))
 
 
 def _records(parts, step: int, n_eps: int):
@@ -210,8 +239,8 @@ def _records(parts, step: int, n_eps: int):
     out = []
     parts = [_from_ipc(p) for p in parts]
     for i, p in enumerate(parts):
-        if len(p) > 14 and p[14] is not None:
-            rec = dict(p[14]); rec["rows"] = rec["rows"] + i * step * n_eps
+        if len(p) > 15 and p[15] is not None:
+            rec = dict(p[15]); rec["rows"] = rec["rows"] + i * step * n_eps
             out.append(rec)
     return out
 
@@ -255,7 +284,7 @@ class ParallelRollout:
     """
 
     def __init__(self, spec: dict, workers: Optional[int] = None,
-                 min_pop: int = 32, threads: Optional[int] = None):
+                 min_pop: int = 32, threads: Optional[int] = None, shards: Optional[int] = None):
         self.spec = dict(spec)
         if threads is None:
             # With a composer in the loop each worker is matmul-bound (the
@@ -268,6 +297,11 @@ class ParallelRollout:
         self.spec["threads"] = int(threads)
         self.workers = int(workers or default_workers())
         self.min_pop = int(min_pop)
+        # More shards than workers, dispatched one at a time: on a machine with
+        # performance AND efficiency cores (this Mac: 4 + 6) equal static shards
+        # wait on the slowest core, and eight workers bought nothing over four.
+        # With P shards a fast worker takes several while a slow one takes one.
+        self.shards = None if shards is None else int(shards)
         self._pool: Optional[ProcessPoolExecutor] = None
         self._local: Optional[Rollout] = None
 
@@ -280,6 +314,25 @@ class ParallelRollout:
             # far faster.  Workers are pinned to one thread each, and the parent
             # is single-threaded here anyway, so there is nothing to fork unsafely.
             torch.set_num_threads(1)
+            if self.spec.get("compile_workers"):
+                # Compiling in a forked child crashed the child outright on
+                # macOS (Sept 10 2026): "+[MPSGraphObject initialize] may have
+                # been in progress in another thread when fork() was called ...
+                # Crashing instead" -- the compiler's first use touches Metal's
+                # graph classes, and Objective-C refuses to run a class
+                # initializer in a forked child.  So the compiler is exercised
+                # once HERE, before the fork, with one compile thread (no
+                # subprocess pool to inherit); the children find it initialised.
+                import os
+                import torch._inductor.config as _ic
+                _ic.compile_threads = 1
+                # The generated kernels' OpenMP regions ignored `torch.set_num_threads(1)`
+                # in a forked child (libomp re-initialises after fork): two compiled
+                # workers ran 2x SLOWER than eager until OMP_NUM_THREADS pinned them
+                # (Sept 10 2026: 27-32 s -> 12 s per batch).  Inherited by the children.
+                os.environ.setdefault("OMP_NUM_THREADS", str(int(self.spec.get("threads", 1))))
+                if self.spec.get("compile_warmup", True):
+                    torch.compile(lambda x: x * 2.0 + 1.0, dynamic=False)(torch.ones(4))
             try:
                 ctx = mp.get_context("fork")
             except ValueError:                      # platform without fork
@@ -317,7 +370,7 @@ class ParallelRollout:
         return _merge(self._pool_map(chunks))
 
     def run_with_records(self, TH: Tensor, goals: Tensor, seed: int,
-                         stochastic: bool = True, record_frac: float = 0.125):
+                         stochastic: bool = True, record_frac: float = 0.125, difficulty=None):
         """`run`, and the composer's recorded decisions from every shard.
 
         For co-training: the GA ranks every flight from the merged result while
@@ -325,9 +378,11 @@ class ParallelRollout:
         `records`, `chain` and the global `rows` they belong to."""
         P = TH.shape[0]
         n = self._shards(P) if (self.workers > 1 and P >= self.min_pop) else 1
+        if self.shards and n > 1:
+            n = max(d for d in range(1, min(P, self.shards) + 1) if P % d == 0)     # the largest exact split up to `shards`
         step = P // n
         goals_ipc = _ipc(goals)
-        chunks = [(_ipc(TH[i * step:(i + 1) * step].contiguous()), goals_ipc, seed, stochastic, record_frac, i)
+        chunks = [(_ipc(TH[i * step:(i + 1) * step].contiguous()), goals_ipc, seed, stochastic, record_frac, i, difficulty)
                   for i in range(n)]
         parts = self._pool_map(chunks) if n > 1 else [_work_local(self._local_rig(), chunks[0])]
         return _merge(parts), _records(parts, step, goals.shape[0])

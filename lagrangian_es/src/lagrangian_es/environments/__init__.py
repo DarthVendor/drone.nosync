@@ -84,6 +84,11 @@ LOADERS = {
     "singapore_cbd": lambda: city_to_environment(MAPS / "singapore_cbd.json",
                                                  cull_k=12,
                                                  name="singapore_cbd"),
+    # nothing but corridors: a Manhattan grid of tall blocks with 4 m streets,
+    # ringed by a wall (scripts/corridor_city.py).  For the enclosed-space
+    # failure: walls on two sides everywhere, four blocks within reach at any
+    # junction, so cull_k 12 is exact with margin.
+    "corridors": lambda: city_to_environment(MAPS / "corridors.json", cull_k=12, name="corridors"),
 }
 
 

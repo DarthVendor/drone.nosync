@@ -104,6 +104,9 @@ def test_ga_step_preserves_elites_and_shape():
 # --------------------------------------------------------------------------- #
 # the loops
 # --------------------------------------------------------------------------- #
+MARGINAL = (0.25, 0.25, 0.25, 0.10, 0.10, 0.10)   # the old fixed attitude prior: 3.5 rad/s at damping 0.28, crashes untrained
+
+
 @pytest.mark.parametrize("strategy", ["es", "ga"])
 def test_training_improves_on_held_out_tasks(strategy):
     """The learning curve is noisy because goals are resampled every generation,
@@ -115,9 +118,13 @@ def test_training_improves_on_held_out_tasks(strategy):
     the optimizer correctly spends its budget on staying alive instead.  Testing
     waypoint accuracy on a task that cannot be completed measures nothing.
     """
+    # On the marginal prior, which leaves training something to fix; the
+    # plant-derived prior (2026-09-08) flies from generation 0 and 14 noisy
+    # generations of GA at two episodes a genome cannot beat it on 64 tasks.
     cfg = Config(seed=0, rollout=RolloutCfg(ep_steps=250, n_eps=2),
                  es=ESCfg(pop=16, gens=14, whiten=True, metric_every=4,
-                          strategy=strategy, sigma0=0.12, elite_frac=0.5))
+                          strategy=strategy, sigma0=0.12, elite_frac=0.5),
+                 system_kw=(("phi0", MARGINAL),))
     system, tr, task = build(cfg)
     res = train(cfg, system, tr, task)
     before = evaluate(system, tr, task, tr.init(), cfg.rollout, n_tasks=64)
@@ -209,7 +216,7 @@ def _bonus_costs(bonus, tol_scale=1.0):
     from lagrangian_es.tasks import make_task
     from lagrangian_es.trainables import make_trainable
 
-    system = make_system("quadrotor", dtype=DT)
+    system = make_system("quadrotor", dtype=DT, phi0=MARGINAL)   # reaches, drifts, dies: all three credit paths
     tr = make_trainable("energy_shaping", system)
     task = make_task("waypoint_pair", system, gating="arrival")
     task.tol = task.tol * tol_scale

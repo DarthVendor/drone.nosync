@@ -1,20 +1,19 @@
 """Training the composer against the objective, at its own timescale.
 
-There is no teacher.  The composer acts every few steps on what the drone
-perceives and what its stream reports, and is rewarded with the rollout's own
-cost -- the same cost the low level was evolved on, read off the measurement
-tokens -- so nothing about "how to navigate" is written into a reward.  The
-decision problem is short (a few hundred ticks) and the low level absorbs the
-dynamics, which is what makes a plain clipped policy gradient with a value
-baseline enough.
+There is no teacher.  The composer is a language model over the flight: at
+every report it reads the chain -- the drone's measurement tokens and its own
+earlier action tokens -- and emits one ACTION TOKEN (see `actions.Vocab`).
+It is rewarded with the rollout's own settled cost, read off the measurement
+stream, so nothing about "how to navigate" is written into a reward.
 
-`PolicyComposer` samples every head with a learned log-std and records what it
-saw and did; `ppo_update` fits the recorded stream.  Deterministic mode (the
-mean) is what gets judged.
+`PolicyComposer` samples the token on the rows the update will read and takes
+the mode elsewhere; `ppo_update` fits the recorded stream with the clipped
+policy gradient.  The categorical is exact: likelihoods, KL and entropy need
+no scale to tune, and a wide move is one token away.
 """
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import math
 
@@ -24,153 +23,166 @@ from torch import Tensor, nn
 from .base import COMPOSERS
 from .distill import collate
 from .spec import TaskSpec
-from .tokens import to_world
 from .transformer import ComposerNet, TransformerComposer
 
 
 class PolicyNet(ComposerNet):
     def __init__(self, n_terms, **kw):
         super().__init__(n_terms, **kw)
-        d = self.head_sub.in_features
+        d = self.embed.out_features
         self.value = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1))
-        # Exploration scale, MEASURED: on identical city legs the identity prior
-        # flies 0.354 reach / 0.646 crash deterministically and at a pre-
-        # activation std of 0.37 collapses to 0.000 / 0.875, at 0.14 to
-        # 0.042 / 0.708, at 0.05 keeps 0.354 / 0.646.  So it starts at 0.05;
-        # it is a parameter, and may grow if exploring further ever pays.
-        self.log_std = nn.Parameter(torch.full((3 + 2 * n_terms + 2,), -3.0))   # + heading delta, heading gate
 
-    def pre(self, tok, store=None):
-        """Pre-activations of every head, and the value, from the read tokens.
-        `store` collects attention weights for the explainer."""
-        B = tok["self"].shape[0]; te = self.type_emb
-        scene = torch.cat([self.embed(tok["self"])[:, None] + te.weight[0],
-                           self.embed(tok["goal"])[:, None] + te.weight[1],
-                           self.embed(tok["entities"]) + te(tok["ent_types"])], 1)
-        smask = torch.cat([torch.zeros(B, 2, dtype=torch.bool, device=scene.device), ~tok["ent_mask"]], 1)
-        for blk in self.scene:
-            scene = blk(scene, mask=smask, store=None if store is None else store.setdefault("scene", {}))
-        mem, mmask = scene, smask
-        if tok["chain"].shape[1]:
-            ch = self.embed(tok["chain"]) + te(tok["chain_types"])
-            L = ch.shape[1]
-            causal = torch.triu(torch.ones(L, L, dtype=torch.bool, device=ch.device), 1)
-            for i, blk in enumerate(self.chain):
-                ch = blk(ch, attn_mask=causal, store=None if store is None else store.setdefault("chain", {}),
-                         last=i == len(self.chain) - 1)
-            mem = torch.cat([mem, ch[:, -1:]], 1)
-            mmask = torch.cat([mmask, torch.zeros(B, 1, dtype=torch.bool, device=ch.device)], 1)
-        q = torch.cat([self.pool.expand(B, -1, -1), self.constraint.expand(B, -1, -1)], 1)
-        for blk in self.read:
-            q = blk(q, mem=mem, mem_mask=mmask, store=None if store is None else store.setdefault("read", {}))
-        q = self.ln(q)
-        h_sub = self.head_sub(q[:, 0]) + tok["goal"][:, :3] * self.goal_gain   # residual on the goal
-        aw = self.head_w(q[:, 1:])                           # [B, n, 2]
-        hy = self.head_yaw(q[:, 0])                          # [B, 2]
-        pre = torch.cat([h_sub, aw[..., 0], aw[..., 1], hy], -1)   # [B, 3 + 2n + 2]
-        return pre, self.value(q[:, 0]).squeeze(-1)
+    def pre(self, tok, store=None, scene=None):
+        """Action logits [B, V] and the value [B].  `store` collects attention
+        weights for the explainer."""
+        q = self.read_out(tok, store, scene)
+        return self.head_act(q), self.value(q).squeeze(-1)
 
-    @staticmethod
-    def activate(pre, n):
-        h = pre[:, :3]
-        nrm = h.norm(dim=-1, keepdim=True).clamp_min(1e-9)
-        sub = torch.tanh(nrm) * h / nrm
-        alpha = nn.functional.softplus(pre[:, 3:3 + n]) + 1e-3
-        gate = torch.sigmoid(pre[:, 3 + n:3 + 2 * n])
-        yaw = (math.pi * torch.tanh(pre[:, 3 + 2 * n]), torch.sigmoid(pre[:, 3 + 2 * n + 1]))
-        return sub, alpha, gate, yaw
-
-    LOG_STD_MIN = -3.5      # a floor at the measured harmless scale: sigma may grow, not vanish
-
-    @property
-    def std(self):
-        return self.log_std.clamp_min(self.LOG_STD_MIN).exp()
-
-    def dist(self, pre):
-        return torch.distributions.Normal(pre, self.std)
+    def dist(self, logits):
+        return torch.distributions.Categorical(logits=logits)
 
 
 class PolicyComposer(TransformerComposer):
-    """Stochastic in training, the mean when judged; records every decision."""
+    """Sampled on the explored rows, the mode elsewhere; records every report."""
     kind = "policy"
 
     def __init__(self, system, trainable, **kw):
         # the checkpoint is for THIS net; the base class must not try to load
-        # it into the plain ComposerNet it builds first (a policy checkpoint
-        # carries the value head and log_std, and the base load rejected it)
+        # it into the plain ComposerNet it builds first
         weights = kw.pop("weights", "")
+        self.explore_eps = float(kw.pop("explore_eps", 0.0))     # uniform mixture on the RECORDED rows (see `emit`)
+        self.follow_parent = bool(kw.pop("follow_parent", False))  # a population's policy rows take the parent's token (see `emit`)
+        # The update reads a capped random subset of the recorded decisions
+        # (`ppo_update(max_samples=...)`), yet every recorded row carried its
+        # full scene tokens: about 150k samples' worth per iteration for a
+        # 10k update -- 600 MB per worker, most of it pickled to the parent and
+        # dropped there.  Records keep their small fields for EVERY recorded
+        # row (the returns need the whole stream); the scene tokens are kept
+        # for this fraction of the rows, drawn from a private generator so the
+        # flights' own randomness is untouched.
+        self.tok_frac = float(kw.pop("tok_frac", 1.0))
+        self._tok_gen = None
         super().__init__(system, trainable, **kw)
-        kw["weights"] = weights
-        n = max(self.n_terms, 1)
-        self.net = PolicyNet(n, d=kw.get("d", 64), heads=kw.get("heads", 4)).to(self.net_dtype)
+        self.net = PolicyNet(max(self.n_terms, 1), d=kw.get("d", 64), heads=kw.get("heads", 4)).to(self.net_dtype)
         self.net.goal_gain = self.tok.scale / self.reach
-        self.weights_path = kw.get("weights", "")
-        if kw.get("weights"):
+        self.weights_path = weights
+        if weights:
             import os
-            self.net.load_state_dict(torch.load(kw["weights"], map_location="cpu"))
-            self._weights_mtime = os.path.getmtime(kw["weights"])
+            from .transformer import load_composer_weights
+            load_composer_weights(self.net, weights)
+            self._weights_mtime = os.path.getmtime(weights)
         self.net.eval()
         self.stochastic = False
-        self.records: List[Dict] = []          # per decision: tokens (per episode), action, t
-        # Noise is HELD for `noise_hold` decisions (1 s at a 10-step interval):
-        # a fresh draw every 0.2 s is jitter the hold smooths into a random
-        # walk, while a held perturbation explores the same distance without
-        # compounding into a crash.
-        self.noise_hold = int(kw.get("noise_hold", 5))
-        self._eps = None; self._eps_age = 0
+        self.records: List[Dict] = []          # per report: tokens (per row), the token chosen, t
         # Rows to record for the update, by full-batch id; None = every row.
-        # Set by the worker before a batch: recording every live row's full
-        # token set at every decision and slimming at the end held ~700 MB per
-        # worker for nothing, on a machine with 2 GB to spare.
         self.record_rows = None
 
-    def reset(self, B):
-        super().reset(B)
-        self._eps = None; self._eps_age = 0
+    @torch.no_grad()
+    def pair(self, n_eps: int, seed: int) -> None:
+        """Pair the token draws by episode across the population for this run
+        (`crn_sample`); the rollout calls it at every start."""
+        self._crn = (int(n_eps), int(seed)); self._crn_k = 0; self._n_emit = 0
 
     @torch.no_grad()
     def emit(self, ctx):
-        tok = self.tokens(ctx)
-        pre, _ = self.net.pre(tok)
-        if self.stochastic:
-            rows = getattr(self, "_rows", None)
-            B = self._B if rows is not None else pre.shape[0]
-            if self._eps is None or self._eps_age >= self.noise_hold or self._eps.shape[0] != B:
-                self._eps = torch.randn(B, pre.shape[-1], dtype=pre.dtype, device=pre.device); self._eps_age = 0
-            self._eps_age += 1
-            eps = self._eps if rows is None else self._eps[rows]
-            act = pre + self.net.std * eps
-        else:
-            act = pre
-        sub, alpha, gate, (dpsi, yg) = self.net.activate(act, max(self.n_terms, 1))
-        sub, alpha, gate, dpsi, yg = (v.to(self.dtype) for v in (sub, alpha, gate, dpsi, yg))
-        x, goal, psi = ctx["x"], ctx["goal"], tok["psi"].to(self.dtype)
-        sub_world = x + to_world(sub * self.reach, psi)
-        sub_world = torch.cat([sub_world[:, :2], sub_world[:, 2:].clamp_min(self.z_min)], -1)
-        spec = TaskSpec(delta=sub_world - goal, alpha=alpha[:, :self.n_terms], gate=gate[:, :self.n_terms],
-                        yaw=psi + dpsi, yaw_gate=yg)
-        self._remember(ctx, spec)
-        if self.stochastic:
-            rows = getattr(self, "_rows", None)
-            ids = rows.clone() if rows is not None else torch.arange(act.shape[0])
-            keep = torch.ones(ids.shape[0], dtype=torch.bool) if self.record_rows is None \
-                else torch.isin(ids, self.record_rows)
-            self.records.append({"t": float(ctx.get("t", 0)), "act": act[keep].clone(),
-                                 "alive": ctx["alive"][keep].clone(), "rows": ids[keep],
-                                 "tok": {k: (v[keep].clone() if torch.is_tensor(v) and v.ndim and v.shape[0] == act.shape[0]
-                                             else (v.clone() if torch.is_tensor(v) else v)) for k, v in tok.items()}})
-        return spec
+        """A chained decision per row (see `TransformerComposer._decide`); each
+        component is sampled from the policy -- with the exploration mixture on
+        the recorded rows, paired draws across the population, the parent's
+        token on its kids when asked -- and recorded for the update."""
+        eps = float(getattr(self, "explore_eps", 0.0))
+        exploring = self.stochastic and eps > 0.0 and self.record_rows is not None and len(self.record_rows)
+        rec_rows = self.record_rows.to(ctx["x"].device) if self.record_rows is not None else None
+
+        def choose(logits, tok, ctx_s, ids_full, step, placing):
+            B = logits.shape[0]
+            b_logits = logits
+            rec = torch.isin(ids_full, rec_rows) if rec_rows is not None else torch.zeros(B, dtype=torch.bool, device=logits.device)
+            if exploring:
+                mix = torch.log((1.0 - eps) * torch.softmax(logits, -1) + eps / logits.shape[-1])
+                mix = torch.where(torch.isfinite(logits), mix, logits)            # a forced EOS stays forced
+                b_logits = torch.where(rec[:, None], mix, logits)
+            if not self.stochastic:
+                act = logits.argmax(-1)
+            elif getattr(self, "_crn", None) is None:
+                act = self.net.dist(b_logits).sample()
+            else:
+                E, seed = self._crn; k = self._crn_k; self._crn_k += 1
+                own = rec if getattr(self, "unpair_recorded", False) and exploring else None
+                act = crn_sample(b_logits, ids_full, E, seed, k, independent=own)
+            if getattr(self, "follow_parent", False) and getattr(self, "_crn", None) is not None:
+                E = self._crn[0]; ids_c = ids_full.cpu(); n_max = int(ids_c.max()) + 1
+                pos = torch.full((n_max,), -1, dtype=torch.long); pos[ids_c] = torch.arange(len(ids_c))
+                par = pos[ids_c % E]
+                m = (ids_c // E > 0) & (par >= 0) & ~rec.cpu()
+                if bool(m.any()):
+                    act = act.clone(); act[m.to(act.device)] = act[par[m].to(act.device)]
+            n_emit = getattr(self, "_n_emit", 0); self._n_emit = n_emit + 1
+            ov = getattr(self, "override", None)
+            if ov is not None and n_emit in ov:
+                o = ov[n_emit][ids_full.cpu()].to(act.device)
+                act = torch.where(o >= 0, o, act)
+            if self.stochastic:
+                keep = rec if rec_rows is not None else torch.ones(B, dtype=torch.bool, device=logits.device)
+                if bool(keep.any()):
+                    moved = placing & (act == self.net.vocab.EOS)                 # the placement is made at EOS
+                    keep_idx = keep.nonzero().flatten(); tok_keep = None
+                    tf = float(getattr(self, "tok_frac", 1.0))
+                    if tf < 1.0:
+                        if self._tok_gen is None:
+                            self._tok_gen = torch.Generator().manual_seed(int(torch.initial_seed()) % (2 ** 31) + 7)
+                        tok_keep = torch.rand(keep_idx.numel(), generator=self._tok_gen) < tf
+                        keep_idx = keep_idx[tok_keep.to(keep_idx.device)]
+                    self.records.append({"t": float(ctx_s.get("t", 0)), "act": act[keep].clone(), "moved": moved[keep].clone(),
+                                         "logits": b_logits[keep].float().clone(),
+                                         "pi_logits": logits[keep].float().clone(),
+                                         "alive": ctx_s["alive"][keep].clone(), "rows": ids_full[keep].clone(),
+                                         "tok_keep": tok_keep,                                     # None: tokens for every row
+                                         "tok": {k: (v[keep_idx].clone() if torch.is_tensor(v) and v.ndim and v.shape[0] == B
+                                                     else (v.clone() if torch.is_tensor(v) else v)) for k, v in tok.items()}})
+            return act
+        return self._decide(ctx, choose)
+
+
+def crn_sample(logits: torch.Tensor, ids: torch.Tensor, n_eps: int, seed: int, k: int,
+               independent: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """A categorical sample with COMMON RANDOM NUMBERS across the population.
+
+    The k-th decision of episode e draws the same uniform in every genome
+    (batch index = member * n_eps + episode), so two genomes flown on the same
+    task see the same composer decision wherever their logits agree, and the
+    GA's ranking compares controllers rather than dice.  Measured on the
+    corridor city: with independent draws two task draws ranked the same 16
+    genomes at Spearman +0.02 -- noise -- and +0.51 with the tokens frozen;
+    the crash count, which the fitness tracks at +0.76, was the composer's
+    luck rather than the genome's.  Inverse-CDF, so it is still an exact
+    sample of softmax(logits); the recorded logits and acts feed PPO as before.
+    """
+    gen = torch.Generator(device="cpu").manual_seed(int((seed * 1_000_003 + k) % (2 ** 63 - 1)))
+    u_ep = torch.rand(int(n_eps), generator=gen, dtype=torch.float64)
+    u = u_ep[(ids % int(n_eps)).cpu()].to(logits.device)
+    if independent is not None and bool(independent.any()):
+        # rows drawn on their own: a hash of (row, decision, seed) as a uniform,
+        # so two genomes' recordings of one episode are different flights
+        h = (ids.cpu().to(torch.int64) * 2_654_435_761 + (k + 1) * 40_503 + seed * 97) % (2 ** 31 - 1)
+        u_own = (h.to(torch.float64) + 0.5) / (2 ** 31 - 1)
+        u = torch.where(independent.cpu(), u_own, u.cpu()).to(logits.device)
+    cdf = torch.softmax(logits.double(), dim=-1).cumsum(-1)
+    return (cdf < u[:, None]).sum(-1).clamp(max=logits.shape[-1] - 1)
 
 
 def returns_from_stream(records: List[Dict], chain: List[Dict], gamma: float,
-                        subgoal_cost: float = 0.0) -> Tensor:
+                        subgoal_cost: float = 0.0, unit: float = 0.0) -> Tensor:
     """Per decision and FULL-BATCH row, the discounted sum of the cost
     increments the stream reported after it -- negated, so lower cost is higher
     return.  Records may cover only the rows that were alive at that decision
     (`rows`); the return is computed for every row and the update picks its
     own rows out.  `subgoal_cost` is charged to a row for every decision it
     was given (every subgoal placed for it), so the composer is asked to
-    reach the goal with the fewest."""
+    reach the goal with the fewest.  `unit` > 0 makes the discount a rate in
+    TIME: gamma per `unit` steps between one record and the next, so the
+    horizon does not shorten when decisions are dense and stretch when they
+    are sparse (decisions are events, and near the end of a batch few rows
+    are still deciding).  0 keeps gamma per record."""
     ts = [r["t"] for r in records]
     cost_at = {m["t"]: m["cost"] for m in chain}
     times = sorted(cost_at)
@@ -188,10 +200,13 @@ def returns_from_stream(records: List[Dict], chain: List[Dict], gamma: float,
         c1 = cost_at_or_before(ts[k + 1]) if k + 1 < len(records) else last
         r = -(c1 - c0)
         if subgoal_cost:
-            rows = records[k].get("rows")
+            rows = records[k].get("rows"); mv = records[k].get("moved")
+            if rows is not None and mv is not None:
+                rows = rows[mv.to(torch.bool)]               # only the rows given a new subgoal at this report
             r = r - subgoal_cost if rows is None else \
                 r.index_add(0, rows.to(torch.long), torch.full((rows.numel(),), -subgoal_cost, dtype=r.dtype))
-        G = r + gamma * G
+        g = gamma if not unit else gamma ** ((ts[k + 1] - ts[k]) / unit) if k + 1 < len(records) else 0.0
+        G = r + g * G
         R[k] = G
     return R
 
@@ -199,63 +214,89 @@ def returns_from_stream(records: List[Dict], chain: List[Dict], gamma: float,
 def ppo_update(net: PolicyNet, records: List[Dict], returns: Tensor, n_terms: int,
                epochs: int = 4, batch: int = 512, lr: float = 3e-4, clip: float = 0.2,
                vcoef: float = 0.5, ent: float = 1e-3, gen=None,
-               target_kl: float = 0.02, backtracks: int = 8) -> Dict[str, float]:
-    """Fit the recorded stream: clipped surrogate, value regression, entropy.
+               target_kl: float = 0.02, backtracks: int = 8, opt=None, max_samples: int = 0) -> Dict[str, float]:
+    """Fit the recorded stream: the clipped surrogate over the action tokens
+    (a categorical: exact likelihoods and KL), an optional value regression
+    and entropy bonus.
 
-    The step is sized in POLICY space.  After the epochs the exact KL from the
-    collecting policy is measured over the whole batch; if it is beyond the
-    trust region the weights go back to where they started and the step is
-    halved, up to `backtracks` times (a failed attempt is cheap: the early-stop
-    ends it within a minibatch or two).  Measured need: at sigma 0.05 a single
-    Adam step at lr 2e-4 moved the policy by KL 0.13-0.5 (the update's first
-    step moves every parameter by the full rate, and the zero-initialised
-    heads make the network more sensitive to that as they grow), and seven
-    such iterations took the judged reach from 0.25 to 0.  The returned `lr`
-    is the rate that fit, for the caller to start from next time."""
+    The step is sized in POLICY space when `target_kl` > 0: after the epochs
+    the exact KL from the collecting policy is measured over the whole batch;
+    beyond 2x the target the weights go back and the rate is halved, up to
+    `backtracks` times.  `target_kl` = 0 runs every epoch at the given rate.
+    `opt`: an Adam over the net kept ACROSS calls (a fresh Adam's first step
+    moves every parameter by the full rate whatever the gradient).
+    `max_samples` > 0: a random subset of the samples of that size -- one
+    token per report per live row is ~200k samples when flights run long,
+    and the update was measured at 10+ minutes on them."""
     gen = gen or torch.Generator().manual_seed(0)
-    # the update runs in float32 whatever the inference dtype: half gradients underflow
     infer_dtype = next(net.parameters()).dtype
     net.float()
-    # `records` may be one list with one returns tensor, or several groups --
-    # one per worker shard, each with its own decision count and kept rows
     groups = list(zip(records, returns)) if (records and isinstance(records[0], list)) else [(records, returns)]
-    samples, acts, rets = [], [], []
+    samples, acts, rets, blog, plog = [], [], [], [], []
     for recs, R in groups:
         for k, rec in enumerate(recs):
-            al = rec["alive"]; rows = rec.get("rows")
-            for j in al.nonzero().flatten().tolist():
-                b = int(rows[j]) if rows is not None else j         # the column of R this record's row is
-                samples.append({kk: (v[j].float() if torch.is_tensor(v) and v.is_floating_point() else (v[j] if torch.is_tensor(v) else v))
+            al = rec["alive"]; rows = rec.get("rows"); bl = rec.get("logits"); pl = rec.get("pi_logits")
+            tk = rec.get("tok_keep")                       # rows whose scene tokens were kept (None: all of them)
+            if tk is None:
+                js = al.nonzero().flatten().tolist(); tpos = None
+            else:
+                tk = tk.to(al.device); tpos = tk.long().cumsum(0) - 1; js = (al & tk).nonzero().flatten().tolist()
+            for j in js:
+                b = int(rows[j]) if rows is not None else j
+                jt = j if tpos is None else int(tpos[j])
+                samples.append({kk: (v[jt].float() if torch.is_tensor(v) and v.is_floating_point() else (v[jt] if torch.is_tensor(v) else v))
                                 for kk, v in rec["tok"].items()})
-                acts.append(rec["act"][j]); rets.append(R[k, b])
+                acts.append(rec["act"][j]); rets.append(R[k, b]); blog.append(None if bl is None else bl[j]); plog.append(None if pl is None else pl[j])
     if not samples:
         return {"n": 0}
-    acts = torch.stack(acts).float(); rets = torch.stack(rets).float()
-    # a non-finite action or return is dropped and counted before it can reach
-    # a log-probability, which rejects it outright, or a gradient
-    ok = torch.isfinite(acts).all(-1) & torch.isfinite(rets)
+    if max_samples and len(samples) > max_samples:
+        pick = torch.randperm(len(samples), generator=gen)[:max_samples].sort().values.tolist()
+        samples = [samples[i] for i in pick]; acts = [acts[i] for i in pick]; rets = [rets[i] for i in pick]; blog = [blog[i] for i in pick]; plog = [plog[i] for i in pick]
+    acts = torch.stack(acts).long(); rets = torch.stack(rets).float()
+    behaviour = torch.stack(blog).float() if all(b is not None for b in blog) else None
+    policy_old = torch.stack(plog).float() if all(p_ is not None for p_ in plog) else None
+    ok = torch.isfinite(rets)
+    if behaviour is not None:
+        ok = ok & torch.isfinite(behaviour).all(-1)
+    if policy_old is not None:
+        ok = ok & torch.isfinite(policy_old).all(-1)
     dropped = int((~ok).sum())
     if dropped:
         keep = ok.nonzero().flatten().tolist()
         samples = [samples[i] for i in keep]; acts = acts[ok]; rets = rets[ok]
+        behaviour = None if behaviour is None else behaviour[ok]
+        policy_old = None if policy_old is None else policy_old[ok]
         if not samples:
             return {"n": 0, "nonfinite": dropped}
     rets_n = (rets - rets.mean()) / rets.std().clamp_min(1e-6)
-    # Collate ONCE into padded tensors and minibatch by indexing.  Re-collating
-    # 512 Python dicts per minibatch was most of a 159 s update on 52k samples.
     ALL = collate_tok(samples)
     def take(idx):
         return {k: (v[idx] if torch.is_tensor(v) else v) for k, v in ALL.items()}
     with torch.no_grad():
-        old_pre = torch.cat([net.pre(take(torch.arange(i, min(i + batch, len(samples)))))[0]
-                             for i in range(0, len(samples), batch)])
-        old_std = net.std.detach().clone()
-        old_lp = torch.distributions.Normal(old_pre, old_std).log_prob(acts).sum(-1)
+        # the reference policy: the one that COLLECTED the samples when the
+        # records say so (the batch may have flown while the last update ran),
+        # else this net as it stands
+        # The ratio and the KL are taken against the POLICY at collection time
+        # (`pi_logits`).  When the recorded rows explored -- drew from the policy
+        # mixed with a uniform -- that behaviour distribution starts far from the
+        # policy; clipping the ratio around 1 against IT let a rare token be
+        # raised fivefold before the clip bit (one update: KL 0.107, entropy
+        # 2.98, the policy flattened).  Off-policy samples are reweighted by
+        # pi_old / pi_behaviour, capped at 5, as a fixed per-sample weight.
+        ref = policy_old if policy_old is not None else behaviour
+        old_logits = ref if ref is not None else \
+            torch.cat([net.pre(take(torch.arange(i, min(i + batch, len(samples)))))[0] for i in range(0, len(samples), batch)])
+        old_lp = torch.distributions.Categorical(logits=old_logits).log_prob(acts)
+        old_p = torch.softmax(old_logits, -1)
+        if policy_old is not None and behaviour is not None:
+            b_lp = torch.distributions.Categorical(logits=behaviour).log_prob(acts)
+            iw = (old_lp - b_lp).clamp(max=math.log(5.0)).exp()
+        else:
+            iw = torch.ones_like(old_lp)
 
-    def kl_to_old(idx, pre):
-        # the exact KL(old || new) of the diagonal Gaussians, not a sampled estimate
-        return torch.distributions.kl_divergence(torch.distributions.Normal(old_pre[idx], old_std),
-                                                 net.dist(pre)).sum(-1).mean()
+    def kl_to_old(idx, logits):
+        # exact KL(old || new) of the categoricals
+        return (old_p[idx] * (torch.log_softmax(old_logits[idx], -1) - torch.log_softmax(logits, -1))).sum(-1).mean()
 
     def batch_kl():
         with torch.no_grad():
@@ -265,26 +306,23 @@ def ppo_update(net: PolicyNet, records: List[Dict], returns: Tensor, n_terms: in
                 tot += float(kl_to_old(idx, net.pre(take(idx))[0])) * len(idx)
             return tot / len(samples)
 
-    # The exploration scale gets its own learning rate.  Adam moves a
-    # parameter by about `lr` per step whatever the gradient, so at the
-    # network's rate `log_std` could change by at most ~0.7% an iteration and
-    # ~4x over a whole run -- nominally learned, unable to adapt in practice.
-    # Ten times the rate lets it move ~7% an iteration; the floor in `std`
-    # still keeps it from vanishing.
-    head = [p for n, p in net.named_parameters() if n == "log_std"]
-    body = [p for n, p in net.named_parameters() if n != "log_std"]
+    params = [p for p in net.parameters() if p.requires_grad]
+    if opt is None:
+        opt = torch.optim.Adam(params, lr=lr)
+    import copy
+    opt_start = copy.deepcopy(opt.state_dict())
     net.train()
     stats = {"n": len(samples), "nonfinite": dropped, "backtracks": 0}
-    # value-head fit BEFORE the update: how much of the return the composer's
-    # situation explains.  Near zero means the return is not varying with what
-    # the composer sees and does, and no update can find a gradient in it.
-    with torch.no_grad():
-        v0 = torch.cat([net.pre(take(torch.arange(i, min(i + batch, len(samples)))))[1] for i in range(0, len(samples), batch)])
-        stats["ev"] = float(1.0 - (rets_n - v0).var() / rets_n.var().clamp_min(1e-9))
+    if vcoef:
+        # the value head's fit before the update -- a forward pass over every
+        # sample, so only when the head is trained at all
+        with torch.no_grad():
+            v0 = torch.cat([net.pre(take(torch.arange(i, min(i + batch, len(samples)))))[1] for i in range(0, len(samples), batch)])
+            stats["ev"] = float(1.0 - (rets_n - v0).var() / rets_n.var().clamp_min(1e-9))
     start = {k: v.detach().clone() for k, v in net.state_dict().items()}
     lr_used = lr
     for attempt in range(backtracks + 1):
-        opt = torch.optim.Adam([{"params": body, "lr": lr_used}, {"params": head, "lr": 10 * lr_used}])
+        for g in opt.param_groups: g["lr"] = lr_used
         acc = {"loss": 0.0, "v_loss": 0.0, "ent": 0.0, "clipfrac": 0.0, "nb": 0, "epochs": 0}
         stop = False
         for _ in range(epochs):
@@ -294,48 +332,44 @@ def ppo_update(net: PolicyNet, records: List[Dict], returns: Tensor, n_terms: in
             perm = torch.randperm(len(samples), generator=gen)
             for i in range(0, len(samples), batch):
                 idx = perm[i:i + batch]
-                b = take(idx)
-                pre, v = net.pre(b)
-                d = net.dist(pre)
-                lp = d.log_prob(acts[idx]).sum(-1)
+                logits, v = net.pre(take(idx))
+                d = torch.distributions.Categorical(logits=logits)
+                lp = d.log_prob(acts[idx])
                 adv = rets_n[idx] - v.detach()
                 adv = (adv - adv.mean()) / adv.std().clamp_min(1e-6)
-                ratio = (lp - old_lp[idx]).clamp(-20.0, 20.0).exp()      # a stale sample cannot overflow the update
-                pg = -torch.minimum(ratio * adv, ratio.clamp(1 - clip, 1 + clip) * adv).mean()
+                ratio = (lp - old_lp[idx]).clamp(-20.0, 20.0).exp()
+                pg = -(iw[idx] * torch.minimum(ratio * adv, ratio.clamp(1 - clip, 1 + clip) * adv)).mean()
                 with torch.no_grad():
                     acc["clipfrac"] += float(((ratio - 1).abs() > clip).to(ratio.dtype).mean())
-                    # A STEP-SIZE limit, like the clip and the sigma floor, not
-                    # a loss factor: once the policy has moved `target_kl` from
-                    # where the batch was collected, further steps are steps on
-                    # stale samples.
-                    if target_kl and float(kl_to_old(idx, pre)) > target_kl:
+                    kl_mb = float(kl_to_old(idx, logits))
+                    if target_kl and kl_mb > target_kl:
                         stop = True
                 vl = ((v - rets_n[idx]) ** 2).mean()
-                e = d.entropy().sum(-1).mean()
+                e = d.entropy().mean()
                 loss = pg + vcoef * vl - ent * e
                 if not torch.isfinite(loss):
-                    # a non-finite minibatch is skipped and counted, never stepped:
-                    # one bad sample must not poison the weights
                     stats["nonfinite"] = stats.get("nonfinite", 0) + 1
                     continue
+                acc["kl_mb"] = acc.get("kl_mb", 0.0) + kl_mb          # only the minibatches that stepped count toward the reported KL
                 if stop:
                     break
-                opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(net.parameters(), 0.5); opt.step()
+                opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(params, 0.5); opt.step()
                 acc["loss"] += pg.item(); acc["v_loss"] += vl.item(); acc["ent"] += e.item(); acc["nb"] += 1
-        kl = batch_kl()
-        # The early-stop above lands the batch AT the target, give or take a
-        # minibatch; a step too large to be sized by stopping lands well past
-        # it (measured: 6-25x).  Only the latter is backtracked.
+        # the whole-batch KL is a forward pass over every sample: taken when
+        # it sizes the step, otherwise the minibatch mean stands in for it
+        kl = batch_kl() if target_kl else acc.pop("kl_mb", 0.0) / max(acc.get("nb", 1), 1)
         if not target_kl or kl <= 2.0 * target_kl or attempt == backtracks:
             break
-        # beyond what the samples can vouch for: back to the start, half the step
-        net.load_state_dict(start); lr_used *= 0.5; stats["backtracks"] += 1
+        net.load_state_dict(start); opt.load_state_dict(copy.deepcopy(opt_start)); lr_used *= 0.5; stats["backtracks"] += 1
     net.eval(); net.to(infer_dtype)
-    nb = max(acc.pop("nb"), 1)
-    stats.update({k: (v / nb if k != "epochs" else v) for k, v in acc.items()})   # per-minibatch means
-    stats["kl"] = kl                                     # exact, whole batch, after the step
-    stats["lr"] = lr_used
-    stats["sigma"] = float(net.std.mean().detach())
+    nb = max(acc.pop("nb"), 1); acc.pop("kl_mb", None)
+    stats.update({k: (v / nb if k != "epochs" else v) for k, v in acc.items()})
+    stats["kl"] = kl; stats["lr"] = lr_used
+    with torch.no_grad():
+        # what the policy says, on this batch: how often it speaks (not HOLD) and its entropy
+        p = torch.softmax(old_logits, -1)
+        stats["speak"] = float(1.0 - p[:, net.vocab.HOLD].mean())
+        stats["entropy"] = float(torch.distributions.Categorical(probs=p).entropy().mean())
     return stats
 
 

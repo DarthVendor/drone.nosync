@@ -259,6 +259,13 @@ def test_workers_never_compile_however_the_config_asks():
 
     `compile_forward` is worth having (3.16x measured, single-process), so it is
     not removed; it is forced off where it is unsafe.
+
+    Sept 10 2026: the "deadlock" was macOS refusing to run a Metal class
+    initialiser in a forked child ("+[MPSGraphObject initialize] ... Crashing
+    instead"), which the compiler's first use triggers.  A pool built with
+    `spec["compile_workers"]` warms the compiler in the parent before the fork
+    and pins OpenMP; that path is the next test.  Without the opt-in the
+    stripping here still stands.
     """
     import json
     import pathlib
@@ -288,3 +295,99 @@ def test_workers_never_compile_however_the_config_asks():
     finally:
         par.close()
     assert torch.isfinite(r.fitness).all()
+
+
+def test_a_batch_can_set_the_scene_difficulty_on_the_workers():
+    """`run_with_records(difficulty=...)` thins the obstacle field on the
+    worker's plant for that batch: with every building parked, the same
+    flights crash less than with the full city."""
+    import torch
+    from lagrangian_es.config import Config, RolloutCfg
+    from lagrangian_es.parallel import ParallelRollout
+    from lagrangian_es.es import build
+    from lagrangian_es.util import make_gen
+    cfg = Config(system="quadrotor_nav", trainable="nav_agent", task="city_tour", environment="singapore_cbd",
+                 sensors=("range",), gating="arrival", seed=0, task_kw=(("n_legs", 2), ("max_leg", 20.0)),
+                 system_kw=(("free_start", True),), trainable_kw=(("learned", True), ("damp_mode", "beams")),
+                 rollout=RolloutCfg(n_eps=24, ep_steps=300, dead_mode="constant", dead_cost=6.0, goal_bonus=15.0, stop_on_arrival=True))
+    sysm, tr, task = build(cfg); TH = tr.init()[None].expand(2, -1); goals = task.sample(24, make_gen(1))
+    par = ParallelRollout({"cfg": cfg}, workers=1)
+    full, _ = par.run_with_records(TH, goals, 5, stochastic=False, record_frac=0.0, difficulty=1.0)
+    empty, _ = par.run_with_records(TH, goals, 5, stochastic=False, record_frac=0.0, difficulty=0.0)
+    par.close()
+    assert float((~empty.alive).double().mean()) <= float((~full.alive).double().mean()), "an empty scene must not crash more"
+    assert not torch.equal(full.cost, empty.cost), "the difficulty did not reach the plant"
+
+
+def test_shards_carry_the_policy_logits_next_to_the_behaviour_logits():
+    """The update anchors its trust region on the policy at collection time;
+    a shard that dropped `pi_logits` silently fell back to the exploration
+    mixture and the policy flattened (KL 0.138 in one update)."""
+    import torch
+    from dataclasses import replace
+    from lagrangian_es import parallel
+    from lagrangian_es.config import Config, RolloutCfg
+    from lagrangian_es.util import make_gen
+    cfg = Config(system="quadrotor_nav", trainable="nav_agent", task="city_tour", environment="singapore_cbd", sensors=("range",),
+                 gating="arrival", seed=0, composer="policy", composer_kw=(("reach", 10.0), ("every", 10), ("measure_every", 10), ("explore_eps", 0.3)),
+                 task_kw=(("n_legs", 2), ("max_leg", 10.0)), system_kw=(("free_start", True),),
+                 trainable_kw=(("learned", True), ("damp_mode", "beams")),
+                 rollout=RolloutCfg(n_eps=8, ep_steps=60, dead_mode="constant", dead_cost=40.0, goal_bonus=60.0))
+    parallel._init({"cfg": cfg})
+    rig = parallel._RIG; th = rig.trainable.init()[None]
+    goals = rig.task.sample(8, make_gen(3))
+    out = parallel._work((th, goals, 5, True, 0.5, 0, None))          # stochastic, half the rows recorded
+    shard = out[-1]
+    recs = shard["records"]
+    assert recs, "no records came back"
+    assert all("pi_logits" in r and r["pi_logits"] is not None for r in recs)
+    assert all(tuple(r["pi_logits"].shape) == tuple(r["logits"].shape) for r in recs)
+    import numpy as np
+    b = torch.as_tensor(np.asarray(recs[0]["logits"])); pi = torch.as_tensor(np.asarray(recs[0]["pi_logits"]))
+    # the behaviour is the policy mixed with a uniform: flatter than the policy on every recorded row
+    hb = torch.distributions.Categorical(logits=b).entropy(); hp = torch.distributions.Categorical(logits=pi).entropy()
+    assert bool((hb >= hp - 1e-6).all())
+
+
+def test_workers_compile_when_asked_and_match_the_eager_pool():
+    """`spec["compile_workers"]`: the parent exercises the compiler before the
+    fork (macOS will not run a Metal class initialiser in a forked child, which
+    is what crashed compiled workers), each worker compiles with one compile
+    thread and pinned OpenMP, the batch completes, and it matches the eager
+    pool's answer."""
+    import json
+    import pathlib
+
+    import torch
+
+    from lagrangian_es.config import Config, ESCfg, RolloutCfg
+    from lagrangian_es.es import build
+    from lagrangian_es.parallel import ParallelRollout
+
+    genome = pathlib.Path(__file__).parent.parent / "assets" / "nav99_genome.json"
+    if not genome.exists():
+        pytest.skip("prototype genome not present")
+    cfg = Config(system="quadrotor_nav", trainable="nav_agent",
+                 task="waypoint_pair", environment="pillars", sensors=("range",),
+                 gating="arrival", seed=0, system_kw=(("prox_gain", 30.0),),
+                 trainable_kw=(("learned", False),),
+                 rollout=RolloutCfg(n_eps=4, ep_steps=120, compile_forward=True),
+                 es=ESCfg(pop=16, gens=1))
+    system, tr, task = build(cfg)
+    th = torch.tensor(json.loads(genome.read_text())["theta"], dtype=torch.float64)
+    TH = th[None].expand(16, -1).contiguous()
+    goals = task.sample(4, make_gen(1))
+    par = ParallelRollout({"cfg": cfg}, workers=2, min_pop=4)
+    try:
+        ref = par.run(TH, goals, 1)
+    finally:
+        par.close()
+    par = ParallelRollout({"cfg": cfg, "compile_workers": True}, workers=2, min_pop=4)
+    try:
+        r = par.run(TH, goals, 1)
+        r2 = par.run(TH, goals, 1)                 # a second batch reuses the compiled graphs
+    finally:
+        par.close()
+    assert torch.isfinite(r.fitness).all()
+    assert torch.allclose(r.fitness, ref.fitness, rtol=0, atol=1e-9)
+    assert torch.equal(r2.fitness, r.fitness)

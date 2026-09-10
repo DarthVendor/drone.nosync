@@ -23,6 +23,7 @@ from torch import Tensor
 SELF, GOAL, BEAM, PIXEL, INSTR, MEASURE = 0, 1, 2, 3, 4, 5
 N_TYPES = 6
 F = 8                                     # feature width shared by every token
+ACT_SCALE = 64.0                          # an action token's id rides in feature 0 of an INSTR token, over this
 
 
 def yaw_of(R: Tensor) -> Tensor:
@@ -107,8 +108,13 @@ class Tokenizer:
         prog = (1.0 - rel_goal.norm(dim=-1) / self.scale).clamp(0.0, 1.0)
         tilt = s["R"][..., 2, 2] if "R" in s else torch.ones(B, dtype=dt, device=dev)
         ve = to_ego(v, psi) / self.vs
+        # view . travel: the cosine between the body's forward axis and the
+        # direction of travel (0 at rest) -- is it flying where it is looking?
+        sp = v.norm(dim=-1)
+        fwd = s["R"][..., :, 0] if "R" in s else torch.stack([torch.cos(psi), torch.sin(psi), torch.zeros_like(psi)], -1)
+        view_dot_travel = torch.where(sp > 1e-6, (fwd * v).sum(-1) / sp.clamp_min(1e-6), torch.zeros_like(sp))
         self_tok = torch.stack([ve[:, 0], ve[:, 1], ve[:, 2], x[:, 2] / self.scale, tilt, prog,
-                                v.norm(dim=-1) / self.vs, torch.zeros(B, dtype=dt, device=dev)], -1)
+                                sp / self.vs, view_dot_travel], -1)
         goal_tok = torch.cat([rel_goal / self.scale, rel_goal.norm(dim=-1, keepdim=True) / self.scale,
                               torch.zeros(B, 4, dtype=dt, device=dev)], -1)
         per, per_types, per_mask = self._perception(ctx.get("obs", {}) or {}, B, dt, dev)
@@ -118,25 +124,29 @@ class Tokenizer:
         # stream rather than reading a summary once an interval.
         rmax = max(l[3] for l in self.layout) if self.layout else 1.0
         now = float(ctx.get("t", 0))
+        # an action entry is (t, token id per row, valid per row): the rows
+        # whose token it was see it, the others see padding
         events = [(m["t"], "m", m) for m in (ctx.get("chain", []) or [])] + \
-                 [(t_i, "i", (d, w)) for (t_i, d, w) in chain_instr]
+                 [(e[0], "i", (e[1], e[2] if len(e) > 2 else None)) for e in chain_instr]
         events.sort(key=lambda e: (e[0], e[1] == "i"))
-        ch_rows, ch_types = [], []
+        ch_rows, ch_types, ch_valid = [], [], []
         for t_e, kind, val in events[-self.kc:]:
             age = torch.full((B,), (now - t_e) / 200.0, dtype=dt, device=dev)   # 4 s = 1.0
             if kind == "i":
-                d, w = val
-                ch_rows.append(torch.cat([to_ego(d, psi) / self.reach, w.mean(-1, keepdim=True),
-                                          age[:, None], torch.zeros(B, 3, dtype=dt, device=dev)], -1))
+                ids, valid = val
+                ch_rows.append(torch.stack([ids.to(dt) / ACT_SCALE, age] + [torch.zeros(B, dtype=dt, device=dev)] * (F - 2), -1))
                 ch_types.append(INSTR)
+                ch_valid.append(torch.ones(B, dtype=torch.bool, device=dev) if valid is None else valid.to(torch.bool))
             else:
                 mb = val["min_beam"] if val["min_beam"] is not None else torch.full((B,), rmax, dtype=dt, device=dev)
                 ch_rows.append(torch.stack([val["progress"] / self.reach, val["remaining"] / self.reach, mb / rmax,
                                             val["alive"].to(dt), val["arrived"].to(dt), age,
                                             torch.zeros(B, dtype=dt, device=dev), torch.zeros(B, dtype=dt, device=dev)], -1))
                 ch_types.append(MEASURE)
+                ch_valid.append(torch.ones(B, dtype=torch.bool, device=dev))
         chain = torch.stack(ch_rows, 1) if ch_rows else torch.zeros(B, 0, F, dtype=dt, device=dev)
         ctypes = (torch.tensor(ch_types, dtype=torch.long, device=dev).expand(B, -1) if ch_rows
                   else torch.zeros(B, 0, dtype=torch.long, device=dev))
+        cmask = ~torch.stack(ch_valid, 1) if ch_rows else torch.zeros(B, 0, dtype=torch.bool, device=dev)   # True = padding
         return {"self": self_tok, "goal": goal_tok, "entities": per, "ent_types": per_types, "ent_mask": per_mask,
-                "chain": chain, "chain_types": ctypes, "psi": psi}
+                "chain": chain, "chain_types": ctypes, "chain_mask": cmask, "psi": psi}

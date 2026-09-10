@@ -215,13 +215,27 @@ class EnergyShaping(Trainable):
             goal = goal + delta
         e = x - goal
 
-        bracket = None
+        bracket = None; yaw_off = None; yaw_tau = None
         for i, (t, th) in enumerate(zip(self.terms, self.term_slices(theta))):
-            g = t.grad_potential(th, e, v, x, obs) if t.uses_obs \
-                else t.grad_potential(th, e, v, x)
+            gy = None
+            if t.uses_obs and hasattr(t, "grad_potential_both"):
+                g, gy = t.grad_potential_both(th, e, v, x, obs)          # force and yaw gradient, one pass
+            else:
+                g = t.grad_potential(th, e, v, x, obs) if t.uses_obs else t.grad_potential(th, e, v, x)
             if spec is not None:
                 g = g * w[..., i:i + 1]
             bracket = g if bracket is None else bracket + g
+            if gy is not None:
+                # the Lagrangian's own turning: -dV/dpsi as a torque about body z
+                if spec is not None:
+                    gy = gy * w[..., i]
+                yaw_tau = -gy if yaw_tau is None else yaw_tau - gy
+            if getattr(t, "part", None) == "heading":
+                # the low level's own turning: an offset the look-at is rotated by
+                h = t.heading(th, obs)
+                if spec is not None:
+                    h = h * w[..., i]
+                yaw_off = h if yaw_off is None else yaw_off + h
 
         Md = self.desired_mass(theta, s)
         if Md is not None:
@@ -231,9 +245,12 @@ class EnergyShaping(Trainable):
 
         F_des = sysm.gravity_force(s) - bracket
         _, phi = self.split(theta)
+        kw = {"yaw_offset": yaw_off} if yaw_off is not None else {}
+        if yaw_tau is not None:
+            kw["yaw_torque"] = yaw_tau
         if yaw is not None:
-            return sysm.allocate(F_des, s, phi, goal, yaw=yaw, yaw_gate=yaw_gate)
-        return sysm.allocate(F_des, s, phi, goal)
+            return sysm.allocate(F_des, s, phi, goal, yaw=yaw, yaw_gate=yaw_gate, **kw)
+        return sysm.allocate(F_des, s, phi, goal, **kw)
 
     # --- reporting ----------------------------------------------------------
     def describe(self, theta: Tensor) -> dict:

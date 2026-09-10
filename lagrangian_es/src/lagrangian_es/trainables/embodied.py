@@ -152,7 +152,7 @@ class NavAgent(EmbodiedAgent):
                     harmonic_goal: bool = False,
                     learned: bool = True, hidden: int = 16,
                     gyro: bool = False, obs_transform: str = "linear",
-                    damp_mode: str = "full", extra_obs: tuple = (), **kw):
+                    damp_mode: str = "full", extra_obs: tuple = (), split_terms: bool = False, **kw):
         """Core, plus a barrier on POSITION and a damper on CLOSING SPEED.
 
         Both are needed, and for a reason that is structural rather than a matter
@@ -217,10 +217,19 @@ class NavAgent(EmbodiedAgent):
             # the tilt.  The per-beam damping head stays on the first `n_beams`.
             names = (sensor_name,) + tuple(n for n, _ in extra_obs)
             n_obs = n_beams + sum(int(w) for _, w in extra_obs)
-            return [LearnedShaping(system.task_dim, names if extra_obs else sensor_name,
-                                   n_obs=n_obs, hidden=hidden, gyro=gyro,
-                                   obs_transform=obs_transform,
-                                   damp_mode=damp_mode, n_beams=n_beams)]
+            kw_ = dict(n_obs=n_obs, hidden=hidden, gyro=gyro, obs_transform=obs_transform,
+                       damp_mode=damp_mode, n_beams=n_beams,
+                       pull_max=float(system.pull_budget()) if hasattr(system, "pull_budget") else 0.0)
+            if split_terms:
+                # the same controller as two constraint terms, PULL and BRAKE,
+                # so a composer's per-term priorities can ask for more caution
+                # rather than scaling everything together.  Turning needs no
+                # term: it is the potential's own gradient with respect to yaw
+                # through the body-fixed beams (`grad_potential_yaw`).
+                sn = names if extra_obs else sensor_name
+                return [LearnedShaping(system.task_dim, sn, part="potential", **kw_),
+                        LearnedShaping(system.task_dim, sn, part="damping", **kw_)]
+            return [LearnedShaping(system.task_dim, names if extra_obs else sensor_name, **kw_)]
         elif harmonic_goal:
             # A harmonic SINK in place of the bowls, so the composed potential is
             # harmonic and not merely its obstacle half.  Measured: the field

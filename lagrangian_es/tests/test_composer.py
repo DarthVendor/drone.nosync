@@ -50,7 +50,7 @@ def test_the_measurement_chain_reports_what_happened():
     comp = build_composer(b, sysm, tr); comp.every = 40
     roll = Rollout(sysm, tr, task, b.rollout, build_sensors(b, sysm), composer=comp)
     roll.run(tr.init()[None], task.sample(6, make_gen(2)), 8)
-    assert len(roll.chain) == 120 // 40 - 1, "one token per completed interval"
+    assert len(roll.chain) == (120 // 40 - 1) + 1, "one token per completed interval, plus the closing token with the settled cost"
     tok = roll.chain[0]
     for k in ("progress", "remaining", "min_beam", "alive", "arrived"):
         assert k in tok and tok[k].shape[0] == 6
@@ -325,3 +325,88 @@ def test_the_composer_pays_per_subgoal():
     # every row paid for its first subgoal; rows 0 and 2 paid for a second
     assert torch.allclose(R1[0] - R0[0], torch.tensor([-4.0, -2.0, -4.0, -2.0])), R1[0] - R0[0]
     assert torch.allclose(R1[1] - R0[1], torch.tensor([-2.0, 0.0, -2.0, 0.0]))
+
+
+def test_the_report_stream_ends_with_the_settled_cost():
+    """The composer's return is read off the stream's cost.  The last token
+    must carry the cost as SETTLED -- death tail, hover tail and bonus applied
+    -- or an early crash looks cheap and an arrival pays nothing."""
+    b = _cfg("fixed"); sysm, tr, task = build(b)
+    th = tr.init()[None]; goals = task.sample(6, make_gen(1))
+    roll = Rollout(sysm, tr, task, b.rollout, build_sensors(b, sysm), composer=build_composer(b, sysm, tr))
+    r = roll.run(th, goals, 7)
+    last = roll.chain[-1]
+    assert torch.equal(last["cost"], r.cost), "the stream's last cost is not the settled cost"
+    assert last["t"] == float(b.rollout.ep_steps)
+    assert len(roll.chain) >= 2 and roll.chain[-2]["t"] < last["t"]
+
+
+def test_the_discount_is_a_rate_in_time_when_asked():
+    from lagrangian_es.composer import returns_from_stream
+    B = 2
+    chain = [{"t": 10.0, "cost": torch.tensor([1.0, 1.0])}, {"t": 30.0, "cost": torch.tensor([2.0, 2.0])}, {"t": 40.0, "cost": torch.tensor([4.0, 4.0])}]
+    recs = [{"t": 0.0, "act": torch.zeros(B, 1), "alive": torch.ones(B, dtype=torch.bool), "rows": torch.arange(B)},
+            {"t": 30.0, "act": torch.zeros(B, 1), "alive": torch.ones(B, dtype=torch.bool), "rows": torch.arange(B)}]
+    per_record = returns_from_stream(recs, chain, 0.5)                 # r0 = -(2-0)... cost before t=0 is 0
+    per_time = returns_from_stream(recs, chain, 0.5, unit=10.0)        # 30 steps between records = 3 units
+    # decision 1's return is the same either way (nothing after it)
+    assert torch.allclose(per_record[1], per_time[1])
+    # decision 0: r0 + gamma * G1 per record, r0 + gamma^3 * G1 per time
+    r0 = -(2.0 - 0.0); G1 = -(4.0 - 2.0)
+    assert torch.allclose(per_record[0], torch.full((B,), r0 + 0.5 * G1))
+    assert torch.allclose(per_time[0], torch.full((B,), r0 + 0.5 ** 3 * G1))
+
+
+def test_every_row_samples_its_token_and_only_the_recorded_rows_are_read():
+    """One policy: when stochastic every row samples (recorded or not); the
+    records hold only the rows the update will read."""
+    b = _cfg("policy"); sysm, tr, task = build(b)
+    th = tr.init()[None]; goals = task.sample(6, make_gen(1))
+    det = build_composer(b, sysm, tr); det.stochastic = False
+    r_det = Rollout(sysm, tr, task, b.rollout, build_sensors(b, sysm), composer=det); r_det.trace(th, goals, 7); specs_det = r_det.last_specs.clone()
+    with torch.no_grad(): det.net.head_act.bias[det.net.vocab.HOLD] = 0.0        # a policy that speaks often, so sampling shows
+    torch.save(det.net.state_dict(), "/tmp/_one_path.pt")
+    from dataclasses import replace
+    b2 = replace(b, composer_kw=b.composer_kw + (("weights", "/tmp/_one_path.pt"),))
+    r_det2 = Rollout(sysm, tr, task, b2.rollout, build_sensors(b2, sysm), composer=build_composer(b2, sysm, tr)); r_det2.trace(th, goals, 7); specs_det2 = r_det2.last_specs.clone()
+    noisy = build_composer(b2, sysm, tr); noisy.stochastic = True; noisy.record_rows = torch.tensor([0, 2, 4])
+    torch.manual_seed(0)
+    r_noisy = Rollout(sysm, tr, task, b2.rollout, build_sensors(b2, sysm), composer=noisy); r_noisy.trace(th, goals, 7); specs_noisy = r_noisy.last_specs
+    assert not torch.equal(specs_det2[:, [1, 3, 5]], specs_noisy[:, [1, 3, 5]]), "unrecorded rows must sample too"
+    assert all(set(r["rows"].tolist()) <= {0, 2, 4} for r in noisy.records), "only the recorded rows are read"
+
+
+def test_the_self_token_carries_view_dot_travel():
+    """The eighth self feature is the cosine between the forward axis and the
+    velocity: +1 flying forward, -1 backward, 0 sideways or at rest."""
+    import math
+    from lagrangian_es.composer import Tokenizer
+    tok = Tokenizer(scale=30.0, reach=10.0)
+    B = 4; psi = torch.tensor([0.0, 0.0, math.pi / 2, 0.3], dtype=torch.float64)
+    c, s_ = torch.cos(psi), torch.sin(psi)
+    R = torch.zeros(B, 3, 3, dtype=torch.float64); R[:, 0, 0] = c; R[:, 0, 1] = -s_; R[:, 1, 0] = s_; R[:, 1, 1] = c; R[:, 2, 2] = 1.0
+    v = torch.tensor([[2.0, 0.0, 0.0], [-2.0, 0.0, 0.0], [3.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=torch.float64)
+    x = torch.zeros(B, 3, dtype=torch.float64); x[:, 2] = 1.5
+    ctx = {"x": x, "v": v, "goal": x + 5.0, "state": {"R": R, "p": x, "v": v}, "t": 0, "chain": []}
+    t = tok(ctx, [])
+    assert torch.allclose(t["self"][:, 7], torch.tensor([1.0, -1.0, 0.0, 0.0], dtype=torch.float64), atol=1e-9), t["self"][:, 7]
+
+
+def test_spec_where_carries_moved_and_the_recorder_survives_frozen_rows():
+    import torch
+    from lagrangian_es.composer.spec import TaskSpec
+    a = TaskSpec.identity(4, 3, 2, torch.float64, "cpu"); b = a.clone()
+    a.moved = torch.tensor([True, True, False, False]); b.moved = torch.tensor([False, False, False, True])
+    m = torch.tensor([True, False, True, False])
+    assert a.where(m, b).moved.tolist() == [True, False, False, True]      # self where the mask holds, the other elsewhere
+    # the recorder composer through a rollout where rows freeze (crash or arrive)
+    from dataclasses import replace
+    from lagrangian_es.config import RolloutCfg
+    from lagrangian_es.es import build_sensors
+    from lagrangian_es.rollout import Rollout
+    from lagrangian_es.composer import Recorder, OracleSubgoal
+    cfg = replace(_cfg(), rollout=RolloutCfg(n_eps=6, ep_steps=150, dead_mode="constant", dead_cost=40.0, goal_bonus=60.0, stop_on_arrival=True))
+    sysm, tr, task = build(cfg); comp = Recorder(sysm, tr, OracleSubgoal(sysm, tr, reach=10.0, every=50), reach=10.0)
+    roll = Rollout(sysm, tr, task, cfg.rollout, build_sensors(cfg, sysm), composer=comp)
+    r = roll.run(tr.init()[None], task.sample(6, make_gen(5)), 6)
+    assert torch.isfinite(r.cost).all()

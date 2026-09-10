@@ -13,6 +13,7 @@ on this plant -- see `two_link_arm.py` for the case where it does not.
 """
 from __future__ import annotations
 
+import math
 import torch
 from torch import Tensor
 
@@ -34,7 +35,11 @@ class QuadrotorSE3(LagrangianSystem):
         g: float = 9.81,
         thrust_ratio: float = 2.2,     # f_max / (m g)
         tau_max: float = 0.30,
-        phi0: tuple = (0.25, 0.25, 0.25, 0.10, 0.10, 0.10),   # kR, kW priors
+        phi0: tuple = None,            # kR, kW priors; None = derived from the plant (see allocator_init)
+        att_ratio: float = 5.0,        # the attitude loop's bandwidth over the position loop's
+        att_zeta: float = 0.8,         # its damping ratio
+        f_min_frac: float = 0.1,       # the thrust envelope keeps at least this fraction of f_max vertical
+        yaw_budget_frac: float = 0.5,  # the Lagrangian yaw torque saturates smoothly at this fraction of tau_max
         # "world_x" pins the heading to a compass bearing; "learned" hands yaw
         # to the genome, which is free on this plant -- thrust is along body z,
         # so rotating about it does not disturb position tracking at all.
@@ -51,6 +56,7 @@ class QuadrotorSE3(LagrangianSystem):
         reset_vel_noise: float = 0.05,
         reset_att_noise: float = 0.03,
         reset_yaw: float = 0.0,
+        speed_limit: float = 0.0,
         reset_om_noise: float = 0.05,
         # --- liveness envelope
         z_floor: float = 0.05,
@@ -67,7 +73,11 @@ class QuadrotorSE3(LagrangianSystem):
         self.f_max = float(thrust_ratio) * self.m * self.g
         self.f_min = 0.0
         self.tau_max = float(tau_max)
-        if yaw_mode not in ("world_x", "learned"):
+        # `lagrangian`: no heading rule at all -- the reference is the current
+        # heading, and yaw is driven by the torque -dV/dpsi the controller's own
+        # potential produces through the body-fixed beams (plus the loop's
+        # damping on the yaw rate); a task-level command still blends on top
+        if yaw_mode not in ("world_x", "learned", "lagrangian"):
             raise ValueError(f"unknown yaw_mode {yaw_mode!r}")
         self.yaw_mode = yaw_mode
         self.yaw_speed_gate = float(yaw_speed_gate)
@@ -86,7 +96,9 @@ class QuadrotorSE3(LagrangianSystem):
             # so a body-mounted camera watches everything except where the
             # vehicle is going.
             self.allocator_dim = 9
-        self.phi0 = tuple(phi0)
+        self.phi0 = None if phi0 is None else tuple(phi0)
+        self.att_ratio, self.att_zeta, self.f_min_frac = float(att_ratio), float(att_zeta), float(f_min_frac)
+        self.yaw_budget_frac = float(yaw_budget_frac)
 
         self.reset_z = float(reset_z)
         self.reset_pos_noise = float(reset_pos_noise)
@@ -95,6 +107,7 @@ class QuadrotorSE3(LagrangianSystem):
         # half-range of a uniform random heading at reset; pi = any heading.  With a
         # forward-mounted fan, facing where you are going is a skill, not a given.
         self.reset_yaw = float(reset_yaw)
+        self.speed_limit = float(speed_limit)   # an airspeed limit, like the thrust and torque clamps; 0 = none (`v_max` below is the liveness bound)
         self.reset_om_noise = float(reset_om_noise)
 
         self.z_floor = float(z_floor)
@@ -140,6 +153,11 @@ class QuadrotorSE3(LagrangianSystem):
         b3 = R[..., :, 2]                                     # body z in world
         acc = b3 * (f * self._inv_m)[..., None] - self._g_vec
         v = s["v"] + dt * acc
+        if self.speed_limit > 0.0:
+            # the airframe's speed limit, a physical clamp on the plant (user:
+            # "set a max speed of 5 m/s"); smooth enough for the differentiable path
+            sp = torch.linalg.vector_norm(v, dim=-1, keepdim=True)
+            v = v * (self.speed_limit / sp.clamp_min(1e-9)).clamp(max=1.0)
         p = s["p"] + dt * v
 
         Jom = om * self.Jvec
@@ -185,7 +203,8 @@ class QuadrotorSE3(LagrangianSystem):
     # --- the underactuation seam --------------------------------------------
     def allocate(self, F_des: Tensor, s: State, phi: Tensor,
                  goal: Optional[Tensor] = None, yaw: Optional[Tensor] = None,
-                 yaw_gate: Optional[Tensor] = None) -> Tensor:
+                 yaw_gate: Optional[Tensor] = None, yaw_offset: Optional[Tensor] = None,
+                 yaw_torque: Optional[Tensor] = None) -> Tensor:
         """Thrust along body z + a geometric SO(3) attitude loop.
 
         `phi` = (kR [3], kW [3]) raw; gains are used squared so they stay positive
@@ -196,6 +215,21 @@ class QuadrotorSE3(LagrangianSystem):
         R, om = s["R"], s["om"]
         kR = phi[..., 0:3] ** 2
         kW = phi[..., 3:6] ** 2
+
+        # --- the thrust envelope ----------------------------------------------
+        # A quadrotor produces at most f_max along its body z, so the forces it
+        # can realise fill a ball of radius f_max -- and a force it cannot
+        # realise must lose its HORIZONTAL part, not its vertical one, or the
+        # body is pointed toward a direction it cannot hold up.  Measured
+        # without this: the fresh potential asked for 24.6 N (f_max 10.8) with
+        # 4.9 N vertical, the body was tilted 78-88 degrees, full thrust lifted
+        # 2 N against 4.9 N of weight, and 30 of 32 flights were on the floor
+        # inside two seconds on an EMPTY map.
+        Fz = F_des[..., 2:3].clamp(self.f_min_frac * self.f_max, self.f_max)
+        Fh = F_des[..., :2]
+        room = (self.f_max ** 2 - Fz ** 2).clamp_min(0.0).sqrt()
+        Fh = Fh * (room / torch.linalg.vector_norm(Fh, dim=-1, keepdim=True).clamp_min(1e-9)).clamp(max=1.0)
+        F_des = torch.cat([Fh, Fz], dim=-1)
 
         # --- thrust: project the desired force onto the current body z --------
         b3 = R[..., :, 2]
@@ -256,6 +290,12 @@ class QuadrotorSE3(LagrangianSystem):
                     + (1.0 - ggate) * (1.0 - vgate) * hh)
             n = torch.linalg.vector_norm(look, dim=-1, keepdim=True)
             look = look / n.clamp_min(1e-6)
+            if yaw_offset is not None:
+                # the low level's own turning: the look-at rotated about world
+                # z by an offset its learned heading head reads off the beams
+                co, so = torch.cos(yaw_offset), torch.sin(yaw_offset)
+                look = torch.stack([co * look[..., 0] - so * look[..., 1],
+                                    so * look[..., 0] + co * look[..., 1], look[..., 2]], dim=-1)
             # Blend back to a FIXED bearing at low speed.  `vh` is a normalised
             # direction, so it is well defined but meaningless when barely
             # moving: it swings through large angles for millimetre-per-second
@@ -295,6 +335,16 @@ class QuadrotorSE3(LagrangianSystem):
             psi = cur + (valid * dpsi).clamp(-self.yaw_slew, self.yaw_slew)
             b1c = torch.stack([torch.cos(psi), torch.sin(psi),
                                torch.zeros_like(psi)], dim=-1)
+        elif self.yaw_mode == "lagrangian":
+            cur = torch.atan2(R[..., 1, 0], R[..., 0, 0])
+            des = cur
+            if yaw is not None:
+                g = torch.ones_like(cur) if yaw_gate is None else yaw_gate
+                dcmd = torch.atan2(torch.sin(yaw - cur), torch.cos(yaw - cur))
+                des = cur + g * dcmd
+            dpsi = torch.atan2(torch.sin(des - cur), torch.cos(des - cur))
+            psi = cur + dpsi.clamp(-self.yaw_slew, self.yaw_slew)
+            b1c = torch.stack([torch.cos(psi), torch.sin(psi), torch.zeros_like(psi)], dim=-1)
         elif yaw is not None:
             # No look-at of its own (yaw fixed at world x), but a heading has
             # been COMMANDED from the task-level layer: slew toward it from the
@@ -321,7 +371,25 @@ class QuadrotorSE3(LagrangianSystem):
         eW = om                                              # om_d = 0
 
         gyro = torch.cross(om, om * self.Jvec, dim=-1)       # feedforward
-        tau = (-kR * eR - kW * eW + gyro).clamp(-self.tau_max, self.tau_max)
+        tau = -kR * eR - kW * eW + gyro
+        if yaw_torque is not None and self.yaw_mode == "lagrangian":
+            # the potential's own turning, about body z (the third torque
+            # channel); the loop's kW damps the yaw rate it produces.  Only
+            # in the Lagrangian yaw mode: the other modes command a heading
+            # through b1c, and adding the torque there fought that loop in
+            # every existing configuration (review finding, Sept 9).
+            #
+            # SMOOTHLY budgeted, like the pull: the potential asks for tens of
+            # N.m against a 0.3 N.m limit, so a hard clamp made yaw bang-bang
+            # and the closed loop discontinuous -- a 1e-4 perturbation of the
+            # genome flipped 13% of crash outcomes in corridors with this
+            # torque and 3% without it.  tanh at half the torque limit keeps
+            # the other half for the attitude loop's own damping and keeps
+            # the map continuous.
+            b = self.yaw_budget_frac * self.tau_max
+            yaw_torque = b * torch.tanh(yaw_torque / b)
+            tau = tau + torch.stack([torch.zeros_like(yaw_torque), torch.zeros_like(yaw_torque), yaw_torque], dim=-1)
+        tau = tau.clamp(-self.tau_max, self.tau_max)
         return torch.cat([f[..., None], tau], dim=-1)
 
     # --- task-space accessors -----------------------------------------------
@@ -331,17 +399,41 @@ class QuadrotorSE3(LagrangianSystem):
         eye = torch.eye(3, dtype=self.dtype, device=self.device)
         return (self.m * eye).expand(s["p"].shape[:-1] + (3, 3))
 
+    def pull_budget(self) -> float:
+        """The force a goal pull may ask for: HALF the horizontal room the
+        rotors have at hover, sqrt(f_max^2 - (m g)^2) / 2.  The other half is
+        the brake's.  A pull that takes the whole room -- the quadratic bowl
+        asks 20 N at 10 m against 9.6 N of room -- leaves a braking term no
+        authority at all: it must first cancel what the envelope was already
+        discarding before it slows anything.  Measured on the 25%-buildings
+        map: every crash at the speed limit, 1.0 s after takeoff, the brake
+        never biting, the search flat for 40 iterations."""
+        return 0.5 * float((self.f_max ** 2 - (self.m * self.g) ** 2) ** 0.5)
+
     def allocator_init(self) -> Tensor:
-        """kR = 0.25, kW = 0.10 (used squared) -> an attitude loop barely faster
-        than the position loop.  Deliberately marginal: this is what makes the
-        generation-0 prior crash rather than merely track poorly.
+        """The attitude prior, derived from the plant rather than guessed.
+
+        The position loop's prior is the unit bowl V = |e|^2 (force 2e), so its
+        bandwidth is w_pos = sqrt(2/m); the attitude loop sits `att_ratio`
+        times above it at damping `att_zeta`: kR_i = w^2 J_i, kW_i = 2 zeta w
+        J_i, stored as square roots since the gains are used squared.  The old
+        fixed prior (0.25, 0.10) gave 3.5 rad/s at damping 0.28 on this plant:
+        a 60-degree command overshot to 95 degrees, past horizontal.  The base
+        Lagrangian must fly on its own -- the perturbations are there to keep
+        it from crashing, not to teach it to fly.  Pass `phi0` to override.
 
         Under `yaw_mode="learned"` the prior points straight at the target
         (1, 0, 0) -- the cue that survives at hover -- and the search is free to
         move weight onto travel (look where you are going) or lateral (scan into
         the turn) instead.
         """
-        phi = self._t(self.phi0)
+        if self.phi0 is not None:
+            phi = self._t(self.phi0)
+        else:
+            w_att = self.att_ratio * math.sqrt(2.0 / self.m)
+            kR = (w_att ** 2) * self.Jvec
+            kW = 2.0 * self.att_zeta * w_att * self.Jvec
+            phi = torch.cat([kR.sqrt(), kW.sqrt()]).to(self.dtype)
         if self.yaw_mode == "learned":
             extra = torch.tensor([1.0, 0.0, 0.0], dtype=self.dtype,
                                  device=self.device)   # look AT the target
