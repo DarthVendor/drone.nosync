@@ -135,8 +135,9 @@ def _init(spec: dict) -> None:
 def _work(payload):
     TH, goals, seed = payload[:3]
     TH, goals = _tensor(TH), _tensor(goals)
-    stochastic, record_frac, shard, difficulty = (payload[3:] + (False, 0.0, 0, None))[:4] if len(payload) > 3 \
-        else (False, 0.0, 0, None)
+    stochastic, record_frac, shard, difficulty, noise = \
+        (tuple(payload[3:]) + (False, 0.0, 0, None, 0))[:5] if len(payload) > 3 \
+        else (False, 0.0, 0, None, 0)
     if difficulty is not None and hasattr(_RIG.system, "difficulty"):
         # a curriculum on the scene: the fraction of obstacles left active this
         # batch, set on the worker's own plant (the pool is forked once)
@@ -152,7 +153,13 @@ def _work(payload):
         # exploration noise is seeded per shard, so a batch is reproducible
         # and two shards never draw the same noise
         comp.stochastic = bool(stochastic); comp.records = []
-        torch.manual_seed(int(seed) * 1_000 + int(shard))
+        # `noise` moves ONLY the composer's draws.  The tasks, the initial
+        # states and the sensor noise all come from `seed`, so re-flying a
+        # batch with the same seed and a different `noise` gives independent
+        # policy samples of the SAME tasks -- which is what a per-task baseline
+        # needs, and what lets a hard task enter the update as soon as one of
+        # its samples arrives.
+        torch.manual_seed(int(seed) * 1_000 + int(shard) + int(noise) * 1_000_003)
         # record only the rows that will be kept, from the first decision on
         B_rows = TH.shape[0] * goals.shape[0]
         comp.record_rows = (torch.arange(0, B_rows, max(1, int(round(1.0 / record_frac))))
@@ -227,18 +234,49 @@ def _work_local(rig, payload):
         _RIG = saved
 
 
-def _merge(parts) -> RolloutResult:
+def _ep_rows(P: int, E: int, lo: int, hi: int) -> Tensor:
+    """Global flat rows held by the episode shard `[lo, hi)`.
+
+    The batch is laid out `member * E + episode`, so a POPULATION shard owns a
+    contiguous block and an EPISODE shard owns a stride -- one run of `hi - lo`
+    rows per member.  Everything the caller gets back is addressed in these
+    global rows, which is why the merge scatters instead of concatenating.
+    """
+    e = torch.arange(lo, hi)
+    p = torch.arange(P)
+    return (p[:, None] * E + e[None, :]).reshape(-1)
+
+
+def _merge(parts, order=None) -> RolloutResult:
     parts = [_from_ipc(p) for p in parts]
-    cat = lambda i: torch.cat([_tensor(p[i]) for p in parts], dim=0)
+    if order is None:
+        cat = lambda i: torch.cat([_tensor(p[i]) for p in parts], dim=0)
+    else:
+        # Episode shards interleave, so each part is written to the global rows
+        # it owns rather than appended.  The two PER-GENOME fields are the
+        # exception: every shard reports the same P genomes, each already
+        # averaged over its own (equal-sized) slice of episodes, so their mean
+        # is the full-batch mean exactly.
+        N = sum(int(o.numel()) for o in order)
+        PER_GENOME = (0, 13)                                   # fitness, fitness_sub
+        def cat(i):
+            vs = [_tensor(p[i]) for p in parts]
+            if i in PER_GENOME:
+                return torch.stack(vs, 0).mean(0)
+            out = torch.empty((N,) + tuple(vs[0].shape[1:]), dtype=vs[0].dtype)
+            for o, v in zip(order, vs):
+                out[o] = v
+            return out
     opt = lambda i: None if any(p[i] is None for p in parts) else cat(i)
     return RolloutResult(
         fitness=cat(0), cost=cat(1), alive=cat(2), leg_err=cat(3),
         final_err=cat(4), success=cat(5), legs_done=cat(6), finish_frac=cat(7),
-        saturation=cat(8), effort=cat(9), shaping=cat(10), n_eps=parts[0][11],
+        saturation=cat(8), effort=cat(9), shaping=cat(10),
+        n_eps=parts[0][11] if order is None else sum(p[11] for p in parts),
         cost_sub=opt(12), fitness_sub=opt(13), death_step=opt(14))
 
 
-def _records(parts, step: int, n_eps: int):
+def _records(parts, step: int, n_eps: int, order=None):
     """Per-shard composer records with their rows re-based to the whole batch.
     Shards can end at different intervals (early exit), so their decision
     lists are kept separate rather than concatenated."""
@@ -246,7 +284,8 @@ def _records(parts, step: int, n_eps: int):
     parts = [_from_ipc(p) for p in parts]
     for i, p in enumerate(parts):
         if len(p) > 15 and p[15] is not None:
-            rec = dict(p[15]); rec["rows"] = rec["rows"] + i * step * n_eps
+            rec = dict(p[15])
+            rec["rows"] = (rec["rows"] + i * step * n_eps) if order is None else order[i][rec["rows"]]
             out.append(rec)
     return out
 
@@ -290,7 +329,8 @@ class ParallelRollout:
     """
 
     def __init__(self, spec: dict, workers: Optional[int] = None,
-                 min_pop: int = 32, threads: Optional[int] = None, shards: Optional[int] = None):
+                 min_pop: int = 32, threads: Optional[int] = None, shards: Optional[int] = None,
+                 shard_axis: str = "auto"):
         self.spec = dict(spec)
         if threads is None:
             # With a composer in the loop each worker is matmul-bound (the
@@ -308,6 +348,12 @@ class ParallelRollout:
         # wait on the slowest core, and eight workers bought nothing over four.
         # With P shards a fast worker takes several while a slow one takes one.
         self.shards = None if shards is None else int(shards)
+        # Which axis to split.  The population is the natural one for a GA, but
+        # a FROZEN low level is a single genome, so there is nothing to split
+        # and the whole batch ran in one process -- 576 flights, one core, the
+        # other nine idle.  The EPISODES are independent too, so "auto" splits
+        # those whenever the population is too small to fill the workers.
+        self.shard_axis = str(shard_axis)
         self._pool: Optional[ProcessPoolExecutor] = None
         self._local: Optional[Rollout] = None
 
@@ -364,34 +410,77 @@ class ParallelRollout:
             rig = self._local_rig()
             return [_work_local(rig, c) for c in chunks]
 
-    def run(self, TH: Tensor, goals: Tensor, seed: int) -> RolloutResult:
-        P = TH.shape[0]
-        if self.workers <= 1 or P < self.min_pop:
-            return self._local_rig().run(TH, goals, seed)
+    #: an episode shard's slice must keep the recorded-row stride's PHASE.  The
+    #: worker keeps every `1/record_frac`-th row of its OWN batch, and the
+    #: trainer reads the complement as the policy rows by global index; both
+    #: agree as long as each shard's episode count is a multiple of the stride.
+    EP_ALIGN = 4
+
+    def _ep_shards(self, E: int) -> int:
+        """Largest worker count <= `workers` that splits E exactly and aligned."""
+        for n in range(min(self.workers, E), 1, -1):
+            if E % n == 0 and (E // n) % self.EP_ALIGN == 0:
+                return n
+        return 1
+
+    def _plan(self, P: int, E: int, cap: bool) -> tuple:
+        """`(axis, n)` -- how this batch is split, and into how many pieces."""
+        if self.workers <= 1:
+            return "pop", 1
+        axis = self.shard_axis
+        if axis == "auto":
+            axis = "episode" if P < self.workers else "pop"
+        if axis == "episode":
+            n = self._ep_shards(E)
+            return ("episode", n) if n > 1 else ("pop", 1)
+        if P < self.min_pop:
+            return "pop", 1
         n = self._shards(P)
-        step = P // n
-        goals_ipc = _ipc(goals)
-        chunks = [(_ipc(TH[i * step:(i + 1) * step].contiguous()), goals_ipc, seed)
-                  for i in range(n)]
-        return _merge(self._pool_map(chunks))
+        if cap and self.shards and n > 1:
+            n = max(d for d in range(1, min(P, self.shards) + 1) if P % d == 0)   # the largest exact split up to `shards`
+        return "pop", n
+
+    def _chunks(self, TH: Tensor, goals: Tensor, seed: int, axis: str, n: int):
+        """`(payloads, order, step)`: the `(TH, goals, seed)` each shard flies,
+        the global rows it owns (None when the shards are contiguous), and the
+        width of one shard along whichever axis was split."""
+        P, E = TH.shape[0], goals.shape[0]
+        if axis == "pop":
+            step = P // n
+            g = _ipc(goals)
+            return ([(_ipc(TH[i * step:(i + 1) * step].contiguous()), g, seed) for i in range(n)],
+                    None, step)
+        step = E // n
+        th = _ipc(TH)
+        # a DIFFERENT reset seed per shard: `Rollout._expand` draws its initial
+        # states from `make_gen(seed)`, so the same seed in every shard would
+        # fly the same starts against different goals
+        return ([(th, _ipc(goals[i * step:(i + 1) * step].contiguous()), seed + i * 104_729)
+                 for i in range(n)],
+                [_ep_rows(P, E, i * step, (i + 1) * step) for i in range(n)], step)
+
+    def run(self, TH: Tensor, goals: Tensor, seed: int) -> RolloutResult:
+        P, E = TH.shape[0], goals.shape[0]
+        axis, n = self._plan(P, E, cap=False)
+        if n <= 1:
+            return self._local_rig().run(TH, goals, seed)
+        chunks, order, _ = self._chunks(TH, goals, seed, axis, n)
+        return _merge(self._pool_map(chunks), order)
 
     def run_with_records(self, TH: Tensor, goals: Tensor, seed: int,
-                         stochastic: bool = True, record_frac: float = 0.125, difficulty=None):
+                         stochastic: bool = True, record_frac: float = 0.125, difficulty=None,
+                         noise: int = 0):
         """`run`, and the composer's recorded decisions from every shard.
 
         For co-training: the GA ranks every flight from the merged result while
         the composer's update reads a fraction of rows -- each entry carries
         `records`, `chain` and the global `rows` they belong to."""
-        P = TH.shape[0]
-        n = self._shards(P) if (self.workers > 1 and P >= self.min_pop) else 1
-        if self.shards and n > 1:
-            n = max(d for d in range(1, min(P, self.shards) + 1) if P % d == 0)     # the largest exact split up to `shards`
-        step = P // n
-        goals_ipc = _ipc(goals)
-        chunks = [(_ipc(TH[i * step:(i + 1) * step].contiguous()), goals_ipc, seed, stochastic, record_frac, i, difficulty)
-                  for i in range(n)]
+        P, E = TH.shape[0], goals.shape[0]
+        axis, n = self._plan(P, E, cap=True)
+        chunks, order, step = self._chunks(TH, goals, seed, axis, max(n, 1))
+        chunks = [c + (stochastic, record_frac, i, difficulty, noise) for i, c in enumerate(chunks)]
         parts = self._pool_map(chunks) if n > 1 else [_work_local(self._local_rig(), chunks[0])]
-        return _merge(parts), _records(parts, step, goals.shape[0])
+        return _merge(parts, order), _records(parts, step, E, order)
 
     def _shards(self, P: int) -> int:
         """Largest worker count <= `workers` that divides P EXACTLY.

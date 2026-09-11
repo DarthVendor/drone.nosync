@@ -118,3 +118,36 @@ def test_adaptive_cap_counts_only_the_recorded_rows_when_a_composer_records():
     r2 = Rollout(sysm, tr, task, base.rollout, build_sensors(base, sysm), composer=comp2).run(th, goals, 3)
     assert r.cost.shape == r2.cost.shape
     assert bool((r.cost[[1, 3, 5, 7]] <= r2.cost[[1, 3, 5, 7]] + 1e-9).all()), "recorded rows were cut shorter than before"
+
+
+def test_the_quantile_truncates_the_reported_arrival_rate():
+    """The trap that cost this project a fortnight.
+
+    `stop_quantile` is an approximation for SPEED, and the tests above only
+    pinned that it does not change the COST.  It does change `success`: the
+    batch ends the moment `q` of it has arrived, and every episode still in the
+    air is recorded as never having arrived.  So the measured arrival rate is
+    capped at roughly `q` no matter how good the policy is.
+
+    Co-training read that number two ways and both were wrong: the curriculum
+    gate needed 0.95 from a quantity bounded near 0.90, so the difficulty could
+    never rise off zero; and `finish_frac` is 1.0 for exactly those truncated
+    rows, so the imitation filter was told they had failed while they were
+    still flying.  Measured on the real config: 0.908 with q=0.9 against 0.988
+    with the early exit off, on identical tasks.
+
+    Anything that READS `success` or `finish_frac` as a measurement -- a gate, a
+    curriculum, a training filter, a report -- needs q = 1.0.
+    """
+    exact = _fitness("empty", 1.0, steps=600)
+    cut = _fitness("empty", 0.5, steps=600)
+    r_exact = float(exact.success.to(torch.float64).mean())
+    r_cut = float(cut.success.to(torch.float64).mean())
+    assert r_exact > r_cut, (
+        f"expected the quantile to truncate arrivals, got exact {r_exact:.3f} vs cut {r_cut:.3f}")
+    # and the truncated rows are the ones that were still flying: alive, not arrived
+    still_flying = float(((cut.alive) & (~cut.success.bool())).to(torch.float64).mean())
+    assert still_flying > 0.0, "nothing was truncated, so this fixture proves nothing"
+    # their finish_frac is 1.0 -- indistinguishable from a genuine failure
+    trunc = cut.finish_frac[(cut.alive) & (~cut.success.bool())]
+    assert float(trunc.min()) == 1.0

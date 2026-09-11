@@ -23,13 +23,15 @@ def _spec(B, n=2):
     return s
 
 
-def _place(V, r, th, L=10.0, reach=10.0, psi=0.0, B=4):
+def _place(V, r, th, L=10.0, reach=10.0, psi=0.0, B=4, phi=0.0, dz=0.0):
     """`L` is the distance to the goal in METRES; `g_ego` is handed to the
-    vocabulary in units of the reach, which is the convention `goal_ego` uses."""
+    vocabulary in units of the reach, which is the convention `goal_ego` uses.
+
+    `phi` is the elevation argument, 0 meaning level with the vehicle."""
     x = torch.zeros(B, 3, dtype=DT); x[:, 2] = 1.5
-    goal = x + torch.tensor([[L, 0.0, 0.0]], dtype=DT).repeat(B, 1)
-    g_ego = torch.tensor([[L / reach, 0.0, 0.0]], dtype=DT).repeat(B, 1)
-    a = torch.zeros(B, 2, dtype=DT); a[:, 0] = r; a[:, 1] = th
+    goal = x + torch.tensor([[L, 0.0, dz]], dtype=DT).repeat(B, 1)
+    g_ego = torch.tensor([[L / reach, 0.0, dz / reach]], dtype=DT).repeat(B, 1)
+    a = torch.zeros(B, 3, dtype=DT); a[:, 0] = r; a[:, 1] = th; a[:, 2] = phi
     tok = torch.full((B,), V.WAYPOINT, dtype=torch.long)
     sp = V.apply(tok, a, _spec(B), x, goal, torch.full((B,), psi, dtype=DT), g_ego, reach, 0.3)
     return x, goal, sp
@@ -242,3 +244,151 @@ def test_an_argument_a_token_does_not_use_gets_no_gradient():
     # token's either, since none of them were chosen
     assert torch.equal(net.arg_w2.detach(), before), \
         "silence moved an argument head, so unused slots are entering the likelihood"
+
+
+# --- arrival time as the cross-entropy weight --------------------------------
+# The hard `keep_frac` cut threw away the gradient from two thirds of the
+# arrivals and quantized the rest; worse, with one flight per task it ranked
+# the TASKS, so "the fastest 30%" meant "the 30% nearest goals".
+
+def test_a_flight_that_never_arrived_is_never_imitated():
+    """`finish_frac` is 1.0 exactly when the flight never arrived, and such a
+    flight has no arrival time to rank.  A positive weight on it would make the
+    failure more likely, so imitation gives it zero."""
+    from lagrangian_es.composer.policy_cont import arrival_weights
+    t = torch.tensor([0.2, 0.5, 0.8, 1.0, 1.0])
+    w = arrival_weights(t, tau=1.0)
+    assert (w[3:] == 0).all()
+    assert (w[:3] > 0).all()
+
+
+def test_imitation_weight_falls_with_arrival_time_and_averages_one():
+    from lagrangian_es.composer.policy_cont import arrival_weights
+    t = torch.tensor([0.2, 0.4, 0.6, 0.8])
+    w = arrival_weights(t, tau=1.0)
+    assert (w[:-1] > w[1:]).all(), "a quicker flight must count for more"
+    assert abs(float(w.mean()) - 1.0) < 1e-9, "mean 1 keeps the loss on the scale an unweighted mean has"
+
+
+def test_effective_sample_size_matches_the_cut_it_replaces():
+    """tau = 1 is chosen so the soft weight is about as selective as the 30%
+    cut: for a normal spread of arrival times the effective sample size is
+    e^-1 = 37% of the arrivals."""
+    from lagrangian_es.composer.policy_cont import arrival_weights
+    g = torch.Generator().manual_seed(0)
+    t = 0.5 + 0.1 * torch.randn(20000, generator=g, dtype=torch.float64)
+    w = arrival_weights(t.clamp(0.01, 0.99), tau=1.0)
+    ess = float(w.sum() ** 2 / (w * w).sum()) / w.numel()
+    assert 0.30 < ess < 0.45, f"effective sample size {ess:.3f}, expected ~0.37"
+
+
+def test_grouping_by_task_ranks_decisions_not_goals():
+    """The whole point.  Two tasks, one easy and one hard; the hard task's best
+    flight is SLOWER in absolute terms than the easy task's worst, and must
+    still outweigh it -- otherwise the update only ever sees easy tasks."""
+    from lagrangian_es.composer.policy_cont import arrival_weights
+    t = torch.tensor([0.10, 0.20, 0.60, 0.90])       # task 0 easy, task 1 hard
+    task = torch.tensor([0, 0, 1, 1])
+    ungrouped = arrival_weights(t, tau=1.0)
+    assert ungrouped[2] < ungrouped[1], "without tasks the easy goal wins on absolute time"
+    w = arrival_weights(t, task, tau=1.0)
+    assert w[2] > w[1], "the hard task's best flight must outweigh the easy task's worst"
+    assert w[0] > w[1] and w[2] > w[3], "within a task, quicker still wins"
+
+
+def test_signed_weight_pushes_failures_down_and_balances_within_a_task():
+    """A signed weight is a policy gradient with a per-task baseline, written
+    as a weight -- one cross-entropy term still, but it can move probability
+    DOWN, which is the only way the failure rate can fall."""
+    from lagrangian_es.composer.policy_cont import arrival_weights
+    t = torch.tensor([0.3, 1.0, 0.4, 0.5])           # flight 1 never arrived
+    task = torch.tensor([0, 0, 1, 1])
+    w = arrival_weights(t, task, tau=1.0, signed=True)
+    assert w[1] < 0, "a failure must be made LESS likely"
+    assert w[0] > 0
+    for j in (0, 1):                                  # the baseline is the task's own mean
+        assert abs(float(w[task == j].sum())) < 1e-9
+    # and the magnitude is bounded, since nothing stops -log p running away
+    big = arrival_weights(torch.tensor([0.0, 0.5, 1.0]), tau=0.01, signed=True, w_max=2.0)
+    assert float(big.abs().max()) <= 2.0
+
+
+def test_one_sample_per_task_falls_back_to_the_batch_baseline():
+    """Centring a task's single flight on its own mean leaves exactly zero, so
+    every weight comes out 1 and the update degenerates to imitating
+    everything.  That is the k=1 control arm, and it must centre on the batch."""
+    from lagrangian_es.composer.policy_cont import arrival_weights
+    t = torch.tensor([0.2, 0.4, 0.6, 0.8])
+    solo = torch.arange(4)                          # one flight per task
+    w = arrival_weights(t, solo, tau=1.0)
+    assert float(w.std()) > 0.1, "weights collapsed to uniform: no selection at all"
+    assert torch.allclose(w, arrival_weights(t, tau=1.0))
+    ess = float(w.sum() ** 2 / (w * w).sum())
+    assert ess < 0.9 * w.numel(), "an effective sample size equal to n means nothing was weighted"
+
+
+# --- phi: the vertical axis the composer did not have -----------------------
+# Height used to be DERIVED -- the subgoal took the goal's own height scaled by
+# how far out it sat -- so the composer could route around a building but never
+# over one, and could not lift away from the floor where most deaths happen.
+
+def test_phi_lifts_and_drops_the_subgoal():
+    from lagrangian_es.composer.actions_cont import ContVocab, PHI_MAX
+    V = ContVocab(1)
+    x, goal, lvl = _place(V, r=1.0, th=0.0, phi=0.0)
+    _, _, up = _place(V, r=1.0, th=0.0, phi=1.0)
+    _, _, dn = _place(V, r=1.0, th=0.0, phi=-1.0)
+    z = lambda sp: (goal + sp.delta)[:, 2]
+    assert (z(up) > z(lvl)).all(), "phi=+1 must place the subgoal above"
+    assert (z(dn) < z(lvl)).all(), "phi=-1 must place it below"
+    # at full deflection the climb is PHI_MAX, so rise = radius * sin(PHI_MAX)
+    rise = float((z(up) - x[:, 2]).mean())
+    assert abs(rise - 10.0 * math.sin(PHI_MAX)) < 1e-6, rise
+
+
+def test_phi_is_bounded_so_one_token_cannot_command_straight_up():
+    """The argument is squashed into [-PHI_MAX, PHI_MAX].  Unbounded, the
+    extreme puts the subgoal directly overhead with no horizontal progress."""
+    from lagrangian_es.composer.actions_cont import ContVocab, PHI_MAX
+    V = ContVocab(1)
+    assert PHI_MAX <= math.pi / 2
+    x, goal, sp = _place(V, r=1.0, th=0.0, phi=1.0)
+    sub = goal + sp.delta
+    horiz = (sub[:, :2] - x[:, :2]).norm(dim=-1)
+    assert (horiz > 0).all(), "full climb must still make horizontal progress"
+
+
+def test_the_subgoal_still_collapses_onto_the_goal_in_three_dimensions():
+    """The arrival degeneracy, now in 3-D.  The radius is the 3-D distance to
+    go, so r at its maximum aimed at the goal lands exactly ON it -- measuring
+    the radius horizontally (as before) left the subgoal at the goal's range
+    but the vehicle's height whenever the goal was above or below."""
+    from lagrangian_es.composer.actions_cont import ContVocab, PHI_MAX
+    V = ContVocab(1)
+    L, dz, reach = 6.0, 3.0, 10.0
+    elev = math.atan2(dz, L)
+    assert elev < PHI_MAX, "fixture only meaningful when the goal is reachable in one token"
+    x, goal, sp = _place(V, r=1.0, th=0.0, L=L, dz=dz, reach=reach, phi=elev / PHI_MAX)
+    sub = goal + sp.delta
+    assert torch.allclose(sub, goal, atol=1e-6), (sub[0].tolist(), goal[0].tolist())
+
+
+def test_the_elevation_residual_round_trips_to_the_goals_own_climb_angle():
+    """`pre` adds `atanh(elev / PHI_MAX)` to the WAYPOINT's phi slot, the same
+    residual it adds to theta for the bearing.  The property that matters is
+    the round trip: with the head contributing nothing, the token that comes
+    out must aim at the goal's actual climb angle -- so a waypoint placed on
+    the prior flies AT the goal in three dimensions, and the head only has to
+    learn the correction.
+    """
+    from lagrangian_es.composer.actions_cont import PHI_MAX
+    for dz, L in ((2.0, 4.0), (-1.0, 5.0), (0.0, 3.0)):
+        elev = math.atan2(dz, L)                      # the goal's own climb angle
+        assert abs(elev) < PHI_MAX, "fixture must stay inside the token's range"
+        u = math.atanh(min(max(elev / PHI_MAX, -0.999), 0.999))   # what `pre` adds
+        got = PHI_MAX * math.tanh(u)                  # what `finish` turns it back into
+        assert abs(got - elev) < 1e-9, (dz, L, got, elev)
+    # and a goal steeper than the token's range saturates rather than wrapping
+    steep = math.atan2(50.0, 1.0)
+    u = math.atanh(min(max(steep / PHI_MAX, -0.999), 0.999))
+    assert 0 < PHI_MAX * math.tanh(u) <= PHI_MAX

@@ -5,7 +5,8 @@ is a bare EOS -- but the arguments are real numbers instead of a grid.  Five
 token TYPES replace twenty-five components:
 
     EOS                     close the chain; alone, it is silence
-    WAYPOINT(r, theta)      put the subgoal r of the way out, at bearing theta
+    WAYPOINT(r, theta, phi) put the subgoal r of the way out, at bearing theta
+                            and elevation phi
     TURN(theta)             command a yaw change
     PRIORITY(w0..w_{n-1})   push the constraint terms up or down
     LOOK                    point the camera
@@ -53,13 +54,19 @@ EOS, WAYPOINT, TURN, PRIORITY, LOOK = 0, 1, 2, 3, 4
 N_TOKENS = 5
 
 #: how many continuous arguments each type carries (PRIORITY is n_terms, set per instance)
-BASE_ARGS = {EOS: 0, WAYPOINT: 2, TURN: 1, LOOK: 0}      # WAYPOINT is (r, theta)
+BASE_ARGS = {EOS: 0, WAYPOINT: 3, TURN: 1, LOOK: 0}      # WAYPOINT is (r, theta, phi)
 
 #: the widest argument vector any token uses; the head always emits this many
 #: and the unused tail is ignored, so one Gaussian covers every token type
-MAX_ARGS = 2
+MAX_ARGS = 3
 
 TURN_MAX = math.pi / 2          # a single TURN commands at most a quarter turn
+#: how steeply one waypoint may be placed above or below the vehicle.  Not
+#: pi/2: at the extreme that puts the subgoal directly overhead with no
+#: horizontal progress at all, and the whole argument range would be spent on
+#: climb angles no delivery flight uses.  At pi/4 the vertical and horizontal
+#: components are equal at full deflection, which is already a steep climb.
+PHI_MAX = math.pi / 4
 PRIORITY_MAX = 1.0              # how far one PRIORITY token can push a term
 
 
@@ -77,7 +84,7 @@ class ContVocab:
         self.n_args = max(MAX_ARGS, self.n_terms)
 
     def name(self, t: int) -> str:
-        return {EOS: "EOS", WAYPOINT: "WAYPOINT(r,theta)", TURN: "TURN(theta)",
+        return {EOS: "EOS", WAYPOINT: "WAYPOINT(r,theta,phi)", TURN: "TURN(theta)",
                 PRIORITY: "PRIORITY(w)", LOOK: "LOOK"}[int(t)]
 
     def n_arg_of(self, t: int) -> int:
@@ -94,7 +101,7 @@ class ContVocab:
         """A working copy plus the pending-waypoint slots."""
         out = cur.clone() if hasattr(cur, "clone") else cur
         B = psi.shape[0]
-        pend = torch.zeros(B, 2, dtype=psi.dtype, device=psi.device)     # (r, theta), squashed
+        pend = torch.zeros(B, 3, dtype=psi.dtype, device=psi.device)     # (r, theta, phi), squashed
         has = torch.zeros(B, dtype=torch.bool, device=psi.device)
         return out, pend, has
 
@@ -116,7 +123,7 @@ class ContVocab:
         psi_r = psi if psi.shape[0] == tok.shape[0] else psi[idx]
         w = tok == WAYPOINT
         if bool(w.any()):
-            pend[idx[w]] = a[w, :2]
+            pend[idx[w]] = a[w, :3]
             has[idx[w]] = True
         t = tok == TURN
         if bool(t.any()) and out.yaw is not None:
@@ -152,15 +159,29 @@ class ContVocab:
             # units and the conversion happens once, at the end.  Mixing the two
             # put every waypoint a couple of metres from the vehicle instead of
             # out at its reach, and it crawled instead of flying.
-            L0 = g_ego[:, :2].to(dt).norm(dim=-1)                      # distance to go, reach units
+            #
+            # SPHERICAL, in the vehicle's frame: `theta` swings the subgoal
+            # around the nose and `phi` tips it above or below the horizon.
+            # Height used to be derived -- the subgoal simply took the goal's
+            # own height scaled by how far out it sat -- which meant the
+            # composer could not climb or descend at all.  It could route
+            # around a building but never over one, and it could not lift away
+            # from the floor, where most deaths happen.  `phi` is that missing
+            # axis; nothing else commands altitude.
+            L0 = g_ego.to(dt).norm(dim=-1)                             # 3-D distance to go, reach units
             radius = L0.clamp(max=1.0)                                 # never past one reach
             r = (pend[:, 0].to(dt) + 1.0) * 0.5 * radius               # [-1,1] -> [0, radius]
             theta = math.pi * pend[:, 1].to(dt)                        # [-1,1] -> [-pi, pi], from the nose
-            # height follows the goal, scaled the same way the distance is, so a
-            # near waypoint does not command a dive
-            zf = (r / radius.clamp_min(1e-9)).clamp(max=1.0)
-            sub_ego = torch.stack([r * torch.cos(theta), r * torch.sin(theta),
-                                   g_ego[:, 2].to(dt) * zf], -1)
+            phi = PHI_MAX * pend[:, 2].to(dt)                          # [-1,1] -> [-PHI_MAX, PHI_MAX]
+            # The radius is the 3-D distance now, so the arrival degeneracy
+            # holds in three dimensions: r at its maximum, aimed at the goal,
+            # puts the subgoal exactly ON the goal.  Measuring it horizontally
+            # (as before) left a subgoal at the goal's range but the vehicle's
+            # height whenever the goal was above or below.
+            cphi = torch.cos(phi)
+            sub_ego = torch.stack([r * cphi * torch.cos(theta),
+                                   r * cphi * torch.sin(theta),
+                                   r * torch.sin(phi)], -1)
             sub_world = x + to_world(sub_ego * reach, psi)             # reach units -> metres
             sub_world = torch.cat([sub_world[:, :2], sub_world[:, 2:].clamp_min(z_min)], -1)
             out.delta = torch.where(has[:, None], sub_world - goal, out.delta)

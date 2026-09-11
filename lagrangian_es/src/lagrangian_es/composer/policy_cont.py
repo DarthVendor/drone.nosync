@@ -24,7 +24,7 @@ from typing import Dict, List, Optional
 import torch
 from torch import Tensor, nn
 
-from .actions_cont import ContVocab, entropy as cont_entropy, log_prob as cont_log_prob
+from .actions_cont import PHI_MAX, ContVocab, entropy as cont_entropy, log_prob as cont_log_prob
 from .base import COMPOSERS
 from .policy import PolicyComposer, PolicyNet, collate_tok
 from .transformer import ACT_SCALE, INSTR
@@ -156,11 +156,19 @@ class ContPolicyNet(PolicyNet):
         mu = torch.einsum("bvh,vhk->bvk", h, self.arg_w2) + self.arg_b2    # [B, token, argument]
         g = self.goal_ego(tok).to(mu.dtype)
         bearing = torch.atan2(g[:, 1], g[:, 0]) / math.pi              # [-1, 1]
-        # the goal-bearing residual belongs to the WAYPOINT's theta and nowhere
-        # else, so a turn or a priority move is not offset by where the goal is
+        # ELEVATION, the same residual one axis up.  `phi` spans [-PHI_MAX,
+        # PHI_MAX], so the goal's own climb angle has to be expressed as a
+        # fraction of that before it can be inverted through the squash -- and
+        # a goal steeper than PHI_MAX simply saturates at full deflection,
+        # which is the steepest the token can ask for anyway.
+        elev = torch.atan2(g[:, 2], g[:, :2].norm(dim=-1).clamp_min(1e-9)) / PHI_MAX
+        # each residual belongs to the WAYPOINT's own slot and nowhere else, so
+        # a turn or a priority move is not offset by where the goal is
         mu = mu.clone()
         mu[:, self.vocab.WAYPOINT, 1] = mu[:, self.vocab.WAYPOINT, 1] + \
             torch.atanh(bearing.clamp(-0.999, 0.999))
+        mu[:, self.vocab.WAYPOINT, 2] = mu[:, self.vocab.WAYPOINT, 2] + \
+            torch.atanh(elev.clamp(-0.999, 0.999))
         return self.head_act(q), mu, self.value(q).squeeze(-1)
 
 
@@ -370,10 +378,64 @@ class ContComposer(PolicyComposer):
         return self._decide_cont(ctx, choose)
 
 
+def arrival_weights(t: Tensor, task: Optional[Tensor] = None, tau: float = 1.0,
+                    signed: bool = False, w_max: float = 2.0) -> Tensor:
+    """A weight per flight from its arrival time `t` (`finish_frac`; 1.0 = never).
+
+    `task` says which flights flew the SAME task, and its absence is the whole
+    reason the composer stalled: with one flight per task, ranking arrival
+    times ranks the TASKS, so "the fastest 30%" means "the 30% nearest goals"
+    and the update trains on the easy third of the distribution.  Centring
+    within a task removes the task's own difficulty and leaves what the
+    decisions changed -- the same argument as `center_by_task`, applied to the
+    imitation filter instead of the return.
+
+    `signed=False` is imitation: a flight that never arrived has no arrival
+    time and takes weight ZERO, because a positive weight on a failure makes
+    that failure more likely.  The consequence is that this can only move
+    probability around among successes -- it cannot lower the failure rate.
+
+    `signed=True` lets the weight go negative, which is what a failure needs:
+    the weight is the negated, centred arrival time, so slower-than-its-task
+    flights (a failure is the slowest possible) are pushed DOWN.  That is a
+    policy gradient with a per-task baseline, written as a weight -- the loss
+    is still the one cross-entropy term.  It is also unbounded below in
+    principle, so the magnitude is clipped at `w_max`.
+    """
+    t = t.to(torch.float64)
+    a = t.clone()
+    grouped = False
+    if task is not None and task.numel() == t.numel():
+        _, inv = torch.unique(task, return_inverse=True)
+        m = int(inv.max()) + 1
+        cnt = torch.zeros(m, dtype=a.dtype).index_add_(0, inv, torch.ones_like(a))
+        sm = torch.zeros(m, dtype=a.dtype).index_add_(0, inv, a)
+        # One sample per task is no baseline at all: subtracting a task's own
+        # mean from its single flight leaves exactly zero, every weight comes
+        # out 1, and the update degenerates to plain imitation of everything.
+        # That is the k=1 control, and it has to centre on the batch instead.
+        if float(cnt.max()) > 1.0:
+            a = a - (sm / cnt.clamp_min(1.0))[inv]
+            grouped = True
+    if not grouped:
+        a = a - a.mean()
+    a = a / a.std().clamp_min(1e-9)
+    if signed:
+        return (-a / max(tau, 1e-9)).clamp(-w_max, w_max)
+    arr = t < 1.0                                    # arrived at all
+    w = torch.zeros_like(a)
+    if int(arr.sum()) > 0:
+        e = torch.exp((-a[arr] / max(tau, 1e-9)).clamp(max=10.0))
+        w[arr] = e / e.mean().clamp_min(1e-12)       # mean 1 over the arrivals
+    return w
+
+
 def imitate_update(net: ContPolicyNet, records: List[Dict], reached: List[Tensor],
                    epochs: int = 2, batch: int = 1024, lr: float = 1e-4,
                    opt=None, max_samples: int = 0, keep_frac: float = 1.0,
-                   score: Optional[List[Tensor]] = None) -> Dict[str, float]:
+                   score: Optional[List[Tensor]] = None, weight_tau: float = 0.0,
+                   task: Optional[List[Tensor]] = None, signed: bool = False,
+                   w_max: float = 2.0) -> Dict[str, float]:
     """Cross-entropy on the composer's OWN successful flights.
 
     The token model is trained the way a language model is post-trained: sample,
@@ -395,54 +457,102 @@ def imitate_update(net: ContPolicyNet, records: List[Dict], reached: List[Tensor
     reinforces whatever the successful flights happened to do, including the
     parts that were irrelevant.
 
-    `keep_frac` < 1 keeps only the BEST fraction of the successful flights,
-    ranked by `score` (lower is better -- the fraction of the episode they
-    needed to finish).  This is not optional polish.  Imitation only improves a
-    policy when the kept set is better than the average, and with ~90% of
-    flights arriving the filter admitted almost everything: cross-entropy on
-    90% of your own behaviour is a fixed point, the loss settles at the policy's
-    own entropy and nothing moves.  Selecting the fastest arrivals gives the
-    update something to climb toward.
+    Selection is not optional polish.  Imitation only improves a policy when
+    the kept set is better than the average, and with ~90% of flights arriving
+    an arrival filter admits almost everything: cross-entropy on 90% of your
+    own behaviour is a fixed point, the loss settles at the policy's own
+    entropy and nothing moves.
 
-    Ranking by time-to-arrive adds no term to the objective -- it is a choice
-    of WHICH successes to copy, and arriving sooner is already implicit in the
-    goal.
+    TWO ways to make the kept set better than average, both ranked by `score`
+    (lower is better -- the fraction of the episode the flight needed to
+    finish, which is 1.0 exactly when it never arrived):
+
+    `keep_frac` < 1 is the HARD cut: keep the fastest fraction, discard the
+    rest.  `weight_tau` > 0 is the SOFT version and takes precedence -- every
+    arrival contributes, weighted by how quickly it arrived, and the weight
+    multiplies its tokens' cross-entropy.  The weight is
+
+        w_i = exp(-z_i / tau) / mean(exp(-z / tau)),   z = (t - mean t) / sd t
+
+    in units of the BATCH's own spread of arrival times, so it needs no
+    retuning as the policy gets faster.  At tau = 1 the effective sample size
+    is e^-1 = 37% of the arrivals, so it is about as selective as the 30% cut
+    it replaces, but continuous: a flight one standard deviation quicker counts
+    2.7x, instead of everything above the 70th percentile counting the same and
+    everything below counting zero.  The cliff was throwing away the gradient
+    from two thirds of the arrivals and quantizing the rest.
+
+    Either way this adds no TERM to the objective -- it is a choice of which
+    successes to copy and how much, and arriving sooner is already implicit in
+    the goal.
+
+    What neither can do: a cross-entropy weight is non-negative, so the update
+    can only move probability AROUND among flights that arrived.  A flight that
+    never arrived has no arrival time and gets weight zero.  Nothing here can
+    reduce the failure rate; it can only make the successes quicker.  Moving
+    the failures needs them to become successes in the data (fly each task
+    more than once and keep its best) or a loss that can push probability down.
     """
     groups = list(zip(records, reached)) if (records and isinstance(records[0], list)) else [(records, reached)]
-    samples, acts, us, nargs = [], [], [], []
+    samples, acts, us, nargs, wts = [], [], [], [], []
+    flight_w = []
     n_flights = n_kept = 0
     scores = score if score is not None else [None] * len(groups)
     if not isinstance(scores, (list, tuple)):
         scores = [scores]
+    tasks = task if task is not None else [None] * len(groups)
+    if not isinstance(tasks, (list, tuple)):
+        tasks = [tasks]
+    # The weights are computed over ALL groups at once, because a group is a
+    # rollout SHARD (or one of k repeats of the same task list) and a task's
+    # samples are scattered across them -- centring within a group would centre
+    # within a shard, which is not a task.
+    w_split = [None] * len(groups)
+    if score is not None and (weight_tau > 0.0 or signed):
+        lens = [int(scores[gi].numel()) for gi in range(len(groups))]
+        t_all = torch.cat([scores[gi].reshape(-1).to(torch.float64) for gi in range(len(groups))])
+        k_all = (torch.cat([tasks[gi].reshape(-1).to(torch.long) for gi in range(len(groups))])
+                 if all(tk is not None for tk in tasks[:len(groups)]) else None)
+        w_split = list(torch.split(arrival_weights(t_all, k_all, tau=max(weight_tau, 1e-9),
+                                                   signed=signed, w_max=w_max), lens))
     for gi, (recs, win) in enumerate(groups):
         w = win.to(torch.bool)
         sc = scores[gi] if gi < len(scores) else None
-        if sc is not None and keep_frac < 1.0 and int(w.sum()) > 1:
-            # among the flights that arrived, keep the fastest `keep_frac`
+        wt = w.to(torch.float64)
+        if w_split[gi] is not None:
+            wt = w_split[gi]
+            w = wt != 0
+        elif sc is not None and keep_frac < 1.0 and int(w.sum()) > 1:
+            # HARD: among the flights that arrived, keep the fastest `keep_frac`
             idx = w.nonzero().flatten()
             k = max(1, int(round(keep_frac * idx.numel())))
             best = idx[sc[idx].argsort()[:k]]
             w = torch.zeros_like(w); w[best] = True
+            wt = w.to(torch.float64)
         n_flights += int(win.numel()); n_kept += int(w.sum())
+        flight_w.append(wt[w])
         for rec in recs:
             al = rec["alive"]
             rows = rec.get("rows")
             for j in al.nonzero().flatten().tolist():
                 b = int(rows[j]) if rows is not None else j
                 if not bool(w[b]):
-                    continue                      # only flights that arrived
+                    continue                      # weight zero: nothing to learn from it
                 samples.append({kk: (v[j].float() if torch.is_tensor(v) and v.is_floating_point()
                                      else (v[j] if torch.is_tensor(v) else v))
                                 for kk, v in rec["tok"].items()})
                 acts.append(rec["act"][j]); us.append(rec["u"][j]); nargs.append(rec["n_args"][j])
+                wts.append(float(wt[b]))
     if not samples:
-        return {"n": 0, "kept_flights": 0, "flights": n_flights}
+        return {"n": 0, "kept_flights": 0, "flights": n_flights, "ess": 0.0}
     gen = torch.Generator().manual_seed(0)
     if max_samples and len(samples) > max_samples:
         pick = torch.randperm(len(samples), generator=gen)[:max_samples].sort().values.tolist()
         samples = [samples[i] for i in pick]
         acts = [acts[i] for i in pick]; us = [us[i] for i in pick]; nargs = [nargs[i] for i in pick]
+        wts = [wts[i] for i in pick]
     acts = torch.stack(acts).long(); us = torch.stack(us).float(); nargs = torch.stack(nargs).long()
+    wts = torch.tensor(wts, dtype=torch.float32)
     tok_all = collate_tok(samples)
     n = acts.shape[0]
     opt = opt or torch.optim.Adam(net.parameters(), lr=lr)
@@ -465,20 +575,33 @@ def imitate_update(net: ContPolicyNet, records: List[Dict], reached: List[Tensor
             # Everything the composer should care about -- not crashing, not
             # dawdling, not placing needless subgoals -- is IMPLICIT in which
             # flights got kept to imitate.
-            loss = -cont_log_prob(logits, mu, net.log_std, acts[idx], us[idx], nargs[idx]).mean()
+            # ONE term still: the same negative log-likelihood, each decision
+            # carrying its flight's arrival-time weight.  Normalised by the
+            # weights in the minibatch, so the loss and its gradient keep the
+            # scale an unweighted mean would have.
+            lw = wts[idx]
+            lp = cont_log_prob(logits, mu, net.log_std, acts[idx], us[idx], nargs[idx])
+            loss = -(lw * lp).sum() / lw.sum().clamp_min(1e-9)
             loss.backward()
             nn.utils.clip_grad_norm_(net.parameters(), 1.0)
             opt.step(); opt.zero_grad(set_to_none=True)
             with torch.no_grad():
                 acc["ce"] += float(loss)
                 acc["nll"] += float(nn.functional.cross_entropy(logits, acts[idx]))   # reported, not optimised
-                acc["acc"] += float((logits.argmax(-1) == acts[idx]).float().mean())
+                _m = (logits.argmax(-1) == acts[idx]).float()
+                acc["acc"] += float((lw * _m).sum() / lw.sum().clamp_min(1e-9))
                 acc["nb"] += 1
     nb = max(1, acc["nb"])
     with torch.no_grad():
         p = torch.softmax(net.pre({kk: (v[:512] if torch.is_tensor(v) else v)
                                    for kk, v in tok_all.items()})[0], -1).mean(0)
-    return {"n": n, "flights": n_flights, "kept_flights": n_kept,
+    fw = torch.cat(flight_w) if flight_w else torch.zeros(0)
+    # effective flights behind the update.  For a SIGNED weight the sum is ~0
+    # by construction, so that ratio says nothing; report the split instead.
+    ess = float(fw.sum() ** 2 / (fw * fw).sum().clamp_min(1e-12)) if (fw.numel() and not signed) else 0.0
+    return {"n": n, "flights": n_flights, "kept_flights": n_kept, "ess": ess,
+            "w_up": float((fw > 0).double().mean()) if fw.numel() else 0.0,
+            "w_abs": float(fw.abs().mean()) if fw.numel() else 0.0,
             "ce": acc["ce"] / nb, "nll": acc["nll"] / nb, "match": acc["acc"] / nb,
             "kl": 0.0, "clipfrac": 0.0, "entropy": float(cont_entropy(
                 torch.log(p.clamp_min(1e-9))[None], net.log_std.detach()).mean()),

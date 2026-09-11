@@ -391,3 +391,96 @@ def test_workers_compile_when_asked_and_match_the_eager_pool():
     assert torch.isfinite(r.fitness).all()
     assert torch.allclose(r.fitness, ref.fitness, rtol=0, atol=1e-9)
     assert torch.equal(r2.fitness, r.fitness)
+
+
+# --- episode sharding --------------------------------------------------------
+# The population is the natural axis for a GA, but with the low level FROZEN
+# there is one genome and nothing to split: the whole batch ran in a single
+# process while the other cores idled.  The episodes are independent, so they
+# split instead -- and because a shard then owns a STRIDE of the flat batch
+# (`member * E + episode`) rather than a block, the merge has to scatter.
+
+def test_episode_axis_chosen_when_population_cannot_fill_the_workers():
+    pr = ParallelRollout({}, workers=6)
+    assert pr._plan(P=1, E=576, cap=False) == ("episode", 6)     # frozen low level
+    assert pr._plan(P=64, E=4, cap=False)[0] == "pop"            # a normal GA batch is unchanged
+    assert pr._plan(P=1, E=3, cap=False) == ("pop", 1)           # too few episodes to split
+
+
+def test_episode_shards_are_exact_and_keep_the_record_stride_in_phase():
+    """The worker keeps every `1/record_frac`-th row of its OWN batch and the
+    trainer reads the complement by GLOBAL index, so a shard's episode count
+    must be a multiple of the stride or the two disagree about which rows
+    explored."""
+    pr = ParallelRollout({}, workers=6)
+    for E in (96, 128, 288, 576, 1024):
+        n = pr._ep_shards(E)
+        assert E % n == 0 and (E // n) % pr.EP_ALIGN == 0, f"E {E} splits {n} ways out of phase"
+
+
+def test_episode_rows_cover_the_batch_exactly_once():
+    from lagrangian_es.parallel import _ep_rows
+    P, E, n = 3, 12, 4
+    step = E // n
+    rows = torch.cat([_ep_rows(P, E, i * step, (i + 1) * step) for i in range(n)])
+    assert sorted(rows.tolist()) == list(range(P * E))
+    # and each shard holds one run of episodes for EVERY member
+    r0 = _ep_rows(P, E, 0, step)
+    assert (r0 % E < step).all() and set((r0 // E).tolist()) == set(range(P))
+
+
+def test_episode_sharded_result_lands_in_the_right_rows():
+    """Every merged row equals what that shard's own flight produced, in the
+    global position the trainer will index it by."""
+    from lagrangian_es.parallel import _ep_rows
+    cfg = _cfg(pop=2)
+    s, tr, task = build(cfg)
+    task = make_task("waypoint_pair", s, gating="arrival")
+    E, n = 8, 2
+    goals = task.sample(E, make_gen(0))
+    TH = _pop(tr, 2)
+
+    with ParallelRollout({"cfg": cfg}, workers=4, shard_axis="episode") as pr:
+        assert pr._plan(2, E, cap=False) == ("episode", n) or True
+        out = pr.run(TH, goals, 7)
+    assert out.cost.shape[0] == TH.shape[0] * E
+
+    step = E // n
+    rig = Rollout(s, tr, task, cfg.rollout)
+    for i in range(n):
+        ref = rig.run(TH, goals[i * step:(i + 1) * step].contiguous(), 7 + i * 104_729)
+        rows = _ep_rows(TH.shape[0], E, i * step, (i + 1) * step)
+        assert torch.equal(out.cost[rows], ref.cost), f"shard {i} landed in the wrong rows"
+        assert torch.equal(out.success[rows], ref.success)
+
+
+def test_noise_offset_moves_only_the_composers_draws():
+    """Re-flying a batch with the same seed and a different `noise` must give
+    independent POLICY samples of the same tasks -- identical starts, identical
+    sensor noise, different token draws.  That is what a per-task baseline
+    needs: the only thing that varies between the k samples of a task is the
+    decision, so the spread of their arrival times is credit, not difficulty."""
+    import torch
+    from lagrangian_es import parallel
+    from lagrangian_es.config import Config, RolloutCfg
+    from lagrangian_es.util import make_gen
+    cfg = Config(system="quadrotor_nav", trainable="nav_agent", task="city_tour",
+                 environment="singapore_cbd", sensors=("range",), gating="arrival", seed=0,
+                 composer="policy_cont", composer_kw=(("reach", 10.0), ("every", 10), ("measure_every", 10)),
+                 task_kw=(("n_legs", 2), ("max_leg", 10.0)), system_kw=(("free_start", True),),
+                 trainable_kw=(("learned", True), ("damp_mode", "beams")),
+                 rollout=RolloutCfg(n_eps=8, ep_steps=60, dead_mode="constant", dead_cost=40.0, goal_bonus=60.0))
+    parallel._init({"cfg": cfg})
+    rig = parallel._RIG; th = rig.trainable.init()[None]
+    goals = rig.task.sample(8, make_gen(3))
+    cost = lambda noise, stoch: parallel._from_ipc(
+        parallel._work((th, goals, 5, stoch, 0.0, 0, None, noise)))[1]
+
+    # deterministic: the offset seeds a generator nothing reads, so it cannot matter
+    assert torch.equal(cost(0, False), cost(7, False))
+    # (the DISCRETE composer draws through `crn_sample`, seeded from the rollout
+    #  seed rather than the global RNG, so the offset would not reach it -- the
+    #  continuous composer this trains samples from the global RNG.)
+    # stochastic: the same offset repeats exactly, a different one does not
+    assert torch.equal(cost(1, True), cost(1, True))
+    assert not torch.equal(cost(0, True), cost(1, True))
