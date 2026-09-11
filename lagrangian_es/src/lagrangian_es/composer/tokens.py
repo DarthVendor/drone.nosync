@@ -182,8 +182,18 @@ class Tokenizer:
         for t_e, kind, val in events[-self.kc:]:
             age = torch.full((B,), (now - t_e) / 200.0, dtype=dt, device=dev)   # 4 s = 1.0
             if kind == "i":
-                ids, valid = val
-                ch_rows.append(torch.stack([ids.to(dt) / ACT_SCALE, age] + [torch.zeros(B, dtype=dt, device=dev)] * (F - 2), -1))
+                ids, valid, args = (val + (None,))[:3] if isinstance(val, tuple) else (val, None, None)
+                # An instruction is what was SAID, and for a typed vocabulary
+                # that includes its arguments: "I placed a waypoint" and "I
+                # placed it 0.6 of the way at +30 degrees" are different
+                # memories, and only the second lets the composer notice it has
+                # already tried a direction.  Features 2.. carry them; a
+                # vocabulary without arguments leaves them zero, as before.
+                cols = [ids.to(dt) / ACT_SCALE, age]
+                if args is not None:
+                    cols += [args[:, j].to(dt) for j in range(min(args.shape[-1], F - 2))]
+                cols += [torch.zeros(B, dtype=dt, device=dev)] * (F - len(cols))
+                ch_rows.append(torch.stack(cols[:F], -1))
                 ch_types.append(INSTR)
                 ch_valid.append(torch.ones(B, dtype=torch.bool, device=dev) if valid is None else valid.to(torch.bool))
             else:

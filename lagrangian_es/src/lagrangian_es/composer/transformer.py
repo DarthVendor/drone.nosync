@@ -362,7 +362,11 @@ def load_composer_weights(net: nn.Module, path: str) -> None:
     vocabulary carries continuous heads this net no longer has; its body
     (embeddings, blocks) is taken and the action head keeps its prior."""
     sd = torch.load(path, map_location="cpu")
-    sd = {k: v for k, v in sd.items() if not k.startswith(("head_w", "head_sub", "head_yaw", "head_move", "log_std"))}
+    # `log_std` was on this list as a relic of the FIRST continuous composer,
+    # whose heads this net no longer has.  It is a real parameter again -- the
+    # spread of the typed vocabulary's arguments -- so it must load.  A net that
+    # does not have it filters it out on the shape check below anyway.
+    sd = {k: v for k, v in sd.items() if not k.startswith(("head_w", "head_sub", "head_yaw", "head_move"))}
     own = net.state_dict()
     # a checkpoint from a different term count or vocabulary: the parameters
     # whose shape changed (constraint queries, action head, action embedding)

@@ -153,10 +153,29 @@ def test_the_prior_aims_at_the_goal_so_silence_and_a_waypoint_agree():
     for deg in (0.0, 30.0, -120.0, 179.0):
         with torch.no_grad():
             _, mu, _ = net.pre(_fake_tok(3, deg, net.goal_gain))
-        a = V.squash(mu)
+        # the head emits a set of arguments PER TOKEN TYPE; the waypoint's are
+        # the ones that must aim at the goal, and a turn's must not inherit them
+        assert mu.shape[1:] == (V.V, V.n_args), mu.shape
+        a = V.squash(mu[:, V.WAYPOINT])
         got = math.degrees(math.pi * float(a[0, 1]))
         assert abs(((got - deg + 180) % 360) - 180) < 1.0, (deg, got)
-        assert float(a[0, 0]) > 0.9, "the prior should place at nearly the full radius"
+        # It must place MOST of the way -- close enough that silence and a
+        # waypoint roughly agree -- but NOT at the saturated end.  A prior of
+        # tanh(2.0) = 0.96 read as the perfect default and was unlearnable: the
+        # slope there is 0.07, the sampled range of r collapsed to 0.017, and
+        # the braking end was 17 standard deviations away and never sampled in
+        # 512 flights.  A prior that cannot be moved is worse than one slightly
+        # off, so this pins RESPONSIVENESS, not closeness to 1.
+        r0 = float(a[0, 0])
+        assert 0.4 < r0 < 0.9, f"the prior r should be well inside the range, got {r0:.3f}"
+        slope = 1.0 - float(mu[0, V.WAYPOINT, 0]) ** 2 / (1 + float(mu[0, V.WAYPOINT, 0]) ** 2) * 0 - r0 ** 2
+        assert slope > 0.3, f"the prior sits in the flat region of tanh (slope {slope:.3f})"
+    # a turn must not inherit the waypoint's prior: no default turn, no default
+    # priority move, no goal bearing leaking into either
+    with torch.no_grad():
+        _, mu, _ = net.pre(_fake_tok(3, 40.0, net.goal_gain))
+    for t in (V.EOS, V.TURN, V.PRIORITY, V.LOOK):
+        assert float(mu[0, t].abs().max()) == 0.0, f"{V.name(t)} inherited a prior"
     # and silence is still the overwhelming default
     with torch.no_grad():
         lg, _, _ = net.pre(_fake_tok(3, 0.0, net.goal_gain))
@@ -189,9 +208,11 @@ def test_the_update_runs_and_moves_both_heads_under_its_trust_region():
     st = ppo_update_cont(net, recs, R, 2, epochs=2, batch=16, lr=1e-3, target_kl=0.02)
     assert st["n"] == T * B
     moved = {k for k, v in net.state_dict().items() if not torch.equal(v, before[k])}
-    assert "head_act.weight" in moved, "the type head did not move"
-    assert "head_arg.weight" in moved, "the argument head did not move"
-    assert "log_std" in moved, "the argument spread did not move"
+    assert any(k.startswith("head_act") for k in moved), "the type head did not move"
+    assert any(k.startswith("arg_w") for k in moved), "the argument heads did not move"
+    # the spread is FROZEN on purpose: fitting it by maximum likelihood on the
+    # policy's own successes shrinks it every update until exploration dies
+    assert "log_std" not in moved, "the argument spread should be frozen"
     # a huge learning rate must trip the cap rather than run away
     net2 = _cont_net()
     st2 = ppo_update_cont(net2, recs, R, 2, epochs=8, batch=16, lr=5.0, target_kl=0.01)
@@ -215,7 +236,9 @@ def test_an_argument_a_token_does_not_use_gets_no_gradient():
            "mu": torch.zeros(B, V.n_args), "log_std": net.log_std.detach().clone(),
            "tok": _fake_tok(B, 0.0, net.goal_gain)}
     R = torch.randn(1, B, dtype=torch.float64)
-    before = net.head_arg.weight.detach().clone()
+    before = net.arg_w2.detach().clone()
     ppo_update_cont(net, [rec], R, 2, epochs=2, batch=8, lr=1e-2, target_kl=0.0, vcoef=0.0)
-    assert torch.equal(net.head_arg.weight.detach(), before), \
-        "silence moved the argument head, so unused slots are entering the likelihood"
+    # EOS carries no arguments, so its head must not move -- and no other
+    # token's either, since none of them were chosen
+    assert torch.equal(net.arg_w2.detach(), before), \
+        "silence moved an argument head, so unused slots are entering the likelihood"
