@@ -109,7 +109,38 @@ class ComposerNet(nn.Module):
         super().__init__()
         from .actions import Vocab
         self.vocab = Vocab(n_terms); V = self.vocab.V
+        # PER-TYPE input encoders, not one shared Linear.
+        #
+        # Every perception token used to enter through a single Linear(F, d) --
+        # 576 parameters, 0.1% of the net -- shared by beams, camera patches,
+        # map entries, the self token and the goal token alike.  Those F slots
+        # mean different things per type: slot 3 is a beam's normalised range
+        # and a map entry's footprint half-width, and the only thing telling
+        # them apart was an ADDITIVE type embedding, which cannot undo a shared
+        # projection.  It is the same conflation the argument heads had -- one
+        # slot meaning three things -- left in place at the input, and it sat
+        # under 133k parameters of scene blocks trying to read the result.
+        #
+        # Each type now gets its own two-layer encoder of ~20k parameters,
+        # stacked and indexed by type exactly as the per-token argument heads
+        # are.  `self.embed` is kept as the fallback for callers that have no
+        # type to hand.
         self.embed = nn.Linear(F, d); self.type_emb = nn.Embedding(n_types, d)
+        H_EMB = 664                                   # 75*664 + 64 = 49,864 parameters per type
+        self.emb_w1 = nn.Parameter(torch.randn(n_types, F, H_EMB) * (1.0 / math.sqrt(F)))
+        self.emb_b1 = nn.Parameter(torch.zeros(n_types, H_EMB))
+        self.emb_w2 = nn.Parameter(torch.randn(n_types, H_EMB, d) * (1.0 / math.sqrt(H_EMB)))
+        self.emb_b2 = nn.Parameter(torch.zeros(n_types, d))
+        # The type's own MODULATION, not just an added vector.  An additive
+        # embedding can only shift a token in the space; it cannot change how
+        # the features are weighed, which is what actually differs between a
+        # beam and a map footprint.  A per-type scale and shift (FiLM) on the
+        # encoder's hidden layer lets the type reweigh its own features, and
+        # costs 2 * n_types * H_EMB.  Note the bulk of type-specific capacity
+        # now lives in the encoders above (~20k each); this is the part the
+        # additive `type_emb` could never express.
+        self.emb_g1 = nn.Parameter(torch.ones(n_types, H_EMB))
+        self.emb_s1 = nn.Parameter(torch.zeros(n_types, H_EMB))
         self.act_emb = nn.Embedding(V, d)                            # an action token in the chain, by id
         self.scene = nn.ModuleList([Block(d, heads) for _ in range(n_scene)])
         self.chain = nn.ModuleList([Block(d, heads) for _ in range(n_chain)])
@@ -140,8 +171,34 @@ class ComposerNet(nn.Module):
         """The goal offset in the ego frame, in units of the reach."""
         return tok["goal"][:, :3] * self.goal_gain
 
+    def embed_typed(self, x: Tensor, ty: Tensor) -> Tensor:
+        """`x` [..., F] through the encoder belonging to each row's own type.
+
+        Looped over the handful of types present rather than gathered, because
+        gathering would materialise a [B, n, F, H] tensor per call.  The rows of
+        one type are contiguous in practice but the mask costs little and stays
+        correct when the layout changes mid-episode -- which it does, since the
+        built map contributes no tokens until the vehicle has seen something.
+        """
+        # One matmul per type present.  Measured against a contiguous-slice
+        # variant that avoids the gather and scatter: identical time (3.35s vs
+        # 3.53s per 1024-row batch), because each type's matmul is large enough
+        # that torch threads it internally and the copies are not the cost.
+        # The cost is FLOPs -- ~48k per token at H_EMB 664 -- so the knobs that
+        # matter are H_EMB and the token count, not how the loop is written.
+        out = x.new_zeros(x.shape[:-1] + (self.emb_b2.shape[-1],))
+        for t in torch.unique(ty).tolist():
+            m = ty == t
+            xi = x[m]
+            if xi.numel() == 0:
+                continue
+            h = torch.nn.functional.gelu(xi @ self.emb_w1[t] + self.emb_b1[t])
+            h = h * self.emb_g1[t] + self.emb_s1[t]            # the type reweighs its own features
+            out[m] = h @ self.emb_w2[t] + self.emb_b2[t]
+        return out
+
     def _chain_in(self, tok):
-        ch = self.embed(tok["chain"]) + self.type_emb(tok["chain_types"])
+        ch = self.embed_typed(tok["chain"], tok["chain_types"]) + self.type_emb(tok["chain_types"])
         ids = (tok["chain"][..., 0] * ACT_SCALE).round().long().clamp(0, self.vocab.V - 1)
         return ch + self.act_emb(ids) * (tok["chain_types"] == INSTR).to(ch.dtype)[..., None]
 
@@ -151,9 +208,10 @@ class ComposerNet(nn.Module):
         decision it is computed once and reused for every component step
         (measured: the chain loop ran the whole net five times per report)."""
         B = tok["self"].shape[0]; te = self.type_emb
-        scene = torch.cat([self.embed(tok["self"])[:, None] + te.weight[0],
-                           self.embed(tok["goal"])[:, None] + te.weight[1],
-                           self.embed(tok["entities"]) + te(tok["ent_types"])], 1)
+        zero = torch.zeros(B, dtype=torch.long, device=tok["self"].device)
+        scene = torch.cat([self.embed_typed(tok["self"], zero)[:, None] + te.weight[0],
+                           self.embed_typed(tok["goal"], zero + 1)[:, None] + te.weight[1],
+                           self.embed_typed(tok["entities"], tok["ent_types"]) + te(tok["ent_types"])], 1)
         smask = torch.cat([torch.zeros(B, 2, dtype=torch.bool, device=scene.device), ~tok["ent_mask"]], 1)
         for blk in self.scene:
             scene = blk(scene, mask=smask, store=None if store is None else store.setdefault("scene", {}))

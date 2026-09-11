@@ -64,8 +64,32 @@ class ContPolicyNet(PolicyNet):
         # Held as stacked weights rather than a ModuleList so every token's head
         # runs in one batched matmul instead of V small ones.
         self.arg_w1 = nn.Parameter(torch.empty(V, d, H)); self.arg_b1 = nn.Parameter(torch.zeros(V, H))
-        self.arg_w2 = nn.Parameter(torch.zeros(V, H, k)); self.arg_b2 = nn.Parameter(torch.zeros(V, k))
+        self.arg_w2 = nn.Parameter(torch.empty(V, H, k)); self.arg_b2 = nn.Parameter(torch.zeros(V, k))
         nn.init.normal_(self.arg_w1, std=(1.0 / d) ** 0.5)
+        # `arg_w2` SMALL, NOT ZERO.  It was zeros, so that the net would start
+        # exactly at the prior in `arg_b2` -- but mu = h @ arg_w2 + arg_b2, so
+        # d(mu)/d(arg_w1) is PROPORTIONAL TO arg_w2, and at exactly zero the
+        # gradient to arg_w1 -- and to the shared body and the scene encoder
+        # underneath it -- is exactly zero too.  The branch is switched off
+        # until arg_w2 lifts itself off zero, and measured over 578 iterations
+        # it did not: arg_w2 reached 0.00136 while arg_w1 moved 0.9% from its
+        # initial value (ratio 1.009 after ~11,000 optimizer steps).  So the
+        # argument head stayed a constant -- r had sd 0.0088 across 6,945
+        # decisions -- and the perception pathway received gradient ~500x
+        # smaller than the heads, which is why it never learned to use a beam.
+        #
+        # Sized by measuring both ends of the trade.  At this scale arg_w2
+        # starts at |w| 0.024 -- seventeen times the 0.00136 it reached after
+        # 578 iterations from zero -- and the gradient reaching arg_w1 is 25x
+        # what a timid 0.02 gives, while the prior moves by only 0.098 in u, so
+        # r still sits near 0.60 of the radius where arg_b2 put it.
+        # Sized on REALISTIC tokens, not synthetic ones -- the activations a
+        # real scene produces are ~10x larger and a scale picked on random
+        # inputs overshot badly (the bearing prior landed 88 degrees off).
+        # At this scale the initial bearing is ~8 degrees off the goal (about
+        # 1.1 m on an 8 m leg, re-decided every 0.4 s), r is unmoved at 0.608,
+        # and the gradient reaching arg_w1 is 60x what the live run had.
+        nn.init.normal_(self.arg_w2, std=0.05 * (1.0 / H) ** 0.5)
         # One std per argument slot, shared across states and learned.  A
         # state-dependent std is the usual next step and the usual way a
         # continuous policy collapses, so it is not the place to start.
@@ -419,10 +443,20 @@ def arrival_weights(t: Tensor, task: Optional[Tensor] = None, tau: float = 1.0,
             grouped = True
     if not grouped:
         a = a - a.mean()
-    a = a / a.std().clamp_min(1e-9)
+    arr = t < 1.0                                    # arrived at all
+    # SCALE ON THE ROWS THAT CARRY WEIGHT.  A flight that never arrived sits at
+    # finish_frac 1.0, far above any real arrival time, and unsigned weighting
+    # gives it zero weight -- but it was still inflating the spread everything
+    # else is divided by.  Measured: at a 20% failure rate the arrivals' z
+    # collapsed toward 0 and the effective sample size went to 0.93 of them
+    # (0.37 by design), i.e. the weights turned uniform and the update stopped
+    # selecting at all.  Exactly when obstacles appear and selection matters
+    # most.  The signed path keeps the full spread, because there every row
+    # carries weight and the failures are the point.
+    ref = a if (signed or int(arr.sum()) < 2) else a[arr]
+    a = a / ref.std().clamp_min(1e-9)
     if signed:
         return (-a / max(tau, 1e-9)).clamp(-w_max, w_max)
-    arr = t < 1.0                                    # arrived at all
     w = torch.zeros_like(a)
     if int(arr.sum()) > 0:
         e = torch.exp((-a[arr] / max(tau, 1e-9)).clamp(max=10.0))

@@ -160,7 +160,16 @@ def test_the_prior_aims_at_the_goal_so_silence_and_a_waypoint_agree():
         assert mu.shape[1:] == (V.V, V.n_args), mu.shape
         a = V.squash(mu[:, V.WAYPOINT])
         got = math.degrees(math.pi * float(a[0, 1]))
-        assert abs(((got - deg + 180) % 360) - 180) < 1.0, (deg, got)
+        # APPROXIMATE, not exact.  It used to be within 1 degree because
+        # `arg_w2` was initialised to exactly zero, which made the head a pure
+        # constant -- and that is precisely what switched off the gradient to
+        # `arg_w1`, the body and the scene encoder (see
+        # test_the_argument_head_conducts_gradient_to_the_body).  An exact
+        # prior cost the whole perception pathway its learning signal, so the
+        # prior is now approximate by design.  What must still hold is that it
+        # TRACKS the goal rather than firing off the nose: the failure this
+        # guards against is waypoints at uniformly random bearings.
+        assert abs(((got - deg + 180) % 360) - 180) < 15.0, (deg, got)
         # It must place MOST of the way -- close enough that silence and a
         # waypoint roughly agree -- but NOT at the saturated end.  A prior of
         # tanh(2.0) = 0.96 read as the perfect default and was unlearnable: the
@@ -177,7 +186,15 @@ def test_the_prior_aims_at_the_goal_so_silence_and_a_waypoint_agree():
     with torch.no_grad():
         _, mu, _ = net.pre(_fake_tok(3, 40.0, net.goal_gain))
     for t in (V.EOS, V.TURN, V.PRIORITY, V.LOOK):
-        assert float(mu[0, t].abs().max()) == 0.0, f"{V.name(t)} inherited a prior"
+        # Not exactly zero any more: `arg_w2` must be non-zero at init or the
+        # gradient to arg_w1, the body and the scene encoder is zero too (see
+        # test_the_argument_head_conducts_gradient_to_the_body).  What this
+        # assertion is really for is the old SHARED head, where the waypoint's
+        # r bias commanded a 54-degree default turn and the goal-bearing
+        # residual landed on a priority weight.  Per-token heads make that
+        # structurally impossible; the requirement now is only that no other
+        # token carries a MEANINGFUL default.
+        assert float(mu[0, t].abs().max()) < 0.1, f"{V.name(t)} inherited a prior"
     # and silence is still the overwhelming default
     with torch.no_grad():
         lg, _, _ = net.pre(_fake_tok(3, 0.0, net.goal_gain))
@@ -392,3 +409,77 @@ def test_the_elevation_residual_round_trips_to_the_goals_own_climb_angle():
     steep = math.atan2(50.0, 1.0)
     u = math.atanh(min(max(steep / PHI_MAX, -0.999), 0.999))
     assert 0 < PHI_MAX * math.tanh(u) <= PHI_MAX
+
+
+def test_selection_survives_a_high_failure_rate():
+    """The weight must keep selecting when flights start failing.
+
+    A non-arrival sits at `finish_frac` 1.0, far above any real arrival time,
+    and unsigned weighting gives it zero weight -- but it was still inflating
+    the spread every other flight is divided by.  Measured on the live run at
+    10% buildings: 211 effective flights out of 226, i.e. the weights had gone
+    uniform and the update had stopped preferring the quick flights at all.
+    Exactly when obstacles appear and selection matters most.
+    """
+    from lagrangian_es.composer.policy_cont import arrival_weights
+    g = torch.Generator().manual_seed(0)
+    for fail in (0.02, 0.2, 0.5):
+        n = 1000
+        t = (0.3 + 0.08 * torch.randn(n, generator=g, dtype=torch.float64)).clamp(0.05, 0.95)
+        t[: int(fail * n)] = 1.0
+        w = arrival_weights(t, tau=1.0)
+        fails = w[t >= 1.0]
+        assert fails.numel() == 0 or float(fails.abs().max()) == 0.0, "a failure must never be imitated"
+        nz = w[w > 0]
+        ess = float(nz.sum() ** 2 / (nz * nz).sum()) / nz.numel()
+        assert 0.25 < ess < 0.55, f"at {fail:.0%} failures the effective sample size was {ess:.2f}"
+
+
+def test_the_argument_head_conducts_gradient_to_the_body():
+    """A zero-initialised output layer switches off everything beneath it.
+
+    `mu = h @ arg_w2 + arg_b2`, so `d(mu)/d(arg_w1)` is PROPORTIONAL to
+    `arg_w2`.  It used to be initialised to exactly zero -- so the net would
+    start at the prior in `arg_b2` -- which made the gradient to `arg_w1`, to
+    the shared body and to the scene encoder underneath it exactly zero.  The
+    branch could only switch on once `arg_w2` lifted itself off zero, and over
+    578 live iterations it did not: `arg_w2` reached 0.00136 while `arg_w1`
+    moved 0.9% from its initial value.  The argument head stayed a constant
+    (`r` had sd 0.0088 across 6,945 decisions) and perception, which is only
+    useful through those arguments, was never trained.
+    """
+    from lagrangian_es.composer.policy_cont import ContPolicyNet
+    torch.manual_seed(0)
+    net = ContPolicyNet(n_terms=1)
+    assert float(net.arg_w2.abs().mean()) > 1e-3, "arg_w2 at zero blocks the whole branch"
+
+    tok = {"self": torch.randn(8, 8), "goal": torch.randn(8, 8),
+           "entities": torch.randn(8, 40, 8), "ent_types": torch.randint(2, 8, (8, 40)),
+           "ent_mask": torch.ones(8, 40, dtype=torch.bool),
+           "chain": torch.randn(8, 16, 8), "chain_types": torch.randint(4, 6, (8, 16)),
+           "chain_mask": torch.zeros(8, 16, dtype=torch.bool), "psi": torch.zeros(8)}
+    net.zero_grad(set_to_none=True)
+    net.pre(tok)[1][:, net.vocab.WAYPOINT].sum().backward()
+    # the gradient must reach BOTH the layer below the head and the encoder
+    # that reads the sensors -- perception is only useful through the arguments
+    for name in ("arg_w1", "emb_w1"):
+        g = dict(net.named_parameters())[name].grad
+        assert g is not None and float(g.abs().mean()) > 0, f"no gradient reaches {name}"
+
+
+def test_the_prior_survives_the_non_zero_init():
+    """The reason arg_w2 was zeroed was to start at the hand-built prior, and
+    that intent still has to hold: r near 0.60 of the radius, not scattered."""
+    from lagrangian_es.composer.policy_cont import ContPolicyNet
+    torch.manual_seed(0)
+    net = ContPolicyNet(n_terms=1)
+    W = net.vocab.WAYPOINT
+    assert abs(float(net.arg_b2[W, 0]) - 0.7) < 1e-6, "the r prior itself must be untouched"
+    tok = {"self": torch.randn(64, 8), "goal": torch.randn(64, 8),
+           "entities": torch.randn(64, 40, 8), "ent_types": torch.randint(2, 8, (64, 40)),
+           "ent_mask": torch.ones(64, 40, dtype=torch.bool),
+           "chain": torch.randn(64, 16, 8), "chain_types": torch.randint(4, 6, (64, 16)),
+           "chain_mask": torch.zeros(64, 16, dtype=torch.bool), "psi": torch.zeros(64)}
+    with torch.no_grad():
+        r_u = net.pre(tok)[1][:, W, 0]
+    assert abs(float(r_u.mean()) - 0.7) < 0.25, f"the r prior drifted to {float(r_u.mean()):.3f}"

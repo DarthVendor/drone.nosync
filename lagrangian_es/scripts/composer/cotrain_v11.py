@@ -454,7 +454,7 @@ GA_ADOPT_Z = 0.0          # the low level adopts ANY kid that beats the parent o
 # one: at zero bar, selection on a noisy ranking is a random walk of the genome.
 # The judge every 10 iterations is the check, and the best-judged pair is still
 # checkpointed, so nothing is lost if it wanders.
-GATE_N, GATE_Z, REVERT_Z = 96, 2.5, float("inf")         # adopt at 2.5 pooled sigma; NEVER revert (user's call: "just let it train")
+# (gate constants removed with the adopt/revert mechanic)
 # The revert was set at 1.0 pooled sigma after ten ungated updates drifted the
 # judge 408 -> 512.  Measured here, it costs more than it saves: three reverts
 # in fifteen iterations at z -1.1 and -1.3, which is noise, and each one rolls
@@ -463,34 +463,43 @@ GATE_N, GATE_Z, REVERT_Z = 96, 2.5, float("inf")         # adopt at 2.5 pooled s
 # the +2.5 it needs to be adopted.  Training now always moves forward; the
 # gate still MEASURES, so the log says whether it is actually improving, and
 # the best-judged pair is still checkpointed as the safety net.
-gate_cfg = cfg_for("singapore_cbd", LEG_MAX, 1800, GATE_N)
-gate_sys, gate_tr, gate_task = build(gate_cfg); gate_sens = build_sensors(gate_cfg, gate_sys)
-kept = {k: v.detach().clone() for k, v in comp.net.state_dict().items()}
-chal_ev = [0.0, 0.0, 0]                                  # sum of paired diffs (challenger - kept), sum of squares, n
-gate_note = ""
-def gate_costs(state, it_):
-    # on the worker pool: the workers reload W by mtime, so write the weights there first (a fresh mtime each time)
-    torch.save(state, W); time.sleep(1.05)
-    r, _ = par.run_with_records(th[None], gate_task.sample(GATE_N, make_gen(9_900_000 + it_)), 9_910_000 + it_, stochastic=True, record_frac=0.0, difficulty=DIFF)
-    return r.cost.clone()
+# The adopt/revert GATE is gone.  It trained a challenger, flew it and the kept
+# policy on GATE_N fresh tasks every iteration, pooled the paired difference and
+# adopted at z >= 2.5.  Removed because it cost two extra 96-episode rollouts an
+# iteration (~20s) to arbitrate a decision that is no longer in doubt: the run
+# trains continuously, REVERT_Z was already infinite so nothing was ever rolled
+# back, and its verdict was reported one iteration out of step with the batch
+# beside it.  The safety net that remains is the judge every JUDGE_EVERY
+# iterations on a held-out batch, which still checkpoints the best pair.
 def _join(it_=0):
-    global pending, st_prev, t_u_prev, kept, gate_note, chal_ev
-    if pending is not None:
-        _t0 = time.time(); pending[0].join(); st_prev = pending[1].get("st", st_prev); t_u_prev = pending[1].get("t", 0.0); pending = None
-        _t1 = time.time(); cand = {k: v.detach().clone() for k, v in comp.net.state_dict().items()}
-        _c1 = gate_costs(cand, it_); _t2 = time.time(); _c0 = gate_costs(kept, it_); _t3 = time.time()
-        d = _c1 - _c0
-        import os as _os; log(f"    [phase it {it_}: waited on update {_t1 - _t0:.0f}s (update itself {t_u_prev:.0f}s), gate cand {_t2 - _t1:.0f}s, gate kept {_t3 - _t2:.0f}s, load {_os.getloadavg()[0]:.0f}]")
-        chal_ev[0] += float(d.sum()); chal_ev[1] += float((d * d).sum()); chal_ev[2] += GATE_N
-        n_ = chal_ev[2]; m_ = chal_ev[0] / n_; se_ = max(chal_ev[1] / n_ - m_ * m_, 1e-12) ** 0.5 / n_ ** 0.5; z_ = -m_ / se_
-        if n_ >= 2 * GATE_N and z_ >= GATE_Z:
-            kept = cand; chal_ev = [0.0, 0.0, 0]; gate_note = f"composer ADOPTED (pooled {m_:+.1f} +- {se_:.1f}, z {z_:.1f})"
-        elif n_ >= 2 * GATE_N and z_ <= -REVERT_Z:
-            cand = kept; chal_ev = [0.0, 0.0, 0]; gate_note = f"composer REVERTED (pooled {m_:+.1f} +- {se_:.1f}, z {z_:.1f})"
-        else:
-            gate_note = f"composer challenger pooled {m_:+.1f} +- {se_:.1f} z {z_:+.1f} n {n_}"
-        comp.net.load_state_dict(cand)
-        torch.save(comp.net.state_dict(), W)             # published: the next batch flies these
+    """Finish the update that has been running beside this rollout, and publish
+    its weights so the next batch flies them."""
+    global pending, st_prev, t_u_prev
+    if pending is None:
+        st_prev = dict(st_prev, n=0); t_u_prev = 0.0
+        return
+    _t0 = time.time(); pending[0].join()
+    st_prev = pending[1].get("st", st_prev); t_u_prev = pending[1].get("t", 0.0); pending = None
+    # the workers reload W by mtime, so a fresh write is how a new policy ships
+    torch.save(comp.net.state_dict(), W)
+    import os as _os
+    log(f"    [phase it {it_}: waited on update {time.time() - _t0:.0f}s "
+        f"(update itself {t_u_prev:.0f}s), load {_os.getloadavg()[0]:.0f}]")
+
+
+row_prev = None
+def _emit(r, st, t_u):
+    """One iteration's batch, its own update, and the gate verdict on it."""
+    _sel = (f"ess {st.get('ess', 0.0):5.0f}" if not SIGNED
+            else f"up {st.get('w_up', float('nan')):.2f} |w| {st.get('w_abs', float('nan')):.2f}")
+    log(f"  [{ARM}] iter {r['it']:>4}  buildings {r['diff']:4.0%} legs {r['leg']:4.0f}m  arrive {r['arrive']:.3f}"
+        f" crash {r['crash']:.3f} t_arr {r['t_arr']:.3f} cost {r['cost']:7.2f} subgoals {r['subs']:4.1f}"
+        f"  | loss {st.get('ce', float('nan')):7.3f} match {st.get('match', float('nan')):.2f}"
+        f" on {st.get('n', 0)} tokens from {st.get('kept_flights', 0)}/{st.get('flights', 0)} weighted {_sel}"
+        f" | speak {st.get('speak', float('nan')):.3f} std {st.get('std', float('nan')):.3f}"
+        f"  [roll {r['t_r']:.0f}s update {t_u:.0f}s | {r['mins']:.1f}m]{r['note']}")
+
+
 for it in range(1, OUTER + 1):
     task_it = sampler(LEG)
     t_r = time.time()
@@ -625,17 +634,29 @@ for it in range(1, OUTER + 1):
             note = f"  -> buildings {DIFF:.0%}, legs back to {LEG:.0f} m"
         _recent.clear()
     save_state()
-    _sel = (f"ess {st.get('ess', 0.0):5.0f}" if not SIGNED
-            else f"up {st.get('w_up', float('nan')):.2f} |w| {st.get('w_abs', float('nan')):.2f}")
-    log(f"  [{ARM}] iter {it:>4}  buildings {flown_diff:4.0%} legs {flown_leg:4.0f}m  arrive {tr_r:.3f} crash {tr_c:.3f} t_arr {tr_t:.3f} cost {de_cost:7.2f} subgoals {subs:4.1f}"
-        f"  | loss {st.get('ce', float('nan')):7.3f} match {st.get('match', float('nan')):.2f} on {st.get('n', 0)} tokens"
-        f" from {st.get('kept_flights', 0)}/{st.get('flights', 0)} weighted {_sel}"
-        f" | speak {st.get('speak', float('nan')):.3f} std {st.get('std', float('nan')):.3f} | {gate_note}"
-        f"  [roll {t_r:.0f}s update {t_u:.0f}s | {(time.time()-t0)/60:.1f}m]{note}")
+    # ONE LINE, ONE ITERATION.  The update runs concurrently with the next
+    # rollout, so when iteration k prints, the freshest update results belong
+    # to batch k-1 -- the line used to mix batch k's arrival rate with update
+    # k-1's loss and gate verdict, and an ADOPTED read as though it belonged to
+    # the batch beside it.  Rather than give up the concurrency (which would
+    # cost roll + update instead of max(roll, update)), the batch stats are
+    # HELD and printed one iteration later, next to their own update.  The log
+    # trails real time by an iteration; nothing on a line is from a different
+    # one.
+    row = {"it": it, "diff": flown_diff, "leg": flown_leg, "arrive": tr_r, "crash": tr_c,
+           "t_arr": tr_t, "cost": de_cost, "subs": subs, "note": note, "t_r": t_r,
+           "mins": (time.time() - t0) / 60}
+    if row_prev is not None:
+        _emit(row_prev, st, t_u)
+    row_prev = row
+
     if it % JUDGE_EVERY == 0:
         _join(it)                                         # the judge flies the finished weights
         c = judge_all(f"judge {it}")
         if c[2] < best_cost:
             best_cost = c[2]; save_state(); save_best()
-_join(); par.close()
+_join()
+if row_prev is not None:
+    _emit(row_prev, st_prev, t_u_prev)      # the final batch's own update
+par.close()
 log(f"COTRAIN V11 {ARM} DONE")

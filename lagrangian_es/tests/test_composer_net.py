@@ -58,8 +58,21 @@ def test_outputs_are_bounded_by_construction():
 
 
 def test_parameter_budget():
-    n = sum(p.numel() for p in ComposerNet(1).parameters())
-    assert 8e4 <= n <= 2.5e5, n
+    """The budget moved deliberately, and where it went matters.
+
+    Perception used to enter through ONE Linear(F, d) -- 576 parameters, 0.1%
+    of the net -- shared by beams, camera patches, map entries, the self token
+    and the goal token, whose F slots mean entirely different things (slot 3 is
+    a beam's normalised range and a map entry's footprint half-width).  Each
+    type now has its own ~50k encoder, so perception carries ~400k against the
+    576 it had.  If this assertion fails, check WHICH bucket grew before
+    relaxing it.
+    """
+    net = ComposerNet(1)
+    n = sum(p.numel() for p in net.parameters())
+    assert 5e5 <= n <= 1.2e6, n
+    per_type = sum(p.numel() for k, p in net.named_parameters() if k.startswith("emb_"))
+    assert per_type > 0.3 * n, "perception must not be a rounding error in the budget again"
 
 
 def test_the_composer_never_reads_the_map():
