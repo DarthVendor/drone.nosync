@@ -729,8 +729,13 @@ for it in range(1, OUTER + 1):
     # sensor noise, flown with the composer MUTED.  What the frozen low level
     # does unaided is then present in both flights and cancels, so the
     # difference is what the composer's tokens were worth and nothing else.
-    _ctl, _ = par.run_with_records(TH, goals_it, 5_100_000 + it, stochastic=True,
-                                   record_frac=0.0, difficulty=DIFF, noise=0, mute=True)
+    # Only the paired losses need a control.  LOSS="time" regresses the time a
+    # decision actually needed and never looks at a twin, so flying one would
+    # double the rollout for nothing.
+    _ctl = None
+    if LOSS != "time":
+        _ctl, _ = par.run_with_records(TH, goals_it, 5_100_000 + it, stochastic=True,
+                                       record_frac=0.0, difficulty=DIFF, noise=0, mute=True)
     # FINISH_FRAC, not soft_time.  soft_time accumulates only while a row is
     # alive, so a flight that crashes at step 100 scores LOWER -- looks faster --
     # than one that flies 500 steps and arrives; as a paired advantage that
@@ -739,10 +744,14 @@ for it in range(1, OUTER + 1):
     # preferred (failures all tie at 1.0 and cannot be ranked) does not apply
     # here: the pairing ranks them -- a failure the control also failed scores
     # 0, one the control won scores -1.
-    _ctl_ff = projected_time(_ctl.finish_frac, _ctl.final_err,
-                             _ctl.success, SPAN).reshape(-1)[:E_T].clone()
-    for _s in shards:
-        _s["adv"] = paired_advantage(_s["ff"], _ctl_ff[_s["task"]])
+    if _ctl is not None:
+        _ctl_ff = projected_time(_ctl.finish_frac, _ctl.final_err,
+                                 _ctl.success, SPAN).reshape(-1)[:E_T].clone()
+        for _s in shards:
+            _s["adv"] = paired_advantage(_s["ff"], _ctl_ff[_s["task"]])
+    else:
+        for _s in shards:
+            _s["adv"] = torch.zeros_like(_s["ff"], dtype=torch.float64)
     t_r = time.time() - t_r
     _cat = lambda f: torch.cat([getattr(_x, f) for _x in res_list])
     res = res_list[0]

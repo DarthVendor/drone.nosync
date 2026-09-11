@@ -129,9 +129,14 @@ def test_speak_floor_forces_a_waypoint_not_merely_speech():
     V = ContVocab(1)
     net = ContPolicyNet(n_terms=1)
     B = 512
-    # a policy that has collapsed onto TURN: EOS is not even in contention
+    # a policy that has collapsed onto SILENCE.  This fixture used to collapse
+    # it onto TURN, which is no longer in the vocabulary -- TURN, PRIORITY and
+    # LOOK are all exact no-ops at a zero argument, and the policy found each
+    # of them in turn because a no-op earns advantage zero and is dropped from
+    # the batch rather than penalised.  EOS is the only no-op left, and it is
+    # the control, so zero is the right score for it.
     logits = torch.full((B, V.V), -20.0)
-    logits[:, V.TURN] = 20.0
+    logits[:, V.EOS] = 20.0
     dev = logits.device
 
     torch.manual_seed(0)
@@ -143,4 +148,4 @@ def test_speak_floor_forces_a_waypoint_not_merely_speech():
     assert int((act == V.WAYPOINT).sum()) == B, "a forced decision must place"
     # and with the floor off the collapsed policy is untouched
     none = torch.where(torch.zeros(B, dtype=torch.bool)[:, None], row[None].expand_as(logits), logits)
-    assert int((torch.distributions.Categorical(logits=none).sample() == V.TURN).sum()) == B
+    assert int((torch.distributions.Categorical(logits=none).sample() == V.EOS).sum()) == B

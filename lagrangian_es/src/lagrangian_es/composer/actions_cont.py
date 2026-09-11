@@ -64,7 +64,30 @@ EOS, WAYPOINT, TURN, PRIORITY, LOOK = 0, 1, 2, 3, 4
 #: quiet, and a no-op in the vocabulary is a free place for the update's noise
 #: to accumulate.  An earlier run collapsed onto TURN 100% the same way, so the
 #: pattern is "find the cheapest token", not anything specific to LOOK.
-N_TOKENS = 4
+N_TOKENS = 2
+#: TURN AND PRIORITY ARE OUT TOO, for the same reason LOOK was: at an argument
+#: near zero each is an EXACT no-op, and a no-op is an absorbing state under
+#: paired credit.
+#:
+#:   TURN commands `psi_at_decision + TURN_MAX * tanh(u)`.  With the argument
+#:   head untrained tanh(u) ~ 0, so it commands the heading the vehicle already
+#:   had: `dcmd ~ 0`, `des ~ cur`, nothing moves, and the Lagrangian's own yaw
+#:   torque carries on underneath regardless.
+#:   PRIORITY scales alpha by `1.5 ** arg`, which at arg 0 is exactly 1.0.
+#:
+#: A token that changes nothing produces a flight byte-identical to its muted
+#: control, so its advantage is EXACTLY zero -- and zero-advantage samples are
+#: dropped from the batch rather than penalised, which makes the no-op
+#: invisible to the update and impossible to push back down.  MEASURED: the run
+#: went subgoals 0.1 -> 0.0 by iteration 5, `heading 100%` at the judge, then
+#: `signal 0 / 0 tokens / nan` from iteration 13 with the weights frozen --
+#: judges 10 and 20 identical to the decimal.  An earlier run collapsed to
+#: `heading 100%` the same way.
+#:
+#: What is left is the honest choice: say nothing, or place a waypoint.  EOS is
+#: a no-op too, but it is the CONTROL -- it scores zero because it is the thing
+#: everything else is measured against, which is the one case where zero is the
+#: right answer rather than an escape hatch.
 
 #: how many continuous arguments each type carries (PRIORITY is n_terms, set per instance)
 BASE_ARGS = {EOS: 0, WAYPOINT: 3, TURN: 1, LOOK: 0}      # WAYPOINT is (r, theta, phi)

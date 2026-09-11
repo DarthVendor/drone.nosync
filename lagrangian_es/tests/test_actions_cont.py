@@ -128,12 +128,15 @@ def test_the_likelihood_covers_only_the_arguments_a_token_uses():
     unused argument slots must not enter its log-probability or the update
     would fit noise.  (LOOK used to be the other argument-free token; it is out
     of the vocabulary now -- see N_TOKENS in actions_cont.py.)"""
-    V = ContVocab(2); B = 4
+    V = ContVocab(2); B = 2
     torch.manual_seed(0)
     lg = torch.randn(B, V.V, dtype=DT)
     mu = torch.randn(B, 2, dtype=DT); ls = torch.full((2,), -0.5, dtype=DT)
     u = torch.randn(B, 2, dtype=DT)
-    toks = torch.tensor([V.EOS, V.WAYPOINT, V.TURN, V.PRIORITY])
+    # only EOS and WAYPOINT are in the vocabulary now; TURN and PRIORITY went
+    # the way of LOOK because each is an exact no-op at a zero argument, and a
+    # no-op is invisible to paired credit (see N_TOKENS in actions_cont.py)
+    toks = torch.tensor([V.EOS, V.WAYPOINT])
     na = torch.tensor([V.n_arg_of(int(t)) for t in toks])
     lp = log_prob(lg, mu, ls, toks, u, na)
     cat = torch.log_softmax(lg, -1)

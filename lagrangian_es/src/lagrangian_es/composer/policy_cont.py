@@ -381,6 +381,15 @@ class ContComposer(PolicyComposer):
                 # loss: the composer's output is a claim about where the vehicle
                 # can get, and the error needs the position it claimed FROM.
                 ctx_s = {"alive": alive0[idx], "t": t_now, "x": x[idx], "goal": goal[idx]}
+                # THE BEAM RANGES TRAVEL WITH IT TOO.  `ctx_s` is built fresh
+                # per component step, so anything not put here is invisible to
+                # `choose` -- the variational sampler read `ctx_s["obs"]`, found
+                # nothing, and silently never fired: measured, var_temp 0 and
+                # var_temp 2 gave byte-identical arrival (0.469 both).  Only the
+                # forward ring is needed, so only that is carried.
+                _rng0 = (ctx.get("obs") or {}).get("range")
+                if torch.is_tensor(_rng0) and _rng0.ndim == 2:
+                    ctx_s["range"] = _rng0[idx]
                 act, u = choose(logits, mu, tok, ctx_s, ids_full[idx], step, has[idx])
                 arg = V.squash(u)
                 V.step(act, arg, out, pend, has, psi, rows=idx)
@@ -507,7 +516,7 @@ class ContComposer(PolicyComposer):
                     wp = (act == self.net.vocab.WAYPOINT)
                     if bool(wp.any()):
                         dirs, rmax = self._beam_geom(dev, mu.dtype)
-                        rng_all = (ctx_s.get("obs", {}) or {}).get("range")
+                        rng_all = ctx_s.get("range")
                         if dirs is not None and torch.is_tensor(rng_all):
                             gk = self.net.goal_ego(tok).to(mu.dtype)[wp]
                             u = u.clone()
