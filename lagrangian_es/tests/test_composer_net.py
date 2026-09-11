@@ -648,3 +648,241 @@ def test_scene_tokens_are_kept_for_a_fraction_of_the_recorded_rows_and_the_updat
     Rg = [torch.zeros(len(x["records"]), 16, dtype=torch.float64) for x in sh]
     st = ppo_update(comp.net, [x["records"] for x in sh], Rg, comp.n_terms, epochs=1, batch=64, lr=1e-5, target_kl=0.0)
     assert st["n"] == sum(int((r["alive"] & r["tok_keep"]).sum()) for x in sh for r in x["records"]) > 0
+
+
+# --- the two maps ---------------------------------------------------------
+#
+# A composer flies from what it perceives (test_the_composer_never_reads_the_map,
+# above, still holds).  These add two OPTIONAL sources, each switched on only by
+# a config that asks for it, so an experiment can run the four combinations:
+# `map_prior`, the survey a real vehicle carries, and `map_built`, what this one
+# has actually seen.  Both present as aged measurement tokens.
+
+def _map_cfg(sensors=("range", "depth_camera"), built=False):
+    from dataclasses import replace
+    from lagrangian_es.config import RolloutCfg
+    return replace(_cfg(), composer="policy", environment="corridors", sensors=sensors,
+                   composer_kw=(("reach", 10.0), ("every", 10), ("measure_every", 10)),
+                   rollout=RolloutCfg(n_eps=4, ep_steps=60, dead_mode="constant", dead_cost=6.0,
+                                      goal_bonus=15.0, built_map=built))
+
+
+def test_the_prior_map_reports_the_real_buildings_nearest_first():
+    """The carried survey is ground truth, ranked by distance to the footprint's
+    SURFACE, and clipped to its viewport."""
+    from lagrangian_es.sensors.map_view import FEATS, MapPrior
+    cfg = _map_cfg(); sysm, tr, task = build(cfg)
+    s = sysm.reset(3, make_gen(2))
+    mp = MapPrior(sysm, k=6, max_range=30.0)
+    o = mp.observe(s, None).reshape(3, 6, FEATS)
+    d = mp._surface_distance(sysm.task_position(s), s["boxes/c"], s["boxes/h"], s["boxes/a"])
+    near = torch.topk(d, 6, dim=1, largest=False).values
+    assert torch.all(near[:, 1:] >= near[:, :-1] - 1e-9), "not nearest-first"
+    # every reported centre is a real building's centre
+    for b in range(3):
+        for i in range(6):
+            if float(o[b, i, 6]) > 0:
+                hit = (s["boxes/c"][b] - o[b, i, :2]).norm(dim=-1).min()
+                assert float(hit) < 1e-9, "reported a building that is not on the map"
+    assert float(o[..., 7].abs().max()) == 0.0, "a carried survey is never stale"
+    tight = MapPrior(sysm, k=6, max_range=0.5).observe(s, None).reshape(3, 6, FEATS)
+    assert float(tight[..., 6].max()) == 0.0, "viewport ignored: reported a building outside it"
+
+
+def test_the_built_map_remembers_only_what_the_beams_returned():
+    """Empty before flying, filled from returned ranges only, and every cell
+    carries how long ago it was seen."""
+    from lagrangian_es.es import build_sensors
+    from lagrangian_es.mapping import FEATS, BuiltMap
+    cfg = _map_cfg(sensors=("range",)); sysm, tr, task = build(cfg)
+    s = sysm.reset(3, make_gen(2)); p = sysm.task_position(s)
+    sen = build_sensors(cfg, sysm)[0]
+    bm = BuiltMap(k=6, cell=2.0); bm.reset(3, p.device, p.dtype)
+    assert float(bm.read(p).abs().max()) == 0.0, "a fresh map already remembers something"
+    rng = sen.observe(s, make_gen(4))
+    bm.update(p, sen._dirs(s), rng, sen.max_range, t=10.0)
+    r = bm.read(p, now=10.0).reshape(3, 6, FEATS)
+    n_seen = int((r[..., 6] > 0).sum())
+    assert n_seen > 0, "beams returned hits but nothing was remembered"
+    # a beam that ran to its limit hit nothing: a scan of pure misses adds nothing
+    bm2 = BuiltMap(k=6, cell=2.0); bm2.reset(3, p.device, p.dtype)
+    bm2.update(p, sen._dirs(s), torch.full_like(rng, sen.max_range), sen.max_range, t=0.0)
+    assert float(bm2.read(p).abs().max()) == 0.0, "remembered a wall from a beam that hit nothing"
+    # age is time since the cell was last seen, and a fresh sighting refreshes it
+    later = bm.read(p, now=210.0).reshape(3, 6, FEATS)
+    seen = r[..., 6] > 0
+    assert float(later[..., 7][seen].min()) == 200.0, "age did not advance with the clock"
+    bm.update(p, sen._dirs(s), rng, sen.max_range, t=210.0)
+    assert float(bm.read(p, now=210.0).reshape(3, 6, FEATS)[..., 7][seen].max()) == 0.0, "a new sighting did not refresh the cell"
+
+
+def test_map_tokens_are_yaw_and_translation_equivariant():
+    """Rotate and shift the world about the vehicle and the ego map tokens are
+    unchanged -- the same rule the rest of the scene obeys."""
+    from lagrangian_es.composer.tokens import MAP_PRIOR
+    from lagrangian_es.es import build_sensors
+    from dataclasses import replace
+    # Every building, no viewport: equivariance is a property of the ENCODING,
+    # and a nearest-k with a viewport has two boundaries where it cannot hold --
+    # a building sitting exactly on the clip radius, and the k-th and (k+1)-th
+    # tied for the last slot. A rotation moves tied distances in the last bit
+    # and flips which one is kept. Widen both boundaries away and what is left
+    # is the frame arithmetic, which must be exact.
+    cfg = replace(_map_cfg(sensors=("range", "depth_camera", "map_prior")),
+                  sensor_kw=(("map_prior", (("max_range", 500.0), ("k", 29))),))
+    sysm, tr, task = build(cfg); comp = build_composer(cfg, sysm, tr)
+    sens = build_sensors(cfg, sysm); comp.attach(sens)
+    ctx, s = _ctx(sysm, task)
+    ctx["obs"] = {sen.name: sen.observe(s, make_gen(3)) for sen in sens}
+    a = comp.tokens(ctx)
+    assert int((a["ent_types"] == MAP_PRIOR).sum(1)[0]) == 29, "no prior-map tokens emitted"
+    phi = 0.7
+    c, sn = math.cos(phi), math.sin(phi)
+    Rz = torch.tensor([[c, -sn, 0.0], [sn, c, 0.0], [0.0, 0.0, 1.0]], dtype=torch.float64)
+    T = torch.tensor([3.0, -2.0, 0.0], dtype=torch.float64)
+    x = ctx["x"]
+    s2 = dict(s)
+    s2["R"] = Rz @ s["R"]
+    rot = lambda q: (q - x[:, None, :]) @ Rz.T + x[:, None, :] + T
+    c3 = torch.cat([s["boxes/c"], torch.zeros_like(s["boxes/c"][..., :1])], -1)
+    s2["boxes/c"] = rot(c3)[..., :2]; s2["boxes/a"] = s["boxes/a"] + phi
+    s2["p"] = s["p"] + T
+    ctx2 = dict(ctx); ctx2["state"] = s2; ctx2["x"] = x + T
+    ctx2["goal"] = ctx["goal"] + T
+    ctx2["obs"] = dict(ctx["obs"]); ctx2["obs"]["map_prior"] = sens[-1].observe(s2, make_gen(3))
+    b = comp.tokens(ctx2)
+    m = (a["ent_types"] == MAP_PRIOR)[0]
+    # Compared as a SET, per row.  A regular grid ties constantly -- from a
+    # corridor the blocks either side are the same distance away -- and a
+    # rotation moves those equal distances in the last bit, so which of two
+    # tied buildings is listed first is not canonical.  The order also carries
+    # no information: entity tokens get a type embedding and no positional one,
+    # so scene attention is permutation invariant and the model cannot see it.
+    #
+    # The sort key is ROUNDED POSITION, not distance: distance is exactly what
+    # ties, so sorting on it just reproduces the ambiguity.
+    def canon(e):
+        out = []
+        for r in e:
+            key = (r[:, :2] * 1e6).round()
+            for col in (1, 0):                      # primary x, secondary y
+                r = r[key[:, col].argsort(stable=True)]
+                key = key[key[:, col].argsort(stable=True)]
+            out.append(r)
+        return torch.stack(out)
+    assert torch.allclose(canon(a["entities"][:, m]), canon(b["entities"][:, m]), atol=1e-8), \
+        "map tokens are not equivariant"
+
+
+def test_the_four_map_combinations_are_independently_switchable():
+    """Neither / prior / built / both -- the arms of the experiment, each
+    differing only by its map tokens."""
+    from lagrangian_es.composer.tokens import MAP_BUILT, MAP_PRIOR
+    from lagrangian_es.es import build_sensors
+    from lagrangian_es.rollout import Rollout
+    base = ("range", "depth_camera")
+    arms = {"neither": (base, False), "prior": (base + ("map_prior",), False),
+            "built": (base, True), "both": (base + ("map_prior",), True)}
+    counts = {}
+    for name, (sensors, built) in arms.items():
+        cfg = _map_cfg(sensors, built); sysm, tr, task = build(cfg)
+        comp = build_composer(cfg, sysm, tr)
+        r = Rollout(sysm, tr, task, cfg.rollout, build_sensors(cfg, sysm), composer=comp)
+        res = r.run(tr.init()[None], task.sample(4, make_gen(1)), 2)
+        assert torch.isfinite(res.cost).all()
+        kinds = [l[1] for l in comp.tok.layout]
+        counts[name] = kinds.count("map")
+    assert counts == {"neither": 0, "prior": 1, "built": 1, "both": 2}, counts
+
+
+def test_the_speed_credit_is_small_shaped_and_unearnable_by_the_dead():
+    """The one shaped term in the composer's objective: airspeed, credited per
+    interval, pro rata to `speed_ref`.  It must scale with speed, pay nothing
+    for standing still, pay nothing to a row that has crashed, and leave the
+    plant cost -- what the low level is evolved on -- untouched."""
+    from lagrangian_es.composer.policy import returns_from_stream
+    B = 4
+    speeds = torch.tensor([5.0, 2.5, 0.0, 5.0], dtype=torch.float64)   # full, half, stopped, full-but-dead
+    alive = torch.tensor([1, 1, 1, 0], dtype=torch.bool)
+    chain = [{"t": float(t), "cost": torch.full((B,), 10.0 * t, dtype=torch.float64),
+              "speed": speeds, "alive": alive} for t in (0, 20, 40)]
+    recs = [{"t": float(t), "alive": torch.ones(B, dtype=torch.bool),
+             "act": torch.zeros(B, dtype=torch.long)} for t in (0, 20)]
+    plain = returns_from_stream(recs, chain, 0.99, unit=20)
+    withb = returns_from_stream(recs, chain, 0.99, unit=20, speed_bonus=1.0, speed_ref=5.0)
+    credit = (withb - plain)[0]
+    assert float(credit[0]) > 0, "full speed earned nothing"
+    assert abs(float(credit[1]) - float(credit[0]) / 2) < 1e-9, "credit is not pro rata to speed"
+    assert float(credit[2]) == 0.0, "standing still was paid"
+    assert float(credit[3]) == 0.0, "a crashed row was paid"
+    # off by default, and it never touches the cost stream itself
+    assert torch.equal(returns_from_stream(recs, chain, 0.99, unit=20), plain)
+    assert torch.equal(chain[1]["cost"], torch.full((B,), 200.0, dtype=torch.float64))
+    # and it is bounded: at most speed_bonus per interval, whatever the speed
+    fast = [dict(m, speed=torch.full((B,), 50.0, dtype=torch.float64)) for m in chain]
+    over = (returns_from_stream(recs, fast, 0.99, unit=20, speed_bonus=1.0, speed_ref=5.0) - plain)[0]
+    assert float(over.max()) <= float(credit[0]) + 1e-9, "credit is not clamped at speed_ref"
+
+
+def test_the_task_baseline_removes_task_difficulty_not_the_signal():
+    """Most of a return's spread is which task was drawn, not what the composer
+    did.  Centring per task removes that and leaves the decision's effect."""
+    from lagrangian_es.composer.policy import center_by_task
+    torch.manual_seed(0)
+    E, P, K = 8, 4, 3                                   # tasks, genomes, decisions
+    difficulty = torch.tensor([0., 100., 200., 300., 400., 500., 600., 700.], dtype=torch.float64)
+    effect = 7.0                                        # what the decisions actually changed
+    Rs, rows = [], []
+    for g in range(P):                                  # one shard per genome, as the pool splits them
+        r = torch.arange(E, dtype=torch.long) + g * E
+        R = difficulty[None, :].repeat(K, 1) + effect * (g - 1.5)
+        Rs.append(R.clone()); rows.append(r)
+    before = torch.cat([R.reshape(-1) for R in Rs]).std()
+    center_by_task(Rs, rows, n_eps=E)
+    after = torch.cat([R.reshape(-1) for R in Rs]).std()
+    assert float(before) > 200 and float(after) < 10, (float(before), float(after))
+    # the between-genome signal survives exactly: genome g keeps effect*(g-1.5)
+    for g, R in enumerate(Rs):
+        assert torch.allclose(R, torch.full_like(R, effect * (g - 1.5)), atol=1e-9)
+    # a task seen only once is left alone rather than zeroed
+    Rs2 = [torch.full((1, 1), 5.0, dtype=torch.float64)]
+    center_by_task(Rs2, [torch.tensor([3])], n_eps=E)
+    assert float(Rs2[0]) == 5.0, "a single sample was centred against itself"
+
+
+def test_exploration_mass_goes_where_the_policy_is_not_looking():
+    """Uniform exploration is not fair when use is lopsided: the composer emits
+    PLACE ~92% and the turn/priority tokens ~1%, so a uniform mixture leaves
+    the rare ones with too little evidence to ever stop being rare."""
+    from lagrangian_es.composer.policy import explore_weights
+    V = 25
+    assert explore_weights(None, V) is None, "no history should mean uniform"
+    assert explore_weights(torch.zeros(V, dtype=torch.float64), V) is None
+    # a policy that emits token 0 almost always
+    c = torch.full((V,), 1.0, dtype=torch.float64); c[0] = 1000.0
+    w = explore_weights(c, V)
+    assert abs(float(w.sum()) - 1.0) < 1e-12
+    assert float(w[0]) < 1.0 / V, "the over-used token still got a uniform share"
+    assert float(w[1]) > 1.0 / V, "the starved token got no extra mass"
+    assert float(w[1]) / float(w[0]) > 10, "the reweighting is too weak to matter"
+    # bounded: a never-emitted token gets at most V times uniform, not everything
+    c2 = torch.zeros(V, dtype=torch.float64); c2[0] = 100.0
+    w2 = explore_weights(c2, V)
+    assert float(w2.max()) <= 1.0, float(w2.max())
+    assert float(w2[1]) < 0.5, "one starved token swallowed the whole mixture"
+    # a policy already spreading evenly is left alone
+    w3 = explore_weights(torch.full((V,), 7.0, dtype=torch.float64), V)
+    assert torch.allclose(w3, torch.full((V,), 1.0 / V, dtype=torch.float64), atol=1e-12)
+    # A protected token keeps a plain uniform share however common it is.  EOS
+    # is 52% of emitted components because every chain ends with one and a bare
+    # EOS is silence -- structure, not over-use.  Reweighting against it stopped
+    # exploring chains from terminating and drove subgoals per flight upward.
+    c4 = torch.full((V,), 1.0, dtype=torch.float64)
+    c4[0] = 5000.0        # EOS: structurally common
+    c4[1] = 500.0         # a genuinely over-used content token
+    w4 = explore_weights(c4, V, protect=(0,))
+    assert abs(float(w4[0]) - 1.0 / V) < 1e-9, "protected token was reweighted"
+    assert abs(float(w4.sum()) - 1.0) < 1e-12
+    assert float(w4[2]) > float(w4[1]) * 10, "the unprotected tokens are no longer rebalanced"
+    # and without the protection EOS is crushed -- the bug this pins down
+    assert float(explore_weights(c4, V)[0]) < 0.2 / V, "unprotected EOS should be crushed"

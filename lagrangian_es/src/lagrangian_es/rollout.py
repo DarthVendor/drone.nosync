@@ -172,8 +172,18 @@ class Rollout:
                  composer=None):
         self.system, self.trainable, self.task, self.cfg = system, trainable, task, cfg
         self.composer = composer
+        # the vehicle's own map, if the config asks for one: it duck-types a
+        # sensor closely enough to attach through the same path, but it is NOT
+        # one -- it consumes what the range sensor returned rather than the world
+        self.built_map = None
+        self._beam_sen = next((x for x in (sensors or ())
+                               if getattr(x, "kind", "") == "range" and hasattr(x, "_dirs")), None)
+        if getattr(cfg, "built_map", False) and self._beam_sen is not None:
+            from .mapping import BuiltMap
+            self.built_map = BuiltMap(**dict(getattr(cfg, "built_map_kw", ()) or ()))
+            self.built_map.kind, self.built_map.name = "map", "map_built"
         if composer is not None and hasattr(composer, "attach"):
-            composer.attach(list(sensors or []))     # bearings come from the sensors themselves
+            composer.attach(list(sensors or []) + ([self.built_map] if self.built_map is not None else []))
         self.chain: list = []          # measurement tokens, one entry per interval
         self._last_obs: dict = {}
         self.sensors: List[Sensor] = list(sensors or [])
@@ -276,6 +286,8 @@ class Rollout:
         # BEFORE that step, not the frozen state after it.
         if self.charge_mem is not None:
             self.charge_mem.reset()
+        if self.built_map is not None:                # every episode starts knowing nothing
+            self.built_map.reset(any_.shape[0], any_.device, self.system.task_position(s).dtype)
         for sen, buf in zip(self.sensors, self.buffers):
             buf.reset(sen.observe(s, gen))
 
@@ -323,6 +335,22 @@ class Rollout:
                     self.charge_mem.write(hit, seen)
         if self.charge_mem is not None:
             out["charges"], out["charge_w"] = self.charge_mem.read()
+        if self.built_map is not None:
+            # Built from what the BEAMS RETURNED, never from the world: the same
+            # delayed, strided, noisy numbers the rest of the stack sees, so a
+            # remembered wall can be in the wrong place exactly as the vehicle
+            # believes it to be.
+            #
+            # Only on a step the fan actually refreshed.  A strided sensor HOLDS
+            # its reading in between, so marking every step counted one sighting
+            # five times over -- inflating the confidence, and refreshing the
+            # last-seen stamp so that a cell's age could never grow past the
+            # stride.  The map is a record of measurements, so it advances when
+            # a measurement arrives.
+            if step % max(1, int(getattr(self._beam_sen, "update_every", 1))) == 0 or step == 0:
+                x = self.system.task_position(s)
+                self.built_map.update(x, self._beam_sen._dirs(s), out[self._beam_sen.name],
+                                      self._beam_sen.max_range, live=live, t=float(step))
         return out
 
     def _measure(self, sen, s: State, live):
@@ -368,7 +396,11 @@ class Rollout:
         raw = cached[0].clone()
         raw[idx] = r_sub
         jac = None
-        if self._needs_jac:
+        if self._needs_jac and cached[1] is not None:
+            # `cached[1] is None` for a sensor that has no pullback at all --
+            # the carried map is read by the composer and never by the
+            # potential, so there is no Jacobian to patch (`MapPrior.measure`
+            # returns None for it).
             jac = cached[1].clone()
             jac[idx] = j_sub
         self._raw[sen.name] = (raw, jac, self._ver.clone())
@@ -495,7 +527,8 @@ class Rollout:
         m_every, every = cs["m_every"], cs["every"]
         x = sysm.task_position(s)
         if t and t % m_every == 0:
-            tok = self._token(cs["x_int"], x, goal + hold.target.delta, cs["beam_min"], alive, arrived)
+            tok = self._token(cs["x_int"], x, goal + hold.target.delta, cs["beam_min"], alive, arrived,
+                              speed=self.system.task_velocity(s).norm(dim=-1))
             tok["t"] = float(t)
             # the objective itself, so a learner above reads the same cost the
             # low level was evolved on and nothing shaped
@@ -567,11 +600,19 @@ class Rollout:
         """What the composer sees once an interval: the raw pieces.  Ego-centric
         framing is the composer's own job."""
         sysm = self.system
-        ctx = {"x": sysm.task_position(s), "v": sysm.task_velocity(s),
+        x = sysm.task_position(s)
+        ctx = {"x": x, "v": sysm.task_velocity(s),
                "goal": goal, "alive": alive, "arrived": arrived, "leg": leg,
                "t": t, "state": s, "chain": self.chain}
         if obs:
             ctx["obs"] = obs
+        if self.built_map is not None:
+            # Read HERE rather than in `_observe`: the k nearest remembered
+            # cells are wanted only when the composer is deciding (every ~20
+            # steps), and computing them every step was 95% waste -- a top-k
+            # over the whole grid, 1800 times an episode instead of ~90.
+            ctx["obs"] = dict(obs or {})
+            ctx["obs"]["map_built"] = self.built_map.read(x, now=float(t))
         return ctx
 
     @staticmethod
@@ -586,13 +627,15 @@ class Rollout:
         return torch.cat([suffix, torch.zeros_like(suffix[:, :1])], 1)  # [B, n]: to go after leg j
 
     @staticmethod
-    def _token(x0, x1, sub, beam_min, alive, arrived):
+    def _token(x0, x1, sub, beam_min, alive, arrived, speed=None):
         """The measurement token: what the last instruction actually did --
         progress toward the subgoal it was given, the closest any beam came,
-        and whether it is still flying.  Reported, never hoped."""
+        how fast it is going, and whether it is still flying.  Reported, never
+        hoped."""
         e0 = (x0 - sub).norm(dim=-1); e1 = (x1 - sub).norm(dim=-1)
         return {"progress": e0 - e1, "remaining": e1, "min_beam": beam_min,
-                "alive": alive.clone(), "arrived": arrived.clone()}
+                "alive": alive.clone(), "arrived": arrived.clone(),
+                "speed": None if speed is None else speed.clone()}
 
     # --- layout ------------------------------------------------------------
     def _expand(self, TH: Tensor, goals: Tensor, seed: int):
@@ -915,7 +958,8 @@ class Rollout:
             # batch) while the judged cost never moved: it was learning that
             # an early crash is cheap and arriving pays nothing.
             tok = self._token(cs["x_int"], sysm.task_position(s), final_goal + cs["hold"].target.delta,
-                              cs["beam_min"], alive, arrived)
+                              cs["beam_min"], alive, arrived,
+                              speed=sysm.task_velocity(s).norm(dim=-1))
             tok["t"] = float(T); tok["cost"] = cost.clone()
             self.chain.append(tok)
         done = (finish < T) if arrival else task.success(s, final_goal)

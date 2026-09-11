@@ -1,0 +1,200 @@
+"""Tokens that carry continuous arguments: `[WAYPOINT(r, theta)] [EOS]`.
+
+The same grammar as `actions.py` -- a chain of components closed by EOS, silence
+is a bare EOS -- but the arguments are real numbers instead of a grid.  Five
+token TYPES replace twenty-five components:
+
+    EOS                     close the chain; alone, it is silence
+    WAYPOINT(r, theta)      put the subgoal r of the way out, at bearing theta
+    TURN(theta)             command a yaw change
+    PRIORITY(w0..w_{n-1})   push the constraint terms up or down
+    LOOK                    point the camera
+
+Why this and not twenty-five discrete components: the grid was coarse where it
+mattered (30 degrees of bearing is a metre and a half across a four-metre
+street) and it split the gradient twenty-five ways, so the rare components --
+turn, priority -- never gathered enough evidence to improve and stayed rare.
+One continuous head gets every sample instead.
+
+POLAR, in the vehicle's OWN frame, and both halves of that matter.
+
+`theta` is measured from where the drone is facing, which is the frame its
+beams and camera patches already report their bearings in -- so "the beam at
++30 degrees is clear" and "put the waypoint at +30 degrees" are the same
+number, and the composer never has to convert between frames to act on what it
+sees.  `r` is the distance, which is also the only brake it has: a near
+waypoint is how the task level tells a controller that flies at whatever the
+pull commands to slow down.
+
+**`r` is a FRACTION of the distance still to go, and that is not cosmetic.**
+An earlier design held a Cartesian offset in world coordinates and arrival
+became impossible: the subgoal sat a fixed distance from a goal with a 0.25 m
+tolerance, so the vehicle could never be at both.  Here the radius is
+`min(reach, distance to the goal)`, so every reachable subgoal collapses onto
+the goal on approach.
+
+The policy is Gaussian over the UNSQUASHED argument `u`, and the squash
+(tanh) is applied here when the action is built.  That keeps the log-density
+exact without a change-of-variables term, which is what the update needs.
+"""
+from __future__ import annotations
+
+import math
+from typing import Optional, Tuple
+
+import torch
+from torch import Tensor
+
+from .actions import to_world
+from .spec import TaskSpec
+
+#: token types
+EOS, WAYPOINT, TURN, PRIORITY, LOOK = 0, 1, 2, 3, 4
+N_TOKENS = 5
+
+#: how many continuous arguments each type carries (PRIORITY is n_terms, set per instance)
+BASE_ARGS = {EOS: 0, WAYPOINT: 2, TURN: 1, LOOK: 0}      # WAYPOINT is (r, theta)
+
+#: the widest argument vector any token uses; the head always emits this many
+#: and the unused tail is ignored, so one Gaussian covers every token type
+MAX_ARGS = 2
+
+TURN_MAX = math.pi / 2          # a single TURN commands at most a quarter turn
+PRIORITY_MAX = 1.0              # how far one PRIORITY token can push a term
+
+
+class ContVocab:
+    """Token types with continuous arguments."""
+
+    EOS, WAYPOINT, TURN, PRIORITY, LOOK = EOS, WAYPOINT, TURN, PRIORITY, LOOK
+    HOLD = EOS                   # the chain memory calls silence HOLD; here it is a bare EOS
+    straight = WAYPOINT          # the rollout's opening action (see ContComposer._apply)
+    V = N_TOKENS
+    L_MAX = 4                    # components in a chain before EOS is forced
+
+    def __init__(self, n_terms: int = 1):
+        self.n_terms = int(n_terms)
+        self.n_args = max(MAX_ARGS, self.n_terms)
+
+    def name(self, t: int) -> str:
+        return {EOS: "EOS", WAYPOINT: "WAYPOINT(r,theta)", TURN: "TURN(theta)",
+                PRIORITY: "PRIORITY(w)", LOOK: "LOOK"}[int(t)]
+
+    def n_arg_of(self, t: int) -> int:
+        return self.n_terms if int(t) == PRIORITY else BASE_ARGS[int(t)]
+
+    # --- the squash: unbounded policy output -> a bounded action -------------
+    @staticmethod
+    def squash(u: Tensor) -> Tensor:
+        """[-1, 1]^k.  The policy is Gaussian over `u`; this is the action."""
+        return torch.tanh(u)
+
+    # --- building the spec ---------------------------------------------------
+    def begin(self, cur: TaskSpec, psi: Tensor) -> Tuple[TaskSpec, Tensor, Tensor]:
+        """A working copy plus the pending-waypoint slots."""
+        out = cur.clone() if hasattr(cur, "clone") else cur
+        B = psi.shape[0]
+        pend = torch.zeros(B, 2, dtype=psi.dtype, device=psi.device)     # (r, theta), squashed
+        has = torch.zeros(B, dtype=torch.bool, device=psi.device)
+        return out, pend, has
+
+    def step(self, tok: Tensor, arg: Tensor, out: TaskSpec, pend: Tensor, has: Tensor,
+             psi: Tensor, rows: Optional[Tensor] = None) -> None:
+        """One component, in place.
+
+        `tok` [n] token type and `arg` [n, n_args] (already squashed to
+        [-1, 1]) describe the rows named by `rows`, while `out`, `pend` and
+        `has` are FULL width -- the same split the discrete `step` uses, so a
+        decision that only some rows are still making writes through to the
+        batch instead of into a copy.
+
+        WAYPOINT is held until EOS (so a chain that also turns still places
+        once); TURN, PRIORITY and LOOK apply immediately.
+        """
+        a = arg.to(psi.dtype)
+        idx = rows if rows is not None else torch.arange(tok.shape[0], device=tok.device)
+        psi_r = psi if psi.shape[0] == tok.shape[0] else psi[idx]
+        w = tok == WAYPOINT
+        if bool(w.any()):
+            pend[idx[w]] = a[w, :2]
+            has[idx[w]] = True
+        t = tok == TURN
+        if bool(t.any()) and out.yaw is not None:
+            # absolute, like the discrete TURN: the current heading plus the
+            # commanded offset, and the gate opened so the plant obeys it
+            out.yaw[idx[t]] = psi_r[t] + TURN_MAX * a[t, 0]
+            if out.yaw_gate is not None:
+                out.yaw_gate[idx[t]] = 1.0
+        p = tok == PRIORITY
+        if bool(p.any()):
+            # MULTIPLICATIVE, matching the discrete RAISE/LOWER exactly at the
+            # extremes: an argument of +1 is one RAISE (x1.5), -1 one LOWER
+            scale = torch.exp(math.log(1.5) * a[p][:, : self.n_terms])
+            out.alpha = out.alpha.clone()
+            out.alpha[idx[p]] = (out.alpha[idx[p]] * scale).clamp(0.05, 20.0)
+        lk = tok == LOOK
+        if bool(lk.any()) and out.yaw_gate is not None:
+            out.yaw_gate[idx[lk]] = 0.0
+
+    def finish(self, out: TaskSpec, pend: Tensor, has: Tensor, x: Tensor, goal: Tensor,
+               psi: Tensor, g_ego: Tensor, reach: float, z_min: float) -> TaskSpec:
+        """EOS for every row: realise the pending waypoint.
+
+        The ball the argument indexes has radius `min(reach, |goal - x|)`, so a
+        waypoint is always reachable AND collapses onto the goal as the vehicle
+        arrives -- the property whose absence made arrival impossible when the
+        offset was held in world coordinates.
+        """
+        dt = x.dtype
+        if bool(has.any()):
+            # `g_ego` is in units of the REACH, not metres -- the same convention
+            # the discrete `finish` works in -- so everything here is in reach
+            # units and the conversion happens once, at the end.  Mixing the two
+            # put every waypoint a couple of metres from the vehicle instead of
+            # out at its reach, and it crawled instead of flying.
+            L0 = g_ego[:, :2].to(dt).norm(dim=-1)                      # distance to go, reach units
+            radius = L0.clamp(max=1.0)                                 # never past one reach
+            r = (pend[:, 0].to(dt) + 1.0) * 0.5 * radius               # [-1,1] -> [0, radius]
+            theta = math.pi * pend[:, 1].to(dt)                        # [-1,1] -> [-pi, pi], from the nose
+            # height follows the goal, scaled the same way the distance is, so a
+            # near waypoint does not command a dive
+            zf = (r / radius.clamp_min(1e-9)).clamp(max=1.0)
+            sub_ego = torch.stack([r * torch.cos(theta), r * torch.sin(theta),
+                                   g_ego[:, 2].to(dt) * zf], -1)
+            sub_world = x + to_world(sub_ego * reach, psi)             # reach units -> metres
+            sub_world = torch.cat([sub_world[:, :2], sub_world[:, 2:].clamp_min(z_min)], -1)
+            out.delta = torch.where(has[:, None], sub_world - goal, out.delta)
+        out.moved = has
+        return out
+
+    def apply(self, tok: Tensor, arg: Tensor, cur: TaskSpec, x: Tensor, goal: Tensor, psi: Tensor,
+              g_ego: Tensor, reach: float, z_min: float) -> TaskSpec:
+        """One component then EOS -- the opening placement, and the tests."""
+        out, pend, has = self.begin(cur, psi.to(x.dtype))
+        self.step(tok, arg, out, pend, has, psi.to(x.dtype), rows=None)
+        return self.finish(out, pend, has, x, goal, psi.to(x.dtype), g_ego, reach, z_min)
+
+
+def log_prob(tok_logits: Tensor, mu: Tensor, log_std: Tensor, tok: Tensor, u: Tensor,
+             n_args: Tensor) -> Tensor:
+    """Log-density of `[type, arguments]`, [B].
+
+    Categorical over the type, plus a diagonal Gaussian over the UNSQUASHED
+    arguments that type actually uses -- a token with no arguments contributes
+    only its type term, so EOS and LOOK are pure classification.
+    """
+    lp = torch.log_softmax(tok_logits, -1).gather(-1, tok[:, None]).squeeze(-1)
+    k = mu.shape[-1]
+    idx = torch.arange(k, device=mu.device)[None, :]
+    used = idx < n_args[:, None]                                   # [B, k]
+    var = (2.0 * log_std).exp()
+    g = -0.5 * (((u - mu) ** 2) / var + 2.0 * log_std + math.log(2 * math.pi))
+    return lp + (g * used.to(g.dtype)).sum(-1)
+
+
+def entropy(tok_logits: Tensor, log_std: Tensor) -> Tensor:
+    """Type entropy plus the Gaussian's, [B]."""
+    p = torch.softmax(tok_logits, -1)
+    h_t = -(p * torch.log_softmax(tok_logits, -1)).sum(-1)
+    h_g = (0.5 * math.log(2 * math.pi * math.e) + log_std).sum(-1)
+    return h_t + h_g

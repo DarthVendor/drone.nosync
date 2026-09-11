@@ -367,6 +367,17 @@ def load_composer_weights(net: nn.Module, path: str) -> None:
     # a checkpoint from a different term count or vocabulary: the parameters
     # whose shape changed (constraint queries, action head, action embedding)
     # keep their prior; the body is what carries over
+    # The type embedding GREW when the two map token types were added.  Its
+    # existing rows are the trained meaning of self/goal/beam/pixel/instr/
+    # measure and must carry over; the new rows start at their prior, which is
+    # exactly right for a vehicle that has not yet been given a map.  Widening
+    # it here is what lets one trained policy seed every arm of the map
+    # experiment, so the arms differ by their INPUT and nothing else.
+    tk = "type_emb.weight"
+    if tk in sd and tk in own and sd[tk].shape[0] < own[tk].shape[0] and sd[tk].shape[1:] == own[tk].shape[1:]:
+        grown = own[tk].clone()
+        grown[: sd[tk].shape[0]] = sd[tk]
+        sd[tk] = grown
     sd = {k: v for k, v in sd.items() if k in own and tuple(own[k].shape) == tuple(v.shape)}
     # The heads may keep their prior (a vocabulary change, a checkpoint
     # without a value head); the BODY may not.  A body key that fails to

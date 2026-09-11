@@ -13,7 +13,7 @@ no scale to tune, and a wide move is one token away.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import math
 
@@ -62,6 +62,19 @@ class PolicyComposer(TransformerComposer):
         # flights' own randomness is untouched.
         self.tok_frac = float(kw.pop("tok_frac", 1.0))
         self._tok_gen = None
+        # Where the exploration mixture puts its mass.  Uniform gives every
+        # token the same slice, which sounds fair and is not: the policy emits
+        # PLACE 92% of the time and TURN/priority about 1%, so the rare tokens
+        # end a batch with ~76 flights of evidence against a per-flight spread
+        # of 415 -- far too little to resolve an effect worth ~25, so they can
+        # never earn their way out of being rare.  Balanced exploration puts
+        # the mixture's mass where the policy is NOT looking, in inverse
+        # proportion to how often each token is actually emitted.  The update
+        # already corrects for the behaviour distribution by importance
+        # weight, so this changes what is sampled, not what is estimated.
+        self.explore_balance = bool(kw.pop("explore_balance", False))
+        self._tok_count = None
+        self._tok_decay = float(kw.pop("explore_decay", 0.5))   # counts kept across ~2 batches
         super().__init__(system, trainable, **kw)
         self.net = PolicyNet(max(self.n_terms, 1), d=kw.get("d", 64), heads=kw.get("heads", 4)).to(self.net_dtype)
         self.net.goal_gain = self.tok.scale / self.reach
@@ -82,6 +95,8 @@ class PolicyComposer(TransformerComposer):
         """Pair the token draws by episode across the population for this run
         (`crn_sample`); the rollout calls it at every start."""
         self._crn = (int(n_eps), int(seed)); self._crn_k = 0; self._n_emit = 0
+        if self._tok_count is not None:
+            self._tok_count *= self._tok_decay      # follow the policy as it moves
 
     @torch.no_grad()
     def emit(self, ctx):
@@ -98,7 +113,15 @@ class PolicyComposer(TransformerComposer):
             b_logits = logits
             rec = torch.isin(ids_full, rec_rows) if rec_rows is not None else torch.zeros(B, dtype=torch.bool, device=logits.device)
             if exploring:
-                mix = torch.log((1.0 - eps) * torch.softmax(logits, -1) + eps / logits.shape[-1])
+                V = logits.shape[-1]
+                w = None
+                if self.explore_balance:
+                    if self._tok_count is None or self._tok_count.numel() != V:
+                        self._tok_count = torch.zeros(V, dtype=torch.float64)
+                    w = explore_weights(self._tok_count, V, protect=(self.net.vocab.EOS,))
+                w = (torch.full((V,), 1.0 / V, dtype=logits.dtype, device=logits.device)
+                     if w is None else w.to(logits.dtype).to(logits.device))
+                mix = torch.log((1.0 - eps) * torch.softmax(logits, -1) + eps * w)
                 mix = torch.where(torch.isfinite(logits), mix, logits)            # a forced EOS stays forced
                 b_logits = torch.where(rec[:, None], mix, logits)
             if not self.stochastic:
@@ -116,6 +139,9 @@ class PolicyComposer(TransformerComposer):
                 m = (ids_c // E > 0) & (par >= 0) & ~rec.cpu()
                 if bool(m.any()):
                     act = act.clone(); act[m.to(act.device)] = act[par[m].to(act.device)]
+            if self.explore_balance and self._tok_count is not None:
+                self._tok_count.index_add_(0, act.detach().flatten().cpu(),
+                                           torch.ones(act.numel(), dtype=torch.float64))
             n_emit = getattr(self, "_n_emit", 0); self._n_emit = n_emit + 1
             ov = getattr(self, "override", None)
             if ov is not None and n_emit in ov:
@@ -171,7 +197,8 @@ def crn_sample(logits: torch.Tensor, ids: torch.Tensor, n_eps: int, seed: int, k
 
 
 def returns_from_stream(records: List[Dict], chain: List[Dict], gamma: float,
-                        subgoal_cost: float = 0.0, unit: float = 0.0) -> Tensor:
+                        subgoal_cost: float = 0.0, unit: float = 0.0,
+                        speed_bonus: float = 0.0, speed_ref: float = 5.0) -> Tensor:
     """Per decision and FULL-BATCH row, the discounted sum of the cost
     increments the stream reported after it -- negated, so lower cost is higher
     return.  Records may cover only the rows that were alive at that decision
@@ -182,9 +209,22 @@ def returns_from_stream(records: List[Dict], chain: List[Dict], gamma: float,
     TIME: gamma per `unit` steps between one record and the next, so the
     horizon does not shorten when decisions are dense and stretch when they
     are sparse (decisions are events, and near the end of a batch few rows
-    are still deciding).  0 keeps gamma per record."""
+    are still deciding).  0 keeps gamma per record.
+
+    `speed_bonus` credits the vehicle's own airspeed: that much per interval at
+    `speed_ref`, pro rata below it.  This is the ONE shaped term in the
+    composer's objective, and it lives here rather than in the cost so that the
+    plant cost the low level is evolved on stays exactly what it was -- distance
+    to go, the arrival bonus, the charge for dying.
+
+    Keep it small.  Raw speed is gameable in principle: a vehicle circling at
+    full speed collects it forever, and only the distance charge accumulating
+    against it makes circling lose.  Well under the distance term and that
+    balance holds; comparable to it and it tips.  A dead row earns nothing, so
+    the credit cannot buy a cheap crash."""
     ts = [r["t"] for r in records]
     cost_at = {m["t"]: m["cost"] for m in chain}
+    speed_at = {m["t"]: (m.get("speed"), m.get("alive")) for m in chain} if speed_bonus else {}
     times = sorted(cost_at)
     B = chain[0]["cost"].shape[0] if chain else records[0]["alive"].shape[0]
     zero = torch.zeros(B, dtype=chain[0]["cost"].dtype if chain else records[0]["act"].dtype)
@@ -199,6 +239,15 @@ def returns_from_stream(records: List[Dict], chain: List[Dict], gamma: float,
         c0 = cost_at_or_before(ts[k])
         c1 = cost_at_or_before(ts[k + 1]) if k + 1 < len(records) else last
         r = -(c1 - c0)
+        if speed_bonus:
+            # credited at the interval's END, the instant its cost increment is
+            # read, and only while the row is still flying
+            t1 = ts[k + 1] if k + 1 < len(records) else (times[-1] if times else ts[k])
+            prev = [u for u in times if u <= t1]
+            sp, al = speed_at.get(prev[-1], (None, None)) if prev else (None, None)
+            if sp is not None:
+                credit = speed_bonus * (sp.to(r.dtype) / speed_ref).clamp(0.0, 1.0)
+                r = r + (credit if al is None else credit * al.to(r.dtype))
         if subgoal_cost:
             rows = records[k].get("rows"); mv = records[k].get("moved")
             if rows is not None and mv is not None:
@@ -209,6 +258,89 @@ def returns_from_stream(records: List[Dict], chain: List[Dict], gamma: float,
         G = r + g * G
         R[k] = G
     return R
+
+
+def explore_weights(count: Optional[Tensor], V: int, protect: Sequence[int] = ()) -> Optional[Tensor]:
+    """Where the exploration mixture should put its mass, given how often each
+    token has actually been emitted.
+
+    Inverse to frequency, floored so a token the policy never emits gets at
+    most V times a uniform share rather than everything: weight is
+    1 / (frequency + 1/V), normalised.  A token at uniform frequency keeps a
+    uniform share, so a policy that already spreads evenly is left alone.
+
+    `protect` pins tokens to a plain uniform share and leaves them out of the
+    rebalancing.  EOS belongs there, and leaving it out was a real bug: it is
+    52% of emitted components because every chain ENDS with one and a bare EOS
+    is silence -- structural frequency, not over-use.  Reweighted against, it
+    fell to 0.09x a uniform share, so exploring chains stopped terminating,
+    ran to the component limit, and turned every exploring decision into a
+    placement.  Subgoals per flight climbed monotonically until it was pinned.
+
+    None (or an empty count) means uniform -- the first batch, before anything
+    has been seen.
+    """
+    if count is None or count.numel() != V or float(count.sum()) <= 0:
+        return None
+    keep = torch.ones(V, dtype=torch.bool)
+    for i in protect:
+        if 0 <= int(i) < V:
+            keep[int(i)] = False
+    n_free = int(keep.sum())
+    if n_free == 0:
+        return torch.full((V,), 1.0 / V, dtype=count.dtype)
+    w = torch.full((V,), 1.0 / V, dtype=count.dtype)          # protected: a plain uniform share
+    c = count[keep]
+    tot = float(c.sum())
+    if tot <= 0:
+        return w
+    f = c / tot
+    wf = 1.0 / (f + 1.0 / n_free)
+    w[keep] = wf / wf.sum() * (n_free / V)                    # the rest share what is left
+    return w / w.sum()
+
+
+def center_by_task(returns: List[Tensor], rows: List[Tensor], n_eps: int,
+                   min_count: int = 2) -> None:
+    """Subtract a per-(task, decision) baseline from the composer's returns, in
+    place, pooled across shards.
+
+    Why this and not the per-genome centring it replaces: most of the spread in
+    a flight's return is not the policy's doing, it is the TASK's.  A flight's
+    cost is dominated by whether it crashed, dying charges 40/s against a 36 s
+    episode, and 55% of starts on this city have a building within 10 m on the
+    line to the goal.  So the same policy scores ~1100 on a hard draw and ~250
+    on an easy one, and centring per genome leaves all of that in.  Every
+    genome flies the SAME task list, so the mean over genomes of one task is a
+    clean estimate of that task's difficulty, and removing it leaves what the
+    decisions actually changed.
+
+    Unbiased: the baseline depends on the task and the decision index, never on
+    the action taken.  Tasks with fewer than `min_count` samples are left
+    alone, since a one-sample mean would subtract the very return being
+    learned from and zero the gradient.
+
+    `rows` are GLOBAL row indices (genome * n_eps + task); the shards split the
+    population, so a task's samples live in different shards and the pooling
+    has to happen across all of them.
+    """
+    if not returns:
+        return
+    K = max(int(R.shape[0]) for R in returns)
+    dt = returns[0].dtype
+    tot = torch.zeros(K, n_eps, dtype=dt)
+    cnt = torch.zeros(K, n_eps, dtype=dt)
+    tids = [(r % n_eps).to(torch.long) for r in rows]
+    for R, tid in zip(returns, tids):
+        k = int(R.shape[0])
+        tot[:k].index_add_(1, tid, R.to(dt))
+        cnt[:k].index_add_(1, tid, torch.ones_like(R, dtype=dt))
+    mean = tot / cnt.clamp(min=1.0)
+    enough = cnt >= float(min_count)
+    for R, tid in zip(returns, tids):
+        k = int(R.shape[0])
+        b = torch.where(enough[:k][:, tid], mean[:k][:, tid], torch.zeros((), dtype=dt))
+        R -= b.to(R.dtype)
 
 
 def ppo_update(net: PolicyNet, records: List[Dict], returns: Tensor, n_terms: int,

@@ -10,6 +10,7 @@ from typing import Callable, Dict, Type
 from .base import DelayBuffer, Sensor
 from .full_state import FullState, FullStateVelocity, NoisyPosition, Tilt
 from .landmarks import LandmarkCamera
+from .map_view import MapPrior
 from .depth_camera import DepthCamera
 from .range_sensor import RangeSensor
 from .lens import LENSES, DoubleSphere, Pinhole, make_lens
@@ -53,8 +54,9 @@ class RangeDown(RangeSensor):
 
 register_sensor("range_down")(RangeDown)
 register_sensor("depth_camera")(DepthCamera)
+register_sensor("map_prior")(MapPrior)
 
 __all__ = ["Sensor", "DelayBuffer", "FullState", "FullStateVelocity",
            "NoisyPosition", "LandmarkCamera", "RangeSensor", "Pinhole", "DoubleSphere",
            "make_lens", "LENSES",
-           "DepthCamera", "SENSORS", "register_sensor", "make_sensor"]
+           "DepthCamera", "MapPrior", "SENSORS", "register_sensor", "make_sensor"]

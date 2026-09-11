@@ -60,6 +60,11 @@ class RolloutCfg:
                                   # objective (0.100 -> 0.141 across the task).
     dead_cost: float = 5.0        # per-second cost accrued by a crashed vehicle
                                   # under dead_mode="constant"
+    # The map the vehicle builds for itself from its own beams (mapping.BuiltMap),
+    # offered to the composer as aged measurement tokens.  Independent of the
+    # `map_prior` SENSOR, so the two can be run in any combination.
+    built_map: bool = False
+    built_map_kw: tuple = ()      # (("cell", 2.0), ("k", 12), ("extent", 72.0), ("max_range", 30.0))
     compile_forward: bool = False  # torch.compile the vmapped controller.
                                   # Measured 1.78x on the learned rig, matching
                                   # eager exactly.  OFF by default because the

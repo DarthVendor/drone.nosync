@@ -1,12 +1,20 @@
 """Ego-centric tokens for the composer -- from what the vehicle perceives.
 
-Nothing here reads the map.  The scene reaches the composer only through the
-sensors: one token per range beam (its bearing in the body frame and what it
-returned) and one per camera column (its bearing and the nearest depth in that
-column).  The other inputs are the vehicle's own motion, the relative goal the
-task hands it, and the chain of its earlier instructions with what came of
+Nothing here reads the map DIRECTLY.  The scene reaches the composer only
+through `obs`: one token per range beam (its bearing in the body frame and what
+it returned) and one per camera column (its bearing and the nearest depth in
+that column).  The other inputs are the vehicle's own motion, the relative goal
+the task hands it, and the chain of its earlier instructions with what came of
 each.  A composer that could read `state["boxes/*"]` would learn to read a map
 the vehicle does not carry, and a test holds this module to never doing so.
+
+Two optional map sources also arrive through `obs`, each as one token per
+building or remembered cell, and each switched on only by a config that asks
+for it: `map_prior`, the carried survey a real vehicle flies with, and
+`map_built`, what this vehicle has itself seen (see `mapping.BuiltMap`).  They
+share a token layout so an experiment can turn either on alone or both
+together, and they carry different type ids so the composer can tell a prior it
+was handed from a wall it has actually met.
 
 Every quantity is expressed in the yaw-aligned, gravity-aligned body frame with
 distances divided by a scale, so a scene rotated about the vehicle or shifted
@@ -20,8 +28,8 @@ from typing import Dict, List, Tuple
 import torch
 from torch import Tensor
 
-SELF, GOAL, BEAM, PIXEL, INSTR, MEASURE = 0, 1, 2, 3, 4, 5
-N_TYPES = 6
+SELF, GOAL, BEAM, PIXEL, INSTR, MEASURE, MAP_PRIOR, MAP_BUILT = 0, 1, 2, 3, 4, 5, 6, 7
+N_TYPES = 8
 F = 8                                     # feature width shared by every token
 ACT_SCALE = 64.0                          # an action token's id rides in feature 0 of an INSTR token, over this
 
@@ -72,14 +80,24 @@ class Tokenizer:
                 bear = torch.stack([u.repeat(ph), v.repeat_interleave(pw)], -1)      # row-major patches
                 self.layout.append((sen.name, "pixel", bear, float(sen.max_range), (W, H, P)))
                 continue
+            elif kind == "map" and hasattr(sen, "k"):
+                # one token per map entry; `BuiltMap` duck-types the same three
+                # attributes, so the two sources attach through one branch
+                ty = MAP_BUILT if getattr(sen, "name", "") == "map_built" else MAP_PRIOR
+                self.layout.append((sen.name, "map", None, float(sen.max_range), (int(sen.k), ty)))
 
 
-    def _perception(self, obs: Dict, B: int, dt, dev) -> Tuple[Tensor, Tensor, Tensor]:
+    def _perception(self, obs: Dict, B: int, dt, dev, x=None, psi=None,
+                    now: float = 0.0) -> Tuple[Tensor, Tensor, Tensor]:
         rows, types = [], []
         for key, kind, bear, rmax, geom in self.layout:
             if key not in obs:
                 continue
             o = obs[key]
+            if kind == "map":
+                rows.append(self._map_rows(o, B, dt, dev, x, psi, geom[0]))
+                types.append(torch.full((B, geom[0]), geom[1], dtype=torch.long, device=dev))
+                continue
             if kind == "pixel":                       # [B, H*W] -> [B, ph*pw] patches: min, mean, hit fraction
                 W, H, P = geom
                 img = o.reshape(B, H, W)[:, : (H // P) * P, : (W // P) * P]
@@ -100,6 +118,35 @@ class Tokenizer:
         feat = torch.cat(rows, 1); ty = torch.cat(types, 1)
         return feat, ty, torch.ones(feat.shape[:2], dtype=torch.bool, device=dev)
 
+    def _map_rows(self, o: Tensor, B: int, dt, dev, x, psi, k: int) -> Tensor:
+        """One token per map entry, world frame in, ego frame out.
+
+        A rotated footprint is presented as its ego-frame BOUNDING box rather
+        than as a centre plus an angle: it needs no orientation slot, it is
+        exact for the axis-aligned blocks these cities are made of, and it is
+        conservative (never smaller than the true footprint) for any other.
+        """
+        e = o.reshape(B, k, -1).to(dt)
+        cx, cy, hw, hd = e[..., 0], e[..., 1], e[..., 2], e[..., 3]
+        height, yaw, conf, age = e[..., 4], e[..., 5], e[..., 6], e[..., 7]
+        if x is None:
+            x = torch.zeros(B, 3, dtype=dt, device=dev)
+        if psi is None:
+            psi = torch.zeros(B, dtype=dt, device=dev)
+        rel = to_ego(torch.stack([cx - x[:, None, 0], cy - x[:, None, 1]], -1), psi[:, None])
+        th = yaw - psi[:, None]
+        ca, sa = th.cos().abs(), th.sin().abs()
+        hw_e, hd_e = hw * ca + hd * sa, hw * sa + hd * ca
+        dist = rel.norm(dim=-1)
+        # an entry with no confidence is padding: report it as nothing at all,
+        # so an empty built map and an empty viewport look the same
+        live = (conf > 0).to(dt)
+        return torch.stack([rel[..., 0] / self.scale * live, rel[..., 1] / self.scale * live,
+                            (dist / self.scale).clamp(0, 4) * live,
+                            hw_e / self.scale * live, hd_e / self.scale * live,
+                            height / self.scale * live, conf,
+                            (age / 200.0).clamp(0, 4) * live], -1)
+
     def __call__(self, ctx: Dict, chain_instr: List[Tuple[Tensor, Tensor]]) -> Dict[str, Tensor]:
         x, v, goal, s = ctx["x"], ctx["v"], ctx["goal"], ctx["state"]
         B = x.shape[0]; dt = x.dtype; dev = x.device
@@ -117,12 +164,14 @@ class Tokenizer:
                                 sp / self.vs, view_dot_travel], -1)
         goal_tok = torch.cat([rel_goal / self.scale, rel_goal.norm(dim=-1, keepdim=True) / self.scale,
                               torch.zeros(B, 4, dtype=dt, device=dev)], -1)
-        per, per_types, per_mask = self._perception(ctx.get("obs", {}) or {}, B, dt, dev)
+        per, per_types, per_mask = self._perception(ctx.get("obs", {}) or {}, B, dt, dev,
+                                                    x=x, psi=psi, now=float(ctx.get("t", 0)))
         # The chain: the drone's measurement stream and the composer's own
         # instructions, merged in time order, last `k_chain` entries.  The
         # composer runs over this window every tick, so it is monitoring the
         # stream rather than reading a summary once an interval.
-        rmax = max(l[3] for l in self.layout) if self.layout else 1.0
+        _beams = [l[3] for l in self.layout if l[1] != "map"]     # a map viewport is not a beam range
+        rmax = max(_beams) if _beams else 1.0
         now = float(ctx.get("t", 0))
         # an action entry is (t, token id per row, valid per row): the rows
         # whose token it was see it, the others see padding

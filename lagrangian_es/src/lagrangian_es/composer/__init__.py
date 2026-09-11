@@ -14,8 +14,14 @@ from .oracle import OracleSubgoal
 from .transformer import ComposerNet, TransformerComposer
 from .tokens import Tokenizer
 from .distill import Recorder, collate, fit
-from .policy import PolicyComposer, PolicyNet, ppo_update, returns_from_stream
+from .policy import PolicyComposer, PolicyNet, ppo_update, returns_from_stream, center_by_task, explore_weights
+from .policy_cont import ContComposer, ContPolicyNet, ppo_update_cont
 from .explain import Tracer, explain_decision
 
-__all__ = ["TaskSpec", "SpecHold", "ground_release", "stale_fallback",
+__all__ = [
+    "ppo_update_cont",
+    "ContPolicyNet",
+    "ContComposer",
+    "explore_weights",
+    "center_by_task","TaskSpec", "SpecHold", "ground_release", "stale_fallback",
            "Composer", "FixedWeights", "make_composer", "OracleSubgoal", "ComposerNet", "TransformerComposer", "Tokenizer", "Recorder", "collate", "fit", "PolicyComposer", "PolicyNet", "ppo_update", "returns_from_stream", "Tracer", "explain_decision"]

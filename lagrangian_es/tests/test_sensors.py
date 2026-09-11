@@ -48,7 +48,11 @@ def test_sensor_conformance(sysname, name):
 
     v = sen.valid(s)
     assert v.shape == (6, sen.obs_dim) and v.dtype == torch.bool
-    assert sen.kind in ("position_like", "velocity_like", "range", "attitude_like")
+    # "map" is the carried survey (sensors/map_view.py).  It is a real sensor --
+    # declared in the config, delivered through `obs` -- but it feeds the
+    # task-level composer and never the potential, so its Jacobian is zero by
+    # design rather than by omission.
+    assert sen.kind in ("position_like", "velocity_like", "range", "attitude_like", "map")
     assert sen.latency_steps >= 0
 
 
