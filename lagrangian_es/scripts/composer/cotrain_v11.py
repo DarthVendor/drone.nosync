@@ -21,8 +21,9 @@ import json, math, shutil, sys, time, torch
 sys.path.insert(0, "/Users/maddoxnoon/Desktop/drone.nosync/lagrangian_es/src")
 from lagrangian_es.config import Config, RolloutCfg
 from lagrangian_es.composer import center_by_task, returns_from_stream, returns_goal_only
-from lagrangian_es.composer.policy_cont import imitate_update, ppo_update_cont
+from lagrangian_es.composer.policy_cont import error_update, imitate_update, ppo_update_cont, time_update
 from lagrangian_es.es import build, build_composer, build_sensors
+from lagrangian_es.composer.policy_cont import paired_advantage
 from lagrangian_es.metric import identity_preconditioner
 from lagrangian_es.operators import whitened_mutation
 from lagrangian_es.parallel import ParallelRollout
@@ -136,10 +137,69 @@ MAX_SAMPLES = 10_000
 #              cross-entropy term; the sign is in the weight, not a new loss.
 import os as _os                                           # the arms come from the environment, not argv (argv is already full)
 REPEAT = int(_os.environ.get("LES_REPEAT", "1"))            # samples per task
-SIGNED = _os.environ.get("LES_SIGNED", "0") == "1"          # can the weight go negative
+SIGNED = _os.environ.get("LES_SIGNED", "1") == "1"          # can the weight go negative
+# DEFAULT ON now that the score is soft time.  With finish_frac the weight had
+# to be non-negative: a failure had no arrival time, so imitating it would have
+# made the failure MORE likely and it could only be dropped.  That capped the
+# objective at "reallocate probability among the successes" -- it could make
+# good flights quicker and could not make bad flights rarer.  Soft time ranks
+# failures too, so the weight can go negative on them and the update can push
+# probability DOWN.  It is still a weighted log-probability -- without
+# differentiating the simulator the score function is the only estimator
+# available -- but it is a policy gradient now, not imitation.
 WEIGHT_TAU = float(_os.environ.get("LES_TAU", "1.0"))       # in units of the batch's own spread
 W_MAX = 2.0                                                # -log p is unbounded below; cap the push-down
-ARM = f"k{REPEAT}{'s' if SIGNED else 'u'}"
+LOSS = _os.environ.get("LES_LOSS", "ce")                   # "ce" | "error" | "time"
+# PER-DECISION credit for the cross-entropy loss.  Flight-level weighting
+# reinforces every decision inside a kept flight equally, including the ones the
+# flight arrived DESPITE -- measured, the advantage separated crashed from
+# surviving flights at z = -166 while correlating -0.013 with the braking
+# argument.  It is also a positive feedback loop on the composer's own
+# behaviour: subgoals climbed 8 -> 24.5 while arrival stalled, and at short legs
+# it took 0.977 down to 0.707.  Weighting each decision by the distance it
+# actually closed makes the credit local; the loss is unchanged.
+# PER-DECISION CREDIT IS GONE, with `progress_weights` itself.  It scored a
+# decision by the distance closed before the NEXT one, which under sparse
+# injection is unmeasurable (a flight has one or two decisions, and the last is
+# never credited) and confounded when it did fire (the distance is the FROZEN
+# LOW LEVEL's, not the token's).  Measured on the live checkpoint: the speak
+# floor emitted 13 WAYPOINTs and 0 of 13 survived it.  Credit is now the paired
+# counterfactual -- see PAIRED below.
+# SPARSE INJECTION (LES_INJECT).  0 = the composer decides at every report,
+# ~90 times a flight.  n > 0 = it decides at exactly n report steps drawn at
+# random per flight and is silent otherwise, so the flight's outcome credits
+# those n tokens against a baseline that succeeds on its own.  Measured on the
+# empty map at 8 m legs, composer at initialisation:
+#     inject 0 -> arrive 0.000, crash 0.469, 29.2 subgoals   (nothing to learn from)
+#     inject 1 -> arrive 0.917, crash 0.000,  0.46 subgoals
+#     inject 5 -> arrive 0.698, crash 0.000,  2.25 subgoals
+# The frozen low level alone is 1.000 on that rung, and a SILENT composer is
+# now also 1.000 -- it was 0.000 until the scripted opening placement was
+# removed, which is what had kept every flight failing and every batch empty.
+INJECT = int(_os.environ.get("LES_INJECT", "0"))
+# LES_SPEAK: probability a decision may not open on EOS, so it must say
+# something.  Guards the absorbing state -- see `PolicyComposer.speak_floor`.
+SPEAK_FLOOR = float(_os.environ.get("LES_SPEAK", "0.0"))
+# Where the composer is actually worth having, measured with no training at all
+# (128 episodes, frozen low level, arrive/crash):
+#
+#     setting            no composer     untrained composer
+#     8 m legs, 10%      0.992 / 0.01    0.977 / 0.01
+#     20 m legs, 100%    0.250 / 0.75    0.227 / 0.73
+#     50 m legs, 100%    0.039 / 0.96    0.070 / 0.89   <- the only cell it helps
+#
+# It nearly doubles arrival and cuts 7 points of crash at 50 m legs in the full
+# city, and is mildly harmful everywhere else -- at 8 m legs the plant is already
+# at 0.99 and a navigator can only subtract.  Success there is 4-7%, which is
+# also why the loss matters: self-imitation needs successes to copy and there
+# are almost none, while the error loss has a target for every decision of every
+# flight including the 93% that crash.
+ERR_ALPHA = float(_os.environ.get("LES_ALPHA", "1.0"))     # weight on e_reach
+ERR_BETA = float(_os.environ.get("LES_BETA", "1.0"))       # weight on e_aim
+LEG_FIX = float(_os.environ.get("LES_LEG", "0") or 0)      # >0 pins the leg length
+DIFF_FIX = float(_os.environ.get("LES_DIFF", "-1"))        # >=0 pins the difficulty
+ARM = (f"k{REPEAT}{'s' if SIGNED else 'u'}" + ("" if LOSS == "ce" else f"-err{ERR_ALPHA:g}_{ERR_BETA:g}")
+       + "-pair")
 COMPILE_WORKERS = False                                    # the workers compile the controller's forward passes (one compile thread each; the parent warms the compiler before the fork)
 TOK_FRAC = 0.1                                             # scene tokens kept for this fraction of the recorded rows: ~15k samples for a 10k update instead of ~150k (600 MB per worker)                                       # sized so the update (3 threads, beside the rollout) finishes inside the rollout
 T_TRAIN = 1800                                             # the JUDGE's horizon: on 18 s episodes a crash at 10 s cost 320, on the judge's 36 s 1040, and the composer drifted bold (crash +1.5 points per update) while its training cost fell -- train on what is judged (user: the curriculum must match the judge)
@@ -236,7 +296,37 @@ GOAL_ONLY = True         # reward ONLY arriving (user: "honestly just reward ach
 # with the braking argument r was -0.013.  A binary outcome makes the value
 # head predict the PROBABILITY of arriving -- bounded, well conditioned, and
 # exactly what a baseline should carry.
-DIFF0, DIFF_STEP, DIFF_UP_AT = 0.0, 0.1, 0.95
+# START WITH OBSTACLES, not on an empty map.  The composer's perception is
+# only worth anything when there is something to perceive, and the frozen low
+# level already reaches 1.000 on an empty map by itself -- so every iteration
+# spent at 0% buildings trains the one part of the net that was just repaired
+# (the argument head, and the scene encoder underneath it) on a scene that
+# cannot reward using a beam.  The previous run spent its first 65 iterations
+# there clearing the leg ladder, then stalled for 506 iterations the moment
+# buildings appeared.  10% is exactly where it stalled, so it is where an
+# improvement shows up soonest.
+# START EMPTY and scale.  The argument for starting at 10% was that
+# perception is useless on an empty map -- true, but it assumed the composer
+# already knew where the goal was.  With every hand-coded term removed it does
+# not: an untrained head points at chance (measured, 85.7 deg mean bearing
+# error against 6.4 with the residual).  Aiming at the goal has to be learned
+# before avoiding anything means anything, and an empty map is where that is
+# learnable.
+# START AT 10% BUILDINGS, not on the empty map (LES_DIFF0 overrides).
+# Measured: starting empty TEACHES SILENCE and silence is absorbing.  The
+# frozen low level alone is 1.000 on the empty map at 8 m legs, so every token
+# the composer emits costs it points (0.917 for one injected token), signed
+# weights correctly push those tokens down, and arrival climbs 0.832 -> 0.950
+# purely by shutting up -- subgoals 0.3 -> 0.0 by iteration 38.  Then
+# `progress_weights` credits ONLY a decision that placed a subgoal, so a
+# composer that places nothing yields zero samples, a nan loss and no gradient
+# at all.  The curriculum meanwhile read 0.950 as "ready" and promoted it to
+# 10% buildings, where silence crashes 18% of flights and nothing can be
+# learned because nothing is emitted.  An empty map measures nothing: there is
+# no use for a composer on it, so the only lesson available there is to be
+# quiet, and that lesson cannot be unlearned.
+DIFF0 = float(_os.environ.get("LES_DIFF0", "0.1"))
+DIFF_STEP, DIFF_UP_AT = 0.1, 0.95
 DIFF_WINDOW = 5          # the bar must hold over the LAST 5 iterations, not one.
 # A single batch of 1152 flights still swings by several points draw to draw, so
 # promoting on one reading steps up on a lucky sample and then sits stuck at a
@@ -293,7 +383,7 @@ TKW = (("learned", True), ("damp_mode", "beams"), ("extra_obs", (("range_down", 
 def cfg_for(env, max_leg, steps, n, composer="policy_cont", early=False, sensors=SENSORS, skw=SENSOR_KW, tkw=TKW, yaw=True, weights=None):
     w = W if weights is None else weights
     # fresh exploration noise per decision: a decision is now an event, not a tick
-    ckw = (("reach", 10.0), ("every", EVERY), ("measure_every", EVERY_M), ("k_chain", K_CHAIN), ("temperature", TEMPERATURE), ("noise_hold", NOISE_HOLD), ("explore_eps", EXPLORE_EPS), ("tok_frac", TOK_FRAC)) + ((("weights", w),) if w else ()) if composer else ()   # kids fly the parent's decisions: the GA compares low levels, not dice
+    ckw = (("reach", 10.0), ("every", EVERY), ("measure_every", EVERY_M), ("k_chain", K_CHAIN), ("temperature", TEMPERATURE), ("noise_hold", NOISE_HOLD), ("explore_eps", EXPLORE_EPS), ("tok_frac", TOK_FRAC), ("inject", INJECT), ("speak_floor", SPEAK_FLOOR)) + ((("weights", w),) if w else ()) if composer else ()   # kids fly the parent's decisions: the GA compares low levels, not dice
     return Config(system="quadrotor_nav", trainable="nav_agent", task="city_tour", environment=env,
                   sensors=sensors, sensor_kw=skw, gating="arrival", seed=0, composer=composer, composer_kw=ckw,
                   task_kw=(("n_legs", 2), ("max_leg", max_leg)),
@@ -401,6 +491,10 @@ state = json.load(open(STATE)) if os.path.exists(STATE) else {"best_cost": float
 _recent = []                                              # the last DIFF_WINDOW batch reaches
 best_cost = float(state["best_cost"]); DIFF = float(state.get("difficulty", DIFF0))
 LEG_I = int(state.get("leg_i", 0)); LEG = LEG_LADDER[min(LEG_I, len(LEG_LADDER) - 1)]
+if LEG_FIX > 0:
+    LEG = LEG_FIX; LEG_I = len(LEG_LADDER) - 1      # pinned: no promotion off this rung
+if DIFF_FIX >= 0:
+    DIFF = DIFF_FIX
 opt_c = torch.optim.Adam([p for p in comp.net.parameters() if p.requires_grad], lr=LR_C)
 def save_state(): json.dump({"best_cost": best_cost, "leg": LEG, "leg_i": LEG_I, "difficulty": DIFF}, open(STATE, "w"))
 def save_best():
@@ -418,16 +512,29 @@ save_state(); t0 = time.time()
 # update ~60 s, sequential).
 import threading
 pending, st_prev, t_u_prev = None, {"kl": float("nan"), "clipfrac": float("nan"), "speak": float("nan"), "entropy": float("nan"), "n": 0}, 0.0
-def _update(groups_r, groups_R, holder, groups_win=None, groups_score=None, groups_task=None):
+def _update(groups_r, groups_R, holder, groups_win=None, groups_score=None, groups_task=None, groups_left=None, groups_adv=None):
     t = time.time()
     # target_kl is a REAL cap here: the argument mean is unbounded and the last
     # continuous composer this project ran was uncapped and reached KL 18
-    if IMITATE:
+    if LOSS == "time":
+        # PURELY TIME: fit T_hat to the time each decision actually needed,
+        # then move the policy down T_hat.  Nothing else is in it.
+        holder["st"] = time_update(comp.net, groups_r, groups_left, ep_steps=T_TRAIN,
+                                   epochs=2, batch=1024, lr=LR_C, opt=opt_c,
+                                   max_samples=MAX_SAMPLES)
+    elif LOSS == "error":
+        # No reward, no return, no labels: the composer claims the vehicle can
+        # reach g by the next decision and reality answers.  See error_update.
+        holder["st"] = error_update(comp.net, groups_r, reach=10.0, epochs=2, batch=1024,
+                                    lr=LR_C, opt=opt_c, max_samples=MAX_SAMPLES,
+                                    alpha=ERR_ALPHA, beta=ERR_BETA)
+    elif IMITATE:
         holder["st"] = imitate_update(comp.net, groups_r, groups_win, epochs=2, batch=1024,
                                       lr=LR_C, opt=opt_c, max_samples=MAX_SAMPLES,
-                                      keep_frac=KEEP_FRAC, score=groups_score,
+                                      keep_frac=KEEP_FRAC, score=groups_score, advantage=groups_adv,
                                       weight_tau=WEIGHT_TAU, task=groups_task,
-                                      signed=SIGNED, w_max=W_MAX)
+                                      signed=SIGNED, w_max=W_MAX,
+                                      reach=10.0)
     else:
         holder["st"] = ppo_update_cont(comp.net, groups_r, groups_R, comp.n_terms, epochs=2, batch=1024, lr=LR_C, vcoef=VCOEF, ent=0.0, target_kl=0.02, opt=opt_c, max_samples=MAX_SAMPLES)
     holder["t"] = time.time() - t
@@ -487,6 +594,44 @@ def _join(it_=0):
         f"(update itself {t_u_prev:.0f}s), load {_os.getloadavg()[0]:.0f}]")
 
 
+def _sens(groups_r, n=192):
+    """How much the composer's output depends on its PERCEPTION, measured on the
+    batch it just flew -- no extra rollout.
+
+    The training batch already records scene tokens to feed the update, then
+    discards them; the judge records outcomes, not tokens, so it cannot answer
+    this at all.  Here each sampled decision is re-run twice on IDENTICAL state:
+    once as it was, once with the beam and pixel rows SHUFFLED between rows,
+    which destroys their information while leaving the marginal distribution
+    exactly as it was.  Blinding them to "nothing within range" is the weaker
+    test -- most beams already read nothing, so it barely perturbs anything.
+
+    Returned as the fraction of the token distribution that moves.  It was
+    0.0001 while the composer was ignoring its sensors entirely.
+    """
+    from lagrangian_es.composer.tokens import BEAM, PIXEL
+    toks = [r["tok"] for g in groups_r for r in g if r.get("tok")]
+    if not toks:
+        return float("nan")
+    step = max(1, len(toks) // 8)
+    dP, k = 0.0, 0
+    with torch.no_grad():
+        for tk in toks[::step][:8]:
+            ty = tk["ent_types"]
+            sel = (ty == BEAM) | (ty == PIXEL)
+            if not bool(sel.any()) or ty.shape[0] < 2:
+                continue
+            t1 = {kk: (v.clone() if torch.is_tensor(v) else v) for kk, v in tk.items()}
+            e = t1["entities"].clone()
+            m0 = sel[0]
+            e[:, m0] = e[torch.randperm(e.shape[0])][:, m0]
+            t1["entities"] = e
+            p0 = torch.softmax(comp.net.pre(tk)[0], -1)
+            p1 = torch.softmax(comp.net.pre(t1)[0], -1)
+            dP += float((p0 - p1).abs().sum(-1).mean()); k += 1
+    return dP / max(1, k)
+
+
 row_prev = None
 def _emit(r, st, t_u):
     """One iteration's batch, its own update, and the gate verdict on it."""
@@ -494,9 +639,17 @@ def _emit(r, st, t_u):
             else f"up {st.get('w_up', float('nan')):.2f} |w| {st.get('w_abs', float('nan')):.2f}")
     log(f"  [{ARM}] iter {r['it']:>4}  buildings {r['diff']:4.0%} legs {r['leg']:4.0f}m  arrive {r['arrive']:.3f}"
         f" crash {r['crash']:.3f} t_arr {r['t_arr']:.3f} cost {r['cost']:7.2f} subgoals {r['subs']:4.1f}"
-        f"  | loss {st.get('ce', float('nan')):7.3f} match {st.get('match', float('nan')):.2f}"
+        # `nll` -- the pure TOKEN cross-entropy -- beside `loss`.  The loss is
+        # not comparable across iterations: with sigma frozen at 0.12 each
+        # Gaussian argument adds a constant +0.701 of log-density, so a
+        # WAYPOINT (3 arguments) subtracts 2.104 from it and an EOS subtracts
+        # nothing.  The loss therefore FALLS whenever the policy simply speaks
+        # more -- measured: speak 0.250 -> 0.291 took the loss 0.072 -> 0.007
+        # while arrival went 0.736 -> 0.719.  `nll` carries no argument term
+        # and is the one to read.
+        f"  | loss {st.get('ce', float('nan')):7.3f} nll {st.get('nll', float('nan')):5.3f} match {st.get('match', float('nan')):.2f}"
         f" on {st.get('n', 0)} tokens from {st.get('kept_flights', 0)}/{st.get('flights', 0)} weighted {_sel}"
-        f" | speak {st.get('speak', float('nan')):.3f} std {st.get('std', float('nan')):.3f}"
+        f" | speak {st.get('speak', float('nan')):.3f} std {st.get('std', float('nan')):.3f} sens {r.get('sens', float('nan')):.4f}"
         f"  [roll {r['t_r']:.0f}s update {t_u:.0f}s | {r['mins']:.1f}m]{r['note']}")
 
 
@@ -517,9 +670,38 @@ for it in range(1, OUTER + 1):
             # carried with the shard, because the merged result of pass _r is
             # not addressable once the passes are pooled
             _s["win"] = _res.success[_s["rows"]]
-            _s["score"] = _res.finish_frac[_s["rows"]]
+            # SOFT TIME, not finish_frac.  finish_frac is 1.0 for every flight
+            # that did not arrive, so all failures tie and the objective can
+            # only ever give them weight zero -- which is why nothing in it
+            # could reduce the failure rate.  soft_time accumulates
+            # sigmoid((|err| - tol)/tol) while the flight was still going, so a
+            # vehicle that nearly made it outranks one that crashed at once and
+            # EVERY flight is rankable.
+            _s["score"] = _res.soft_time[_s["rows"]]
+            _s["ff"] = _res.finish_frac[_s["rows"]]
+            # time still to run from each decision, for LOSS="time".  1.0 means
+            # the flight never arrived, which is exactly "forever" as far as the
+            # time model is concerned.
+            _s["left"] = _res.finish_frac[_s["rows"]]
             _s["task"] = _s["rows"] % E_T           # P = 1, so the row IS the task
         shards += _sh; res_list.append(_res)
+    # PAIRED CONTROL: the same tasks, the same seed, the same initial states and
+    # sensor noise, flown with the composer MUTED.  What the frozen low level
+    # does unaided is then present in both flights and cancels, so the
+    # difference is what the composer's tokens were worth and nothing else.
+    _ctl, _ = par.run_with_records(TH, goals_it, 5_100_000 + it, stochastic=True,
+                                   record_frac=0.0, difficulty=DIFF, noise=0, mute=True)
+    # FINISH_FRAC, not soft_time.  soft_time accumulates only while a row is
+    # alive, so a flight that crashes at step 100 scores LOWER -- looks faster --
+    # than one that flies 500 steps and arrives; as a paired advantage that
+    # would pay the composer to crash.  finish_frac is 1.0 for anything that
+    # never arrived, which is exactly "took forever".  The reason soft_time was
+    # preferred (failures all tie at 1.0 and cannot be ranked) does not apply
+    # here: the pairing ranks them -- a failure the control also failed scores
+    # 0, one the control won scores -1.
+    _ctl_ff = _ctl.finish_frac.reshape(-1)[:E_T].clone()
+    for _s in shards:
+        _s["adv"] = paired_advantage(_s["ff"], _ctl_ff[_s["task"]])
     t_r = time.time() - t_r
     _cat = lambda f: torch.cat([getattr(_x, f) for _x in res_list])
     res = res_list[0]
@@ -575,7 +757,7 @@ for it in range(1, OUTER + 1):
         kids = whitened_mutation(elite.repeat(2, 1)[: P - P // 2], SIGMA, Pm.P, make_gen(7_000_000 + it))
         TH = torch.cat([elite, kids], 0)
     groups_r, groups_R, n_dec, n_sub = [], [], 0, []
-    groups_task = []
+    groups_task = []; groups_left = []; groups_adv = []
     _Rs, _rows, groups_win, groups_score = [], [], [], []
     for sh in shards:
         if GOAL_ONLY:
@@ -601,10 +783,11 @@ for it in range(1, OUTER + 1):
         gid = sh["rows"] // E_T
         for g in gid.unique():
             m = gid == g; R[:, m] = R[:, m] - R[:, m].mean(1, keepdim=True)
-        groups_r.append(sh["records"]); groups_R.append(R); groups_win.append(sh["win"]); groups_score.append(sh["score"]); groups_task.append(sh["task"]); n_dec += sum(int((r["alive"] & r["tok_keep"]).sum()) if r.get("tok_keep") is not None else int(r["alive"].sum()) for r in sh["records"])   # the samples the update can use
+        groups_r.append(sh["records"]); groups_R.append(R); groups_win.append(sh["win"]); groups_score.append(sh["score"]); groups_task.append(sh["task"]); groups_left.append(sh["left"]); groups_adv.append(sh["adv"]); n_dec += sum(int((r["alive"] & r["tok_keep"]).sum()) if r.get("tok_keep") is not None else int(r["alive"].sum()) for r in sh["records"])   # the samples the update can use
+    sens = _sens(groups_r)                                # free: the batch it just flew
     _join(it)                                             # update k-1 done: gate, publish, then start update k
     if n_dec:
-        holder = {}; th_ = threading.Thread(target=_update, args=(groups_r, groups_R, holder, groups_win, groups_score, groups_task), daemon=True); th_.start()
+        holder = {}; th_ = threading.Thread(target=_update, args=(groups_r, groups_R, holder, groups_win, groups_score, groups_task, groups_left, groups_adv), daemon=True); th_.start()
         pending = (th_, holder)
     st, t_u = st_prev, t_u_prev
     # Every row, not the unrecorded half.  The recorded rows used to explore on
@@ -621,7 +804,8 @@ for it in range(1, OUTER + 1):
     _recent.append(de_r)
     if len(_recent) > DIFF_WINDOW:
         _recent.pop(0)
-    _held = len(_recent) == DIFF_WINDOW and (sum(_recent) / DIFF_WINDOW) >= DIFF_UP_AT
+    _held = (len(_recent) == DIFF_WINDOW and (sum(_recent) / DIFF_WINDOW) >= DIFF_UP_AT
+             and LEG_FIX <= 0 and DIFF_FIX < 0)      # a pinned setting never promotes
     if _held:
         if LEG_I < len(LEG_LADDER) - 1:
             # the inner ladder: longer legs on the scene it already handles
@@ -645,7 +829,7 @@ for it in range(1, OUTER + 1):
     # one.
     row = {"it": it, "diff": flown_diff, "leg": flown_leg, "arrive": tr_r, "crash": tr_c,
            "t_arr": tr_t, "cost": de_cost, "subs": subs, "note": note, "t_r": t_r,
-           "mins": (time.time() - t0) / 60}
+           "mins": (time.time() - t0) / 60, "sens": sens}
     if row_prev is not None:
         _emit(row_prev, st, t_u)
     row_prev = row

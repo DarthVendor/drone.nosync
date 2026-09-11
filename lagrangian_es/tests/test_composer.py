@@ -410,3 +410,113 @@ def test_spec_where_carries_moved_and_the_recorder_survives_frozen_rows():
     roll = Rollout(sysm, tr, task, cfg.rollout, build_sensors(cfg, sysm), composer=comp)
     r = roll.run(tr.init()[None], task.sample(6, make_gen(5)), 6)
     assert torch.isfinite(r.cost).all()
+
+
+def test_error_update_runs_end_to_end_on_real_records():
+    """Exercise the whole path: fly, record, update.
+
+    Three launches died on plumbing rather than design -- a KeyError for a
+    context field the sub-context never carried, and an import of `to_ego` from
+    the wrong module -- each costing a run to discover.  Unit tests on the loss
+    arithmetic caught none of it because they never touched a real record.
+    """
+    import torch
+    from lagrangian_es.composer.policy_cont import error_update
+    from lagrangian_es.config import Config, RolloutCfg
+    from lagrangian_es.es import build, build_composer, build_sensors
+    from lagrangian_es.rollout import Rollout
+    from lagrangian_es.util import make_gen
+    cfg = Config(system="quadrotor_nav", trainable="nav_agent", task="city_tour",
+                 environment="singapore_cbd", sensors=("range",), gating="arrival", seed=0,
+                 composer="policy_cont",
+                 composer_kw=(("reach", 10.0), ("every", 20), ("measure_every", 20)),
+                 task_kw=(("n_legs", 2), ("max_leg", 20.0)),
+                 system_kw=(("free_start", True), ("speed_limit", 5.0)),
+                 trainable_kw=(("learned", True), ("damp_mode", "beams")),
+                 rollout=RolloutCfg(n_eps=8, ep_steps=200, dead_mode="constant",
+                                    dead_cost=40.0, goal_bonus=60.0))
+    system, trainable, task = build(cfg)
+    comp = build_composer(cfg, system, trainable)
+    comp.stochastic = True; comp.records = []; comp.record_rows = torch.arange(8)
+    comp.tok_frac = 1.0
+    comp.reset(8); comp.pair(8, 3)
+    rig = Rollout(system, trainable, task, cfg.rollout, build_sensors(cfg, system), composer=comp)
+    torch.manual_seed(0)
+    with torch.no_grad():
+        rig.run(trainable.init()[None], task.sample(8, make_gen(1)), 2)
+
+    recs = comp.records
+    assert recs, "no decisions were recorded"
+    # the fields the error loss needs must survive to the update
+    with_tok = [r for r in recs if r.get("tok")]
+    assert with_tok, "no scene tokens kept"
+    assert all("x" in r and "goalw" in r for r in with_tok), \
+        "the decision position never reached the record -- the error loss cannot pair decisions"
+
+    before = comp.net.arg_w2.detach().clone()
+    st = error_update(comp.net, recs, reach=10.0, epochs=1, batch=64, lr=1e-3)
+    assert st["n"] > 0, "no decision pairs were formed"
+    assert st["ce"] == st["ce"], "loss is NaN"
+    assert not torch.equal(before, comp.net.arg_w2), "the update changed nothing"
+
+
+def test_time_update_runs_end_to_end_and_is_purely_time():
+    """The loss has one quantity in it: time.
+
+    T_hat(s, g) is the composer's estimate of time-to-goal via subgoal g; T is
+    the time the flight actually took from that decision.  The model is fitted
+    to T, and the policy descends the model.  No distance, no aim, no reward,
+    no labels -- T comes from the flight itself.
+    """
+    import torch
+    from lagrangian_es.composer.policy_cont import time_update
+    from lagrangian_es.config import Config, RolloutCfg
+    from lagrangian_es.es import build, build_composer, build_sensors
+    from lagrangian_es.rollout import Rollout
+    from lagrangian_es.util import make_gen
+    cfg = Config(system="quadrotor_nav", trainable="nav_agent", task="city_tour",
+                 environment="singapore_cbd", sensors=("range",), gating="arrival", seed=0,
+                 composer="policy_cont",
+                 composer_kw=(("reach", 10.0), ("every", 20), ("measure_every", 20)),
+                 task_kw=(("n_legs", 2), ("max_leg", 20.0)),
+                 system_kw=(("free_start", True), ("speed_limit", 5.0)),
+                 trainable_kw=(("learned", True), ("damp_mode", "beams")),
+                 rollout=RolloutCfg(n_eps=8, ep_steps=200, dead_mode="constant",
+                                    dead_cost=40.0, goal_bonus=60.0))
+    system, trainable, task = build(cfg)
+    comp = build_composer(cfg, system, trainable)
+    comp.stochastic = True; comp.records = []; comp.record_rows = torch.arange(8)
+    comp.tok_frac = 1.0
+    comp.reset(8); comp.pair(8, 3)
+    rig = Rollout(system, trainable, task, cfg.rollout, build_sensors(cfg, system), composer=comp)
+    torch.manual_seed(0)
+    with torch.no_grad():
+        r = rig.run(trainable.init()[None], task.sample(8, make_gen(1)), 2)
+
+    before_pol = comp.net.arg_w2.detach().clone()
+    before_mod = comp.net.time_head[-1].weight.detach().clone()
+    st = time_update(comp.net, comp.records, [r.finish_frac], ep_steps=200,
+                     epochs=1, batch=64, lr=1e-3)
+    assert st["n"] > 0, "no decisions carried a measured time"
+    assert st["nll"] == st["nll"] and st["ce"] == st["ce"], "loss is NaN"
+    # BOTH halves must move: the model fitted to measured time, and the policy
+    # descending the model
+    assert not torch.equal(before_mod, comp.net.time_head[-1].weight), "the time model did not learn"
+    assert not torch.equal(before_pol, comp.net.arg_w2), "the policy did not follow the model"
+
+
+def test_the_time_model_conditions_on_the_subgoal():
+    """The existing value head sees only the state, so it cannot say which of
+    two subgoals is quicker -- and that comparison is the whole of navigation.
+    The time head must give different answers for different subgoals."""
+    import torch
+    from lagrangian_es.composer.policy_cont import ContPolicyNet
+    torch.manual_seed(0)
+    net = ContPolicyNet(n_terms=1)
+    q = torch.randn(16, net.time_head[0].weight.shape[1] - 3)
+    near = torch.zeros(16, 3); near[:, 0] = 0.05      # subgoal at the vehicle's feet
+    far = torch.zeros(16, 3); far[:, 0] = 0.95        # subgoal out at the goal
+    with torch.no_grad():
+        t_near = net.time_head(torch.cat([q, near], -1))
+        t_far = net.time_head(torch.cat([q, far], -1))
+    assert not torch.allclose(t_near, t_far), "the time model ignores the subgoal it is scoring"

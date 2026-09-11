@@ -15,6 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
+import math
+
 import torch
 from torch import Tensor
 from torch.func import vmap
@@ -38,6 +40,10 @@ class RolloutResult:
     success: Tensor             # [B]  reached the final waypoint
     legs_done: Tensor           # [B]  waypoints reached, arrival gating only
     finish_frac: Tensor         # [B]  fraction of the episode taken to finish (1 = never)
+    #: [B] soft time away from the goal: (1/T) sum_t sigmoid((|err| - tol)/tol),
+    #: accumulated over the steps the episode was still flying.  Unlike
+    #: `finish_frac` this separates a flight that crashed at once from one that
+    #: nearly made it, so a flight that never arrived can still be ranked.
     saturation: Tensor          # [B]  mean fraction of channels at a bound
     effort: Tensor              # [B]  mean counterforce in the M^-1 metric
     shaping: Tensor             # [B]  mean plant-specific regularizer
@@ -50,6 +56,7 @@ class RolloutResult:
     cost_sub: Tensor = None     # [B]
     fitness_sub: Tensor = None  # [P]
     death_step: Tensor = None   # [B]  step the episode crashed at; ep_steps if it never did
+    soft_time: Tensor = None    # [B]  see the note above finish_frac
 
     def per_genome(self, x: Tensor) -> Tensor:
         """Aggregate an episode-level [B] quantity to a per-genome [P] mean.
@@ -176,8 +183,19 @@ class Rollout:
         # sensor closely enough to attach through the same path, but it is NOT
         # one -- it consumes what the range sensor returned rather than the world
         self.built_map = None
-        self._beam_sen = next((x for x in (sensors or ())
-                               if getattr(x, "kind", "") == "range" and hasattr(x, "_dirs")), None)
+        # The fan that can actually MAP, chosen by geometry rather than by
+        # config order.  `RangeDown` subclasses `RangeSensor` so it reports
+        # kind "range" too, and a straight-down beam has no horizontal
+        # component at all: `end = p + dirs[..., :2] * rng` is the vehicle's own
+        # position, so it would stamp the drone's own cell as occupied on every
+        # scan.  It is only the tuple order in the config that has been keeping
+        # that from happening.
+        def _can_map(x):
+            if getattr(x, "kind", "") != "range" or not hasattr(x, "_dirs"):
+                return False
+            els = getattr(x, "elevations", (0.0,)) or (0.0,)
+            return any(abs(math.cos(float(e))) > 0.1 for e in els)   # not purely vertical
+        self._beam_sen = next((x for x in (sensors or ()) if _can_map(x)), None)
         if getattr(cfg, "built_map", False) and self._beam_sen is not None:
             from .mapping import BuiltMap
             self.built_map = BuiltMap(**dict(getattr(cfg, "built_map_kw", ()) or ()))
@@ -479,13 +497,25 @@ class Rollout:
         """The task layer's state for a batch: the hold, the drone's report
         stream, and the event clock that decides when the composer is asked.
 
-        A token-emitting composer starts from an OPENING action: the straight
-        placement at full reach, applied once at takeoff and written into its
-        chain like any other token.  It is the state the old identity prior
-        gave every flight; silent, the subgoal would be the goal itself, and
-        measured, the low level flown at a 17 m target reaches nothing
-        (0.000 / 0.777) where the reach-limited point reaches 0.26.  From
-        here on every change is the composer's own."""
+        With `comp.opening` set, the composer starts from an OPENING action:
+        the straight placement at full reach, applied once at takeoff and
+        written into its chain like any other token.  It is OFF by default,
+        because it is applied with the argument head -- random at
+        initialisation -- and silence cannot undo it.  Measured on the empty
+        map at 8 m legs: the frozen low level alone arrives 1.000, and a
+        composer forced to say NOTHING arrives 0.000 with exactly 1.0 subgoal
+        and zero crashes.  It flies to that single random waypoint and parks.
+        Every flight was therefore ruined before the composer decided anything,
+        which is why no loss could bootstrap and why arrival sat at 0.000 for
+        every variant tried.
+
+        Off, a silent composer leaves `delta` at zero -- the subgoal IS the
+        goal -- so silence inherits the low level's own competence, and that is
+        the baseline every token the composer emits has to beat.  The 17 m
+        measurement the opening was introduced for (silent 0.000/0.777 against
+        0.26 for a reach-limited point) says a LONG leg needs a waypoint; it
+        does not say one should be placed for the composer, and the curriculum
+        starts at 8 m where the low level needs no help at all."""
         comp, sysm = self.composer, self.system
         x = sysm.task_position(s); B = x.shape[0]
         every = int(getattr(comp, "every", 50))
@@ -497,8 +527,23 @@ class Rollout:
               "t_last": torch.full((B,), -every, dtype=torch.long, device=x.device),
               "n_sub": torch.zeros(B, dtype=torch.long, device=x.device), "leg_last": None,
               "tol": float(getattr(self.task, "tol", 1.0))}
+        # SPARSE INJECTION: ask the composer at exactly `comp.inject` report
+        # steps, drawn uniformly at random per flight, and at no others.  Every
+        # other report leaves the spec alone, so an uninjected flight is silent
+        # -- `delta` stays zero, the subgoal IS the goal, and the flight
+        # inherits the low level's own competence.  One intervention per flight
+        # makes the whole outcome attributable to that one token instead of
+        # smearing it over ~90 decisions that differ by 3 against a spread of
+        # 241.  Drawn without replacement so the n steps are distinct.
+        n_inj = int(getattr(comp, "inject", 0) or 0)
+        if n_inj > 0:
+            m = cs["m_every"]
+            n_rep = max(1, int(self.cfg.ep_steps) // max(m, 1))
+            g = make_gen(int(self._crn[1]) + 8_311_771 if getattr(self, "_crn", None) else 8_311_771)
+            pick = torch.rand(B, n_rep, generator=g).argsort(dim=1)[:, :min(n_inj, n_rep)]
+            cs["inject_at"] = (pick.to(x.device) * m).to(torch.long)
         vocab = getattr(getattr(comp, "net", None), "vocab", None)
-        if goal is not None and vocab is not None and hasattr(comp, "_apply"):
+        if getattr(comp, "opening", False) and goal is not None and vocab is not None and hasattr(comp, "_apply"):
             ctx = self._context(s, goal, {}, torch.ones(B, dtype=torch.bool, device=x.device),
                                 torch.zeros(B, dtype=torch.bool, device=x.device), torch.zeros(B, dtype=torch.long, device=x.device), 0)
             ctx["spec"] = cs["hold"].target
@@ -559,30 +604,68 @@ class Rollout:
                 # not the composer's move, so it is not slewed
                 cs["jumped"] = j if cs.get("jumped") is None else (cs["jumped"] | j)
         cs["goal_prev"] = goal.clone()
-        if t % m_every == 0:
+        # A BEAM CAN INTERRUPT.  Decisions used to fire only on the report
+        # clock, so a fan that saw a wall at step 7 could not change the
+        # waypoint until step 20 -- 1.3 m of travel at 5 m/s against a 6 m
+        # sensing range, a fifth of the horizon spent flying at something it had
+        # already seen.  A row whose nearest return falls inside `beam_trigger`
+        # metres decides at once.  `trigger_gap` steps must have passed since
+        # that row last decided, or a wall held in view would re-fire every
+        # step and the chain would fill with duplicates.
+        alarm = None
+        trig = float(getattr(comp, "beam_trigger", 0.0) or 0.0)
+        # no beam interrupt while injecting: the injected steps are the ONLY
+        # decisions, or the count per flight would not be the injected one
+        if trig > 0.0 and cs.get("inject_at") is None and getattr(self, "_last_obs", None):
+            # the FORWARD ring, not anything whose name starts with "range".
+            # `range_down` points at the floor and reads ~1.5 m for the whole
+            # flight, so matching it made the alarm permanently true: every row
+            # re-decided every `trigger_gap` steps and arrival went to 0.000.
+            rng = self._last_obs.get("range")
+            if not (torch.is_tensor(rng) and rng.ndim == 2):
+                rng = next((v for k, v in self._last_obs.items()
+                            if k.startswith("range") and not k.endswith("_down")
+                            and torch.is_tensor(v) and v.ndim == 2), None)
+            if rng is not None:
+                gap = int(getattr(comp, "trigger_gap", 4))
+                alarm = (rng.min(dim=1).values < trig) & (t - cs["t_last"] >= gap)
+        fired = alarm is not None and bool((alarm & alive & ~arrived).any())
+        if t % m_every == 0 or fired:
+            report = (t % m_every == 0)
             if cs["leg_last"] is None:
                 cs["leg_last"] = leg.clone()
             live = alive & ~arrived
+            _inj = cs.get("inject_at")
+            if _inj is not None:                  # only this row's injected steps
+                live = live & (_inj == t).any(dim=1)
+            if alarm is not None:
+                alarm = alarm & live
             if getattr(comp, "monitors", False):
                 # a token-emitting composer is asked at EVERY report about every
                 # live row, and decides for itself what, if anything, changes
-                if bool(live.any()):
-                    spec = self._emit_live(comp, s, goal, alive, arrived, leg, t, hold, rows=live)
-                    hold.set_target(spec, rows=live)
-                    moved = live if spec.moved is None else (live & spec.moved)
+                # on a report every live row is asked; between reports only
+                # the rows a beam interrupted
+                rows_ = live if report else alarm
+                if bool(rows_.any()):
+                    spec = self._emit_live(comp, s, goal, alive, arrived, leg, t, hold, rows=rows_)
+                    hold.set_target(spec, rows=rows_)
+                    moved = rows_ if spec.moved is None else (rows_ & spec.moved)
                     self._snap_jumped(cs, hold, moved)                  # the next PLACEMENT snaps, not the next report
                     cs["n_sub"] += moved.to(cs["n_sub"].dtype)
+                    cs["t_last"] = torch.where(rows_, torch.full_like(cs["t_last"], t), cs["t_last"])
             else:
                 placed = hold.target.delta
                 achieved = ((x - (goal + placed)).norm(dim=-1) < cs["tol"]) & (placed.norm(dim=-1) > cs["tol"])
-                due = live & (achieved | (t - cs["t_last"] >= every) | (leg != cs["leg_last"]))
+                due = live & (achieved | (t - cs["t_last"] >= every) | (leg != cs["leg_last"])) \
+                    if report else alarm
                 if bool(due.any()):
                     spec = self._emit_live(comp, s, goal, alive, arrived, leg, t, hold, rows=due)
                     hold.set_target(spec, rows=due)
                     self._snap_jumped(cs, hold, due if spec.moved is None else (due & spec.moved))
                     cs["t_last"] = torch.where(due, torch.full_like(cs["t_last"], t), cs["t_last"])
                     cs["n_sub"] += due.to(cs["n_sub"].dtype)
-            cs["leg_last"] = leg.clone()
+            if report:                       # a beam interrupt is not a new report
+                cs["leg_last"] = leg.clone()
         return hold.step()
 
     @staticmethod
@@ -695,6 +778,19 @@ class Rollout:
         # continuous through an arrival and only flying the tour lowers it.
         to_go_tab = self._to_go(goals_b) if arrival else None
         finish = torch.full((B,), float(T), dtype=sysm.dtype, device=sysm.device)
+        # SOFT TIME: how long the vehicle spent NOT at the goal, counted with a
+        # soft edge instead of a threshold.
+        #
+        #     t_soft = (1/T) sum_t sigmoid((|err_t| - tol) / beta)
+        #
+        # `finish_frac` is 1.0 for every flight that did not arrive, so a
+        # vehicle that crashed on takeoff and one that hovered 30 cm short score
+        # IDENTICALLY -- failures are unrankable, which is why the imitation
+        # filter could only give them weight zero and could never push the
+        # failure rate down.  This ranks them: it falls as the vehicle spends
+        # time near the goal, whether or not it ever satisfies the dwell test.
+        soft = torch.zeros(B, dtype=sysm.dtype, device=sysm.device)
+        _beta = max(float(getattr(task, "tol", 1.0)), 1e-6)   # one tolerance of softness
         # The final leg never advances `leg`, so its arrival test keeps firing for
         # every step the vehicle sits inside tol -- paying the bonus per step
         # would make hovering on the goal an unbounded reward.  Credit it once.
@@ -764,6 +860,13 @@ class Rollout:
             self._ver = self._ver + moved.long()   # see `_measure`
 
             err = sysm.task_position(s) - goal
+            # accumulated on the LIVING only: a frozen episode (crashed or
+            # arrived) is bit-identical to the step before, and charging it
+            # again would count the same instant many times over
+            soft = soft + torch.where(
+                alive & ~arrived,
+                torch.sigmoid((torch.linalg.vector_norm(err, dim=-1) - float(getattr(task, "tol", 1.0))) / _beta),
+                torch.zeros_like(soft))
             pos = task.position_cost(sysm.task_position(s), goal,
                                      cfg.pos_eps)
             if to_go_tab is not None:
@@ -993,6 +1096,7 @@ class Rollout:
                     else (task.success(s, final_goal) & alive),
             legs_done=leg + done.to(leg.dtype),
             finish_frac=finish / T,
+            soft_time=soft / T,
             saturation=sat / T,
             effort=eff_acc / T,
             shaping=shp_acc / T,

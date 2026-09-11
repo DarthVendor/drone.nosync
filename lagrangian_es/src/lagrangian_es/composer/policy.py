@@ -73,6 +73,47 @@ class PolicyComposer(TransformerComposer):
         # already corrects for the behaviour distribution by importance
         # weight, so this changes what is sampled, not what is estimated.
         self.explore_balance = bool(kw.pop("explore_balance", False))
+        # THE SCRIPTED OPENING, off by default.  `Rollout._composer_start` used
+        # to place a `vocab.straight` WAYPOINT at takeoff unconditionally,
+        # built by the argument head -- which at initialisation is random.
+        # Silence then could not undo it: measured on the empty map at 8 m
+        # legs, the frozen low level alone arrives 1.000, and a composer forced
+        # to say NOTHING arrives 0.000 with exactly 1.0 subgoal and zero
+        # crashes -- it flies to that one random waypoint and parks there.  So
+        # no loss could bootstrap: every flight was ruined before the composer
+        # made a single decision of its own.  With it off, saying nothing
+        # leaves `delta` at zero, which IS the goal, and silence inherits the
+        # low level's own competence as the baseline the composer must beat.
+        self.opening = bool(kw.pop("opening", False))
+        # SPARSE INJECTION.  0 asks the composer at every report (~90 decisions
+        # a flight); n > 0 asks it at exactly n report steps drawn uniformly at
+        # random per flight, and at no others.  The point is CREDIT: with one
+        # intervention per flight the whole outcome attributes to that one
+        # token, against a baseline of flights that were otherwise silent --
+        # instead of being smeared across ~90 decisions that differ by 3
+        # against a spread of 241.  It only means anything with `opening` off,
+        # since otherwise every flight carries a random waypoint regardless.
+        self.inject = int(kw.pop("inject", 0))
+        # SPEAK FLOOR: with this probability a decision is forced to open on a
+        # WAYPOINT -- the only token that moves the subgoal.  Silence is an ABSORBING
+        # state under per-decision credit -- `progress_weights` credits only a
+        # decision that placed a subgoal, so once the policy stops placing
+        # there are no samples, the loss is nan and no gradient exists to find
+        # its way back.  Measured: on the empty map the composer went subgoals
+        # 0.3 -> 0.0 and tokens 18 -> 0 by iteration 38 and never recovered.
+        # `explore_eps` cannot do this job: it mixes UNIFORMLY over the whole
+        # vocabulary, EOS included, so it cannot guarantee speech.  This is a
+        # floor on the behaviour distribution only -- the update still scores
+        # whatever comes out by its outcome, so a forced token that hurts is
+        # pushed down like any other.
+        self.speak_floor = float(kw.pop("speak_floor", 0.0))
+        # MUTE: every decision is a bare EOS.  This is the CONTROL half of the
+        # paired counterfactual -- the same task, the same seed, the same
+        # initial state, flown by the frozen low level with the composer saying
+        # nothing.  The difference in outcome between a muted flight and its
+        # injected twin is what an emitted token is worth, and it is the only
+        # credit signal in the update now.
+        self.mute = bool(kw.pop("mute", False))
         self._tok_count = None
         self._tok_decay = float(kw.pop("explore_decay", 0.5))   # counts kept across ~2 batches
         super().__init__(system, trainable, **kw)

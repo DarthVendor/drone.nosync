@@ -135,14 +135,18 @@ def _init(spec: dict) -> None:
 def _work(payload):
     TH, goals, seed = payload[:3]
     TH, goals = _tensor(TH), _tensor(goals)
-    stochastic, record_frac, shard, difficulty, noise = \
-        (tuple(payload[3:]) + (False, 0.0, 0, None, 0))[:5] if len(payload) > 3 \
-        else (False, 0.0, 0, None, 0)
+    stochastic, record_frac, shard, difficulty, noise, mute = \
+        (tuple(payload[3:]) + (False, 0.0, 0, None, 0, False))[:6] if len(payload) > 3 \
+        else (False, 0.0, 0, None, 0, False)
     if difficulty is not None and hasattr(_RIG.system, "difficulty"):
         # a curriculum on the scene: the fraction of obstacles left active this
         # batch, set on the worker's own plant (the pool is forked once)
         _RIG.system.difficulty = float(difficulty)
     comp = getattr(_RIG, "composer", None)
+    if comp is not None:
+        # THE CONTROL HALF of the paired counterfactual: the same task, the
+        # same seed, the same initial state, the composer saying nothing.
+        comp.mute = bool(mute)
     if comp is not None and hasattr(comp, "stochastic"):
         # Reload the composer's weights if the file changed since this worker
         # last read it.  The pool is forked ONCE, before the parent does any
@@ -171,7 +175,7 @@ def _work(payload):
               file=sys.stderr, flush=True)
     base = (r.fitness, r.cost, r.alive, r.leg_err, r.final_err, r.success,
             r.legs_done, r.finish_frac, r.saturation, r.effort, r.shaping, r.n_eps,
-            r.cost_sub, r.fitness_sub, r.death_step)
+            r.cost_sub, r.fitness_sub, r.death_step, r.soft_time)
     if comp is None or record_frac <= 0 or not getattr(comp, "records", None):
         return _ipc(base + (None,))
     # Slim the composer's records to a fraction of rows, in float32: the
@@ -200,7 +204,7 @@ def _work(payload):
                      # the Gaussian that drew it.  Absent for the token
                      # composer, so this stays None there.
                      **{k: (rc[k][keep] if torch.is_tensor(rc[k]) and rc[k].shape[:1] == r.shape[:1] else rc[k])
-                        for k in ("u", "n_args", "mu", "log_std") if k in rc},
+                        for k in ("u", "n_args", "mu", "log_std", "x", "goalw") if k in rc},
                      "tok": {k: (v[keep_t].float() if torch.is_tensor(v) and v.is_floating_point()
                                  else (v[keep_t] if torch.is_tensor(v) else v)) for k, v in rc["tok"].items()}})
     chain = [{k: (v[sel] if torch.is_tensor(v) else v) for k, v in tok.items()} for tok in _RIG.chain]
@@ -273,7 +277,7 @@ def _merge(parts, order=None) -> RolloutResult:
         final_err=cat(4), success=cat(5), legs_done=cat(6), finish_frac=cat(7),
         saturation=cat(8), effort=cat(9), shaping=cat(10),
         n_eps=parts[0][11] if order is None else sum(p[11] for p in parts),
-        cost_sub=opt(12), fitness_sub=opt(13), death_step=opt(14))
+        cost_sub=opt(12), fitness_sub=opt(13), death_step=opt(14), soft_time=opt(15))
 
 
 def _records(parts, step: int, n_eps: int, order=None):
@@ -283,8 +287,8 @@ def _records(parts, step: int, n_eps: int, order=None):
     out = []
     parts = [_from_ipc(p) for p in parts]
     for i, p in enumerate(parts):
-        if len(p) > 15 and p[15] is not None:
-            rec = dict(p[15])
+        if len(p) > 16 and p[16] is not None:
+            rec = dict(p[16])
             rec["rows"] = (rec["rows"] + i * step * n_eps) if order is None else order[i][rec["rows"]]
             out.append(rec)
     return out
@@ -469,7 +473,7 @@ class ParallelRollout:
 
     def run_with_records(self, TH: Tensor, goals: Tensor, seed: int,
                          stochastic: bool = True, record_frac: float = 0.125, difficulty=None,
-                         noise: int = 0):
+                         noise: int = 0, mute: bool = False):
         """`run`, and the composer's recorded decisions from every shard.
 
         For co-training: the GA ranks every flight from the merged result while
@@ -478,7 +482,7 @@ class ParallelRollout:
         P, E = TH.shape[0], goals.shape[0]
         axis, n = self._plan(P, E, cap=True)
         chunks, order, step = self._chunks(TH, goals, seed, axis, max(n, 1))
-        chunks = [c + (stochastic, record_frac, i, difficulty, noise) for i, c in enumerate(chunks)]
+        chunks = [c + (stochastic, record_frac, i, difficulty, noise, mute) for i, c in enumerate(chunks)]
         parts = self._pool_map(chunks) if n > 1 else [_work_local(self._local_rig(), chunks[0])]
         return _merge(parts, order), _records(parts, step, E, order)
 

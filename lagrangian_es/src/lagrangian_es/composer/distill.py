@@ -89,8 +89,20 @@ def collate(samples: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
         out["ent_types"][i, :n] = s["ent_types"]
         m = s["chain"].shape[0]
         if m:
-            out["chain"][i, :m] = s["chain"]; out["chain_types"][i, :m] = s["chain_types"]
-            out["chain_mask"][i, :m] = s["chain_mask"] if "chain_mask" in s else False
+            # LEFT-pad the chain, so position -1 is always that row's most
+            # recent entry.  `read_out` takes `ch[:, -1:]` as "the latest chain
+            # state"; right-padding made that a PADDED slot for any row shorter
+            # than the batch maximum, so its chain summary was computed from a
+            # zero embedding instead of its real last event.  Rollouts never
+            # showed it -- every row has the same chain length there, so nothing
+            # is padded -- but the update collates records from different times,
+            # so the net saw one representation in flight and another while
+            # learning.  Measured as a constant 7.1e-04 shift in the logits,
+            # independent of how much padding, which is the signature of a
+            # structural error rather than leaked content.
+            out["chain"][i, kc - m:] = s["chain"]
+            out["chain_types"][i, kc - m:] = s["chain_types"]
+            out["chain_mask"][i, kc - m:] = s["chain_mask"] if "chain_mask" in s else False
     return out
 
 

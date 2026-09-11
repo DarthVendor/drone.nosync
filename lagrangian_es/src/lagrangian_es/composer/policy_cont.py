@@ -27,6 +27,7 @@ from torch import Tensor, nn
 from .actions_cont import PHI_MAX, ContVocab, entropy as cont_entropy, log_prob as cont_log_prob
 from .base import COMPOSERS
 from .policy import PolicyComposer, PolicyNet, collate_tok
+from .tokens import drop_oldest_event
 from .transformer import ACT_SCALE, INSTR
 
 
@@ -105,6 +106,24 @@ class ContPolicyNet(PolicyNet):
         # and there is nothing left to select among.  Holding it constant keeps
         # the exploration the imitation depends on, and it is the exploration,
         # since nothing is injected on top.
+        # TIME MODEL: how long to the goal if the vehicle goes via subgoal `g`.
+        # The existing value head sees only the state, so it cannot say whether
+        # one subgoal is quicker than another -- and that comparison is the
+        # whole of navigation.  This one takes the read-out AND the subgoal.
+        # Trained on the time actually measured, it is the only differentiable
+        # path from a subgoal to a time, and the only reason perception becomes
+        # necessary: nothing but the beams explains why a subgoal on the far
+        # side of a building takes forever.
+        #: Add the goal bearing/elevation to the WAYPOINT's arguments by hand.
+        #: OFF.  Measured on a trained composer at 100% buildings, it supplied
+        #: 99.9% of theta's variation and 99.7% of phi's, leaving the network
+        #: deciding 0.0004 of a quantity that moved by 0.775 -- which is why
+        #: perception had no effect on the output despite being linearly
+        #: recoverable from the read-out at R^2 0.852.  The network now has to
+        #: learn where the goal is from the goal token, like everything else.
+        self.goal_residual = False
+        self.time_head = nn.Sequential(nn.Linear(d + 3, d), nn.GELU(),
+                                       nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1))
         self.log_std = nn.Parameter(torch.full((k,), math.log(0.12)),
                                     requires_grad=False)
         # A remembered instruction IS its type together with its arguments.
@@ -117,39 +136,54 @@ class ContPolicyNet(PolicyNet):
         self.argin_w = nn.Parameter(torch.randn(V, k, d) * 0.02)
         self.argin_b = nn.Parameter(torch.zeros(V, d))
         nn.init.normal_(self.act_emb.weight, std=0.02)
-        nn.init.zeros_(self.head_act[-1].weight)      # the prior lives in the last layer's bias
+        # SMALL, NOT ZERO -- the same trap `arg_w2` was in.  The prior lives in
+        # this layer's bias, and zeroing the WEIGHT put the prior in place at
+        # the cost of the gradient to everything beneath it: d(logits)/d(layer
+        # below) is proportional to this weight, so at exactly zero the body and
+        # the per-type sensor encoders got no gradient through the token path at
+        # all.  Both heads were zeroed, so at initialisation the scene encoder
+        # received nothing from either route.
+        #
+        # This head tolerates a much larger init than `arg_w2` did, because its
+        # prior is a 2.0-logit gap between EOS and WAYPOINT rather than a
+        # tanh-squashed value: measured on realistic tokens, this scale moves
+        # `speak` from 0.125 to 0.114 while taking the gradient reaching
+        # `head_act[0]` from 0 to 4.1e-01.  It also starts where the old run's
+        # head took 578 iterations to reach (|w| 0.023 against 0.025).
+        nn.init.normal_(self.head_act[-1].weight, std=0.5 * (1.0 / self.head_act[-1].weight.shape[1]) ** 0.5)
         with torch.no_grad():
-            # The prior is SILENCE, as in the token composer: the subgoal stays
-            # at the goal, which is the bare controller flying the straight
-            # line, and everything the composer does is a learned deviation
-            # from it.  A fresh head that spoke every report killed every
-            # flight the first time this was tried.
-            self.head_act[-1].bias.zero_()
-            self.head_act[-1].bias[self.vocab.EOS] = 6.0
-            self.head_act[-1].bias[self.vocab.WAYPOINT] = 4.0
-            # r: NOT at its maximum.  A bias of 2.0 put the subgoal on the goal,
-            # which is the identity and reads as the right prior, but tanh(2.0)
-            # sits in the flat region -- slope 0.07 instead of 1.0.  Measured
-            # over 27,088 decisions, 100% of them landed there, the sampled
-            # range of r collapsed to 0.017, and every flight emitted r = 0.963
-            # to three decimals.  The braking end of the lever (r = -1, a full
-            # stop) was 17 standard deviations away and was never sampled once,
-            # so no filter could select it and no imitation could learn it.
+            # NO HAND-SET PRIORS.  Both heads start flat and the network decides
+            # everything: whether to speak, how far out to place, in what
+            # direction.  What was here before, and why it went:
             #
-            # 0.7 puts the waypoint at ~80% of the distance to the goal -- still
-            # essentially the straight line, since it re-decides every 0.4 s --
-            # while the slope rises to 0.63 and the reachable range of r by a
-            # factor of six.  A prior that cannot be moved is worse than a prior
-            # that is slightly off.
-            # only the WAYPOINT's own r slot; every other token starts at zero
+            #   head bias EOS 6.0 / WAYPOINT 4.0 -- silence as the default, so
+            #     an untrained composer was nearly harmless (0.977 against 0.992
+            #     for no composer at 8 m legs).
+            #   arg_b2[WAYPOINT, 0] = 0.7 -- the subgoal at ~80% of the way.
+            #     Earlier it was 2.0, which read as the right answer (the
+            #     identity) but sat at tanh slope 0.07: over 27,088 decisions
+            #     every flight emitted r = 0.963 to three decimals and the
+            #     braking end was 17 sigma away, never sampled once.
+            #
+            # Both were judgements about what the vehicle should want, and the
+            # decomposition showed what that cost: the network was deciding
+            # 0.1% of theta and 0.3% of phi, with the rest supplied by hand.
+            # A composer that cannot choose its own behaviour cannot learn to
+            # base it on what it sees.
+            self.head_act[-1].bias.zero_()
             self.arg_b2.zero_()
-            self.arg_b2[self.vocab.WAYPOINT, 0] = 0.7   # tanh(0.7)=0.60 -> 80% of the radius
 
     def _chain_in(self, tok):
         """The chain embedding, with an instruction's ARGUMENTS folded into the
         token's own vector rather than left as bare numbers in shared slots."""
         from .transformer import ACT_SCALE, INSTR
-        ch = self.embed(tok["chain"]) + self.type_emb(tok["chain_types"])
+        # `embed_typed`, NOT the old shared `self.embed`.  This override
+        # shadowed the base class, so while `encode_scene` was moved onto the
+        # per-type encoders the CHAIN -- the drone's measurement stream and the
+        # composer's own instruction history -- was still going through the one
+        # 576-parameter Linear the per-type encoders replaced.  Half the input
+        # path was left on the old encoder by an override nobody re-read.
+        ch = self.embed_typed(tok["chain"], tok["chain_types"]) + self.type_emb(tok["chain_types"])
         is_i = (tok["chain_types"] == INSTR)
         ids = (tok["chain"][..., 0] * ACT_SCALE).round().long().clamp(0, self.vocab.V - 1)
         k = self.vocab.n_args
@@ -189,10 +223,25 @@ class ContPolicyNet(PolicyNet):
         # each residual belongs to the WAYPOINT's own slot and nowhere else, so
         # a turn or a priority move is not offset by where the goal is
         mu = mu.clone()
-        mu[:, self.vocab.WAYPOINT, 1] = mu[:, self.vocab.WAYPOINT, 1] + \
-            torch.atanh(bearing.clamp(-0.999, 0.999))
-        mu[:, self.vocab.WAYPOINT, 2] = mu[:, self.vocab.WAYPOINT, 2] + \
-            torch.atanh(elev.clamp(-0.999, 0.999))
+        if self.goal_residual:
+            # MEASURED, on a trained composer at 100% buildings: with these
+            # residuals on, the network decides 0.1% of theta and 0.3% of phi.
+            # The rest is this arithmetic -- a hand-written function of the goal,
+            # recomputed every forward pass, that no amount of training can
+            # remove.  theta varies by 0.775 across states and the head
+            # contributes 0.0004 of it.  That is why perception has no effect on
+            # the output despite being linearly recoverable from the read-out at
+            # R^2 0.852: the output hardly depends on the NETWORK at all, so it
+            # cannot depend on what the network sees.
+            #
+            # Off, the head must learn the bearing from the goal token itself.
+            # It starts far worse -- the untrained composer no longer aims at
+            # anything -- but every part of the output is then something the
+            # network computes, and perception can compete on equal terms.
+            mu[:, self.vocab.WAYPOINT, 1] = mu[:, self.vocab.WAYPOINT, 1] + \
+                torch.atanh(bearing.clamp(-0.999, 0.999))
+            mu[:, self.vocab.WAYPOINT, 2] = mu[:, self.vocab.WAYPOINT, 2] + \
+                torch.atanh(elev.clamp(-0.999, 0.999))
         return self.head_act(q), mu, self.value(q).squeeze(-1)
 
 
@@ -200,6 +249,16 @@ class ContComposer(PolicyComposer):
     """Samples `[type, arguments]` per component and records both."""
 
     kind = "policy_cont"
+    #: A beam return closer than this (metres) makes the row decide AT ONCE,
+    #: without waiting for the report clock.  Decisions used to fire only every
+    #: `measure_every` steps, so a fan that saw a wall at step 7 could not move
+    #: the waypoint until step 20 -- 1.3 m at 5 m/s against a 6 m sensing range.
+    #: Seeing an obstacle and being unable to act on it for a fifth of the
+    #: horizon is the one thing a reactive navigator must not do.
+    beam_trigger = 1.5
+    #: steps that must pass since a row last decided, or a wall held in view
+    #: re-fires every step and the chain fills with duplicates
+    trigger_gap = 4
 
     def __init__(self, system, trainable, **kw):
         super().__init__(system, trainable, **kw)
@@ -308,8 +367,8 @@ class ContComposer(PolicyComposer):
                     cmask = torch.cat([tok["chain_mask"],
                                        torch.zeros(n, 1, dtype=torch.bool, device=ch.device)], 1)
                     kc = self.tok.kc
-                    if chain.shape[1] > kc:
-                        chain, ctypes, cmask = chain[:, -kc:], ctypes[:, -kc:], cmask[:, -kc:]
+                    while chain.shape[1] > kc:
+                        chain, ctypes, cmask = drop_oldest_event(chain, ctypes, cmask)
                     tok["chain"], tok["chain_types"], tok["chain_mask"] = chain, ctypes, cmask
                     sc = (scene0[0][idx], scene0[1][idx])
                 self._rows = ids_full[idx]
@@ -318,7 +377,10 @@ class ContComposer(PolicyComposer):
                     forced = torch.full_like(logits, float("-inf"))
                     forced[:, V.EOS] = 0.0
                     logits = forced
-                ctx_s = {"alive": alive0[idx], "t": t_now}
+                # `x` and `goal` travel with the sub-context for the error
+                # loss: the composer's output is a claim about where the vehicle
+                # can get, and the error needs the position it claimed FROM.
+                ctx_s = {"alive": alive0[idx], "t": t_now, "x": x[idx], "goal": goal[idx]}
                 act, u = choose(logits, mu, tok, ctx_s, ids_full[idx], step, has[idx])
                 arg = V.squash(u)
                 V.step(act, arg, out, pend, has, psi, rows=idx)
@@ -365,6 +427,39 @@ class ContComposer(PolicyComposer):
                 mix = torch.log((1.0 - eps) * torch.softmax(logits, -1) + eps / V)
                 mix = torch.where(torch.isfinite(logits), mix, logits)
                 b_logits = torch.where(rec[:, None], mix, logits)
+            # SPEAK FLOOR.  With probability `speak_floor` a decision may not
+            # OPEN on EOS, so it has to say at least one thing; the components
+            # after the first are untouched, so the chain still ends when the
+            # policy wants it to.  This exists because silence is ABSORBING:
+            # `progress_weights` credits only a decision that placed a subgoal,
+            # so a policy that has stopped placing produces no samples at all
+            # and no gradient can bring it back (measured: subgoals 0.3 -> 0.0,
+            # tokens 18 -> 0 by iteration 38, and flat thereafter).  It biases
+            # only what is SAMPLED; the update still judges whatever comes out
+            # by the flight's outcome, so a forced token that hurts is pushed
+            # down exactly like a volunteered one.
+            if getattr(self, "mute", False):        # the control: say nothing
+                b_logits = torch.full_like(b_logits, -1e9)
+                b_logits[:, self.net.vocab.EOS] = 0.0
+            p_sp = float(getattr(self, "speak_floor", 0.0))
+            if self.stochastic and p_sp > 0.0 and step == 0:
+                force = torch.rand(B, device=dev) < p_sp
+                if bool(force.any()):
+                    # PIN THE FORCED TOKEN TO WAYPOINT, not merely "not EOS".
+                    # Excluding EOS alone does not help once the policy has
+                    # collapsed onto one of the other types: measured, it went
+                    # to heading 100% / place 0% by judge 40, so forcing
+                    # non-silence just forced more TURN and the update still
+                    # never saw a placement.  WAYPOINT is the only token that
+                    # moves the subgoal, so it is the one that has to be kept
+                    # in the sample if the update is ever to learn whether
+                    # placing helps.  The ARGUMENTS are still drawn from the
+                    # policy's own mu and std, so where it places is explored
+                    # rather than dictated.
+                    row = torch.full((b_logits.shape[-1],), float("-inf"),
+                                     dtype=b_logits.dtype, device=dev)
+                    row[self.net.vocab.WAYPOINT] = 0.0
+                    b_logits = torch.where(force[:, None], row[None].expand_as(b_logits), b_logits)
             temp = float(getattr(self, "temperature", 1.0))
             std = self.net.log_std.exp().to(mu.dtype) * temp
             rows_ = torch.arange(B, device=dev)
@@ -394,6 +489,12 @@ class ContComposer(PolicyComposer):
                     "mu": mu[rec].float().clone(),
                     "log_std": self.net.log_std.detach().float().clone(),
                     "alive": ctx_s["alive"][rec].clone(), "rows": ids[rec].clone(),
+                    # WHERE THE VEHICLE WAS, for the error loss.  The composer's
+                    # output is a claim about where the drone can be by the next
+                    # decision; the error needs the position it started from and
+                    # the one it reached, and nothing else supplies them.
+                    "x": ctx_s["x"][rec].float().clone(),
+                    "goalw": ctx_s["goal"][rec].float().clone(),
                     "tok_keep": None,
                     "tok": {k: (v[rec].clone() if torch.is_tensor(v) and v.ndim and v.shape[0] == B
                                 else (v.clone() if torch.is_tensor(v) else v)) for k, v in tok.items()}})
@@ -403,7 +504,8 @@ class ContComposer(PolicyComposer):
 
 
 def arrival_weights(t: Tensor, task: Optional[Tensor] = None, tau: float = 1.0,
-                    signed: bool = False, w_max: float = 2.0) -> Tensor:
+                    signed: bool = False, w_max: float = 2.0,
+                    arrived: Optional[Tensor] = None) -> Tensor:
     """A weight per flight from its arrival time `t` (`finish_frac`; 1.0 = never).
 
     `task` says which flights flew the SAME task, and its absence is the whole
@@ -443,7 +545,13 @@ def arrival_weights(t: Tensor, task: Optional[Tensor] = None, tau: float = 1.0,
             grouped = True
     if not grouped:
         a = a - a.mean()
-    arr = t < 1.0                                    # arrived at all
+    # Which flights arrived, stated rather than inferred.  `t == 1.0` used to
+    # mean "never arrived" because the score was `finish_frac`; with SOFT TIME
+    # as the score that sentinel is gone -- 0.99 is a flight that spent nearly
+    # the whole episode away from the goal, not a failure -- so the caller
+    # passes the flag.  Only the unsigned path needs it: signed weighting ranks
+    # failures too, which is the point of soft time.
+    arr = (arrived.to(torch.bool) if arrived is not None else (t < 1.0))
     # SCALE ON THE ROWS THAT CARRY WEIGHT.  A flight that never arrived sits at
     # finish_frac 1.0, far above any real arrival time, and unsigned weighting
     # gives it zero weight -- but it was still inflating the spread everything
@@ -464,12 +572,305 @@ def arrival_weights(t: Tensor, task: Optional[Tensor] = None, tau: float = 1.0,
     return w
 
 
+def _subgoal_ego(net: ContPolicyNet, mu: Tensor, g_ego: Tensor) -> Tensor:
+    """The commanded subgoal in the vehicle frame, in REACH units, differentiably.
+
+    The same spherical geometry `ContVocab.finish` uses, rebuilt here from the
+    head's mean so the error can be pushed back into it.  No sampling: this is
+    where the policy is POINTING, which is the thing the error is about.
+    """
+    from .actions_cont import PHI_MAX
+    a = torch.tanh(mu)                                   # [n, k] squashed arguments
+    L0 = g_ego.norm(dim=-1)
+    radius = L0.clamp(max=1.0)
+    r = (a[:, 0] + 1.0) * 0.5 * radius
+    theta = math.pi * a[:, 1]
+    phi = PHI_MAX * a[:, 2] if a.shape[-1] > 2 else torch.zeros_like(theta)
+    cphi = torch.cos(phi)
+    return torch.stack([r * cphi * torch.cos(theta), r * cphi * torch.sin(theta),
+                        r * torch.sin(phi)], -1)
+
+
+def time_update(net: ContPolicyNet, records: List[Dict], t_left: List[Tensor],
+                ep_steps: int = 1800, epochs: int = 2, batch: int = 1024, lr: float = 1e-4,
+                opt=None, max_samples: int = 0, policy_w: float = 0.25) -> Dict[str, float]:
+    """PURELY TIME.  Nothing else appears in it.
+
+        T_hat(s, g)   the composer's own estimate of time-to-goal via subgoal g
+        T             the time the flight actually took from that decision on
+
+        L_model  = (T_hat(s, g_emitted) - T)^2      learn the time model
+        L_policy = T_hat(s, g(theta))               choose the quickest subgoal
+
+    Measured time cannot be differentiated with respect to the subgoal -- it
+    comes out of the simulator -- and a hand-written prediction (distance over
+    speed) is blind to obstacles.  Putting the prediction in a NETWORK resolves
+    both: d(T_hat)/dg is exact so the policy can descend it, and T_hat only
+    becomes accurate by reading the beams, because nothing else explains why a
+    subgoal behind a building takes forever.  Perception stops being optional --
+    it is the only thing that predicts time.
+
+    The degeneracies that sank the other formulations close by themselves, with
+    no balancing term:
+
+      subgoal at the vehicle's own feet -> no progress -> time maximal -> the
+        model learns it -> the policy avoids it
+      subgoal through a building -> the flight never arrives -> time maximal
+
+    A crash needs no penalty term either: a crash IS infinite time to the goal.
+
+    The risk is the usual one for descending a learned model: the policy can
+    find where T_hat is optimistically wrong.  `match` reports the signed
+    model error for exactly that -- if it drifts negative, the model is being
+    gamed and the policy step is too large relative to the fit.
+    """
+    groups = records if (records and isinstance(records[0], list)) else [records]
+    lefts = list(t_left) if isinstance(t_left, (list, tuple)) else [t_left]
+    toks, tt = [], []
+    for gi, recs in enumerate(groups):
+        left = lefts[gi] if gi < len(lefts) else None
+        if left is None:
+            continue
+        for rec in recs:
+            if not rec.get("tok"):
+                continue
+            rows = rec.get("rows")
+            t_now = float(rec.get("t", 0))
+            for j in range(int(rec["alive"].shape[0])):
+                if not bool(rec["alive"][j]):
+                    continue
+                b = int(rows[j]) if rows is not None else j
+                fin = float(left[b])          # finish_frac: 1.0 means it never arrived
+                toks.append({k: (v[j] if torch.is_tensor(v) else v) for k, v in rec["tok"].items()})
+                tt.append(min(1.0, max(0.0, (fin * ep_steps - t_now) / max(ep_steps, 1))))
+    if not toks:
+        return {"n": 0}
+    from .policy import collate_tok
+    gen = torch.Generator().manual_seed(0)
+    if max_samples and len(toks) > max_samples:
+        pick = torch.randperm(len(toks), generator=gen)[:max_samples].sort().values.tolist()
+        toks = [toks[i] for i in pick]; tt = [tt[i] for i in pick]
+    tok_all = collate_tok(toks)
+    T = torch.tensor(tt, dtype=torch.float32)
+    n = T.shape[0]
+    opt = opt or torch.optim.Adam(net.parameters(), lr=lr)
+    acc = {"model": 0.0, "pol": 0.0, "err": 0.0, "nb": 0}
+    W = net.vocab.WAYPOINT
+    for _ in range(epochs):
+        order = torch.randperm(n, generator=gen)
+        for s0 in range(0, n, batch):
+            idx = order[s0:s0 + batch]
+            tk = {k: (v[idx] if torch.is_tensor(v) else v) for k, v in tok_all.items()}
+            q = net.read_out(tk)
+            _, mu_all, _ = net.pre(tk)
+            if not (torch.isfinite(q).all() and torch.isfinite(mu_all).all()):
+                continue
+            g_ego = net.goal_ego(tk).to(mu_all.dtype)
+            g = _subgoal_ego(net, mu_all[:, W], g_ego)
+            # (1) fit the model to the time actually taken, on the subgoal
+            #     actually emitted -- both held constant here
+            # SIGMOID: time is a fraction of the episode, so T_hat must live in
+            # (0, 1).  Unbounded, the policy drove it to -0.4 within two
+            # iterations -- predicting negative time -- while the model's own
+            # fit error ROSE from 0.98 to 1.21.  It was not learning to be
+            # quick, it was walking the model into territory the model had
+            # never seen and believing what it found there.  Bounded, the worst
+            # it can claim is "instant", and the model saturates instead of
+            # running away.
+            t_hat = torch.sigmoid(net.time_head(torch.cat([q.detach(), g.detach()], -1)).squeeze(-1))
+            l_model = ((t_hat - T[idx]) ** 2).mean()
+            # (2) move the policy DOWN the model.  The model's own parameters
+            #     still receive gradient from (1) only, because this term is
+            #     what the policy is being scored by, not what the model is.
+            t_pol = torch.sigmoid(net.time_head(torch.cat([q, g], -1)).squeeze(-1))
+            l_pol = t_pol.mean()
+            (l_model + policy_w * l_pol).backward()
+            nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            opt.step(); opt.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                acc["model"] += float(l_model); acc["pol"] += float(l_pol)
+                acc["err"] += float((t_hat - T[idx]).mean())      # negative = optimistic
+                acc["nb"] += 1
+    nb = max(1, acc["nb"])
+    with torch.no_grad():
+        p = torch.softmax(net.pre({k: (v[:512] if torch.is_tensor(v) else v)
+                                   for k, v in tok_all.items()})[0], -1).mean(0)
+    return {"n": n, "flights": n, "kept_flights": n, "ess": 0.0,
+            "ce": acc["pol"] / nb, "nll": acc["model"] / nb, "match": acc["err"] / nb,
+            "speak": float(1.0 - p[net.vocab.EOS]), "std": float(net.log_std.detach().exp().mean()),
+            "kl": 0.0, "clipfrac": 0.0, "entropy": 0.0, "ev": float("nan"), "w_up": 0.0, "w_abs": 0.0}
+
+
+def error_update(net: ContPolicyNet, records: List[Dict], reach: float = 10.0,
+                 epochs: int = 2, batch: int = 1024, lr: float = 1e-4, opt=None,
+                 max_samples: int = 0, alpha: float = 1.0, beta: float = 1.0) -> Dict[str, float]:
+    """The composer's own error, with no reward, no return and no labels.
+
+    The low level is FROZEN and knows the mechanics of flying.  The composer's
+    output is therefore a CLAIM -- "the vehicle can be at g by the next
+    decision" -- and reality answers it.  Two errors, and they are the only two
+    mistakes a navigator can make:
+
+        e_reach = |x_next - g| / reach     it asked for somewhere unreachable
+        e_aim   = |g - goal|   / reach     it did not ask to go toward the goal
+
+        L = alpha * e_reach^2 + beta * e_aim^2
+
+    Each alone is degenerate and each kills the other's degeneracy: e_reach
+    alone puts the subgoal at the vehicle's own feet, always reachable and never
+    moving; e_aim alone puts it on the goal through a building.  Together the
+    optimum is to place the subgoal AS FAR TOWARD THE GOAL AS THE VEHICLE CAN
+    ACTUALLY REACH -- which is navigation, stated entirely as error.
+
+    Why this and not the weighted log-probability it replaces.  That handed ONE
+    scalar to ~90 decisions: measured, the advantage separated crashed from
+    surviving flights at z = -166 while correlating -0.013 with the braking
+    argument.  It knew the flight was bad and not which decision made it so, so
+    `r` sat frozen at sd 0.0088 and perception stayed decorative.  Here every
+    decision carries its own vector error and the gradient is EXACT -- `g` is an
+    analytic function of the arguments, `x_next` is a constant target, so there
+    is no score-function estimator and no sampling variance.
+
+    Crashes need no penalty term: a vehicle that died before the next decision
+    is far from what was commanded, so e_reach is large for exactly the
+    decisions that flew it in.
+    """
+    groups = records if (records and isinstance(records[0], list)) else [records]
+    toks, mus_g, tgt, goals = [], [], [], []
+    for recs in groups:
+        # pair each decision with the NEXT one from the same flight: that is the
+        # interval the subgoal was actually held for
+        by_row = {}
+        for rec in recs:
+            if not rec.get("tok") or "x" not in rec:
+                continue
+            rows = rec.get("rows")
+            for j in range(int(rec["alive"].shape[0])):
+                if not bool(rec["alive"][j]):
+                    continue
+                b = int(rows[j]) if rows is not None else j
+                by_row.setdefault(b, []).append((rec, j))
+        for b, seq in by_row.items():
+            for (r0, j0), (r1, j1) in zip(seq, seq[1:]):
+                toks.append({k: (v[j0] if torch.is_tensor(v) else v) for k, v in r0["tok"].items()})
+                tgt.append(r1["x"][j1] - r0["x"][j0])       # world displacement actually achieved
+                goals.append(r0["goalw"][j0] - r0["x"][j0])  # world offset to the goal
+                mus_g.append(r0["tok"]["psi"][j0] if torch.is_tensor(r0["tok"].get("psi")) else torch.zeros(()))
+    if not toks:
+        return {"n": 0}
+    from .policy import collate_tok
+    from .tokens import to_ego
+    gen = torch.Generator().manual_seed(0)
+    if max_samples and len(toks) > max_samples:
+        pick = torch.randperm(len(toks), generator=gen)[:max_samples].sort().values.tolist()
+        toks = [toks[i] for i in pick]; tgt = [tgt[i] for i in pick]
+        goals = [goals[i] for i in pick]; mus_g = [mus_g[i] for i in pick]
+    tok_all = collate_tok(toks)
+    psi = torch.stack([p.reshape(()) for p in mus_g]).float()
+    d_world = torch.stack(tgt).float()
+    g_world = torch.stack(goals).float()
+    # everything in the vehicle's own frame, in units of the reach
+    d_ego = to_ego(d_world, psi) / reach
+    gl_ego = to_ego(g_world, psi) / reach
+    n = d_ego.shape[0]
+    opt = opt or torch.optim.Adam(net.parameters(), lr=lr)
+    acc = {"reach": 0.0, "aim": 0.0, "nb": 0}
+    W = net.vocab.WAYPOINT
+    for _ in range(epochs):
+        order = torch.randperm(n, generator=gen)
+        for s0 in range(0, n, batch):
+            idx = order[s0:s0 + batch]
+            tk = {k: (v[idx] if torch.is_tensor(v) else v) for k, v in tok_all.items()}
+            _, mu_all, _ = net.pre(tk)
+            if not torch.isfinite(mu_all).all():
+                continue
+            g = _subgoal_ego(net, mu_all[:, W], gl_ego[idx])
+            e_reach = ((g - d_ego[idx]) ** 2).sum(-1)
+            e_aim = ((g - gl_ego[idx]) ** 2).sum(-1)
+            # SCALE-FREE.  Both terms are squared distances in reach units, but
+            # they are not the same size: measured on the city, e_aim ~ 1.5 and
+            # e_reach ~ 0.4, so an even alpha:beta hands the aim term three
+            # times the gradient and it simply wins -- the composer learns to
+            # put the subgoal ON the goal and ignore whether it can get there,
+            # which is the degenerate arm each term is supposed to prevent in
+            # the other.  Dividing by each term's own detached batch mean makes
+            # the balance a ratio of RELATIVE improvement, so neither can
+            # dominate by being larger, and alpha:beta means what it says.
+            loss = (alpha * e_reach / e_reach.mean().detach().clamp_min(1e-6)
+                    + beta * e_aim / e_aim.mean().detach().clamp_min(1e-6)).mean()
+            loss.backward()
+            nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            opt.step(); opt.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                acc["reach"] += float(e_reach.mean()); acc["aim"] += float(e_aim.mean()); acc["nb"] += 1
+    nb = max(1, acc["nb"])
+    with torch.no_grad():
+        p = torch.softmax(net.pre({k: (v[:512] if torch.is_tensor(v) else v)
+                                   for k, v in tok_all.items()})[0], -1).mean(0)
+    return {"n": n, "flights": n, "kept_flights": n, "ess": 0.0,
+            "ce": acc["reach"] / nb + acc["aim"] / nb,
+            "nll": acc["reach"] / nb, "match": acc["aim"] / nb,
+            "speak": float(1.0 - p[net.vocab.EOS]), "std": float(net.log_std.detach().exp().mean()),
+            "kl": 0.0, "clipfrac": 0.0, "entropy": 0.0, "ev": float("nan"), "w_up": 0.0, "w_abs": 0.0}
+
+
+# `progress_weights` was DELETED here.
+#
+# It credited a decision with the distance closed between it and the NEXT
+# decision of the same flight (`zip(seq, seq[1:])`).  That was written for the
+# ~90 decisions a flight the composer used to make, where losing the last one
+# costs 1% of the data.  Under sparse injection a flight has one or two
+# decisions, so the last -- often the only -- is always uncredited, and most
+# decisions fire after the drone has parked on its goal with no distance left
+# to close.  MEASURED on the live checkpoint: the speak floor emitted 13
+# WAYPOINTs (10.40% of components, exactly its 0.10 setting) and 0 of 13
+# survived `progress_weights > 0`.  The exploration worked; the credit threw
+# all of it away, and the policy drifted freely -- TURN 100%, then LOOK 78%,
+# then EOS 99.9% -- because nothing that could have argued otherwise ever
+# reached the update.
+#
+# It was also confounded even when it did fire: the distance closed in an
+# interval is mostly the FROZEN LOW LEVEL flying to the goal, not the token's
+# doing, so it paid the composer for work it did not do.
+#
+# Credit now comes from `paired_advantage`: the same task and seed flown twice,
+# once with the injected token and once with the composer muted, and the token
+# is worth the DIFFERENCE.  That cancels the low level's own progress exactly,
+# gives every emitted token a weight, and scores silence at zero by
+# construction, since silence IS the control.
+
+
+def paired_advantage(t_arr: Tensor, t_ctl: Tensor) -> Tensor:
+    """TIME SAVED against the muted twin: `t_ctl - t_arr`.
+
+    `t_arr` is the injected flight's finish fraction and `t_ctl` its control's
+    -- the same task, the same seed, the same initial state, flown by the
+    frozen low level with the composer muted.  Positive means the tokens got
+    there sooner.
+
+    Time is the whole objective and nothing else is added to it.  It already
+    contains arrival: a flight that never arrives finishes at 1.0, the worst
+    score there is, so rescuing a flight the control lost is the largest
+    possible gain and losing one the control won is the largest possible loss.
+    A crash is simply a flight that never arrives. No bonus, no death charge,
+    no shaping -- the fastest one there wins.
+
+    It is a COUNTERFACTUAL, not a correlation: whatever the frozen low level
+    would have done unaided happens in both flights and cancels, so this cannot
+    pay the composer for distance it did not close.  That was the flaw in the
+    per-decision progress credit this replaces, which measured the low level's
+    own progress and attributed it to whatever token happened to be live.
+    """
+    return t_ctl.to(torch.float64).reshape(-1) - t_arr.to(torch.float64).reshape(-1)
+
+
 def imitate_update(net: ContPolicyNet, records: List[Dict], reached: List[Tensor],
                    epochs: int = 2, batch: int = 1024, lr: float = 1e-4,
                    opt=None, max_samples: int = 0, keep_frac: float = 1.0,
                    score: Optional[List[Tensor]] = None, weight_tau: float = 0.0,
                    task: Optional[List[Tensor]] = None, signed: bool = False,
-                   w_max: float = 2.0) -> Dict[str, float]:
+                   w_max: float = 2.0, advantage: Optional[List[Tensor]] = None,
+                   reach: float = 10.0) -> Dict[str, float]:
     """Cross-entropy on the composer's OWN successful flights.
 
     The token model is trained the way a language model is post-trained: sample,
@@ -547,13 +948,23 @@ def imitate_update(net: ContPolicyNet, records: List[Dict], reached: List[Tensor
         t_all = torch.cat([scores[gi].reshape(-1).to(torch.float64) for gi in range(len(groups))])
         k_all = (torch.cat([tasks[gi].reshape(-1).to(torch.long) for gi in range(len(groups))])
                  if all(tk is not None for tk in tasks[:len(groups)]) else None)
+        a_all = torch.cat([groups[gi][1].reshape(-1).to(torch.bool) for gi in range(len(groups))])
         w_split = list(torch.split(arrival_weights(t_all, k_all, tau=max(weight_tau, 1e-9),
-                                                   signed=signed, w_max=w_max), lens))
+                                                   signed=signed, w_max=w_max,
+                                                   arrived=a_all), lens))
     for gi, (recs, win) in enumerate(groups):
+        # `advantage`, when given, IS the weight: each flight's paired
+        # counterfactual against its muted twin.  Every decision of that flight
+        # carries it, because with one or two decisions a flight there is
+        # nothing finer to attribute to and no honest way to split it.
+        adv = advantage[gi] if (advantage is not None and gi < len(advantage)) else None
         w = win.to(torch.bool)
         sc = scores[gi] if gi < len(scores) else None
         wt = w.to(torch.float64)
-        if w_split[gi] is not None:
+        if adv is not None:
+            wt = adv.to(torch.float64).reshape(-1)
+            w = wt != 0                      # a token that changed nothing teaches nothing
+        elif w_split[gi] is not None:
             wt = w_split[gi]
             w = wt != 0
         elif sc is not None and keep_frac < 1.0 and int(w.sum()) > 1:
@@ -565,7 +976,7 @@ def imitate_update(net: ContPolicyNet, records: List[Dict], reached: List[Tensor
             wt = w.to(torch.float64)
         n_flights += int(win.numel()); n_kept += int(w.sum())
         flight_w.append(wt[w])
-        for rec in recs:
+        for di, rec in enumerate(recs):
             al = rec["alive"]
             rows = rec.get("rows")
             for j in al.nonzero().flatten().tolist():
@@ -615,7 +1026,12 @@ def imitate_update(net: ContPolicyNet, records: List[Dict], reached: List[Tensor
             # scale an unweighted mean would have.
             lw = wts[idx]
             lp = cont_log_prob(logits, mu, net.log_std, acts[idx], us[idx], nargs[idx])
-            loss = -(lw * lp).sum() / lw.sum().clamp_min(1e-9)
+            # Normalise by the total WEIGHT MASS, not the signed sum.  Signed
+            # weights are centred, so their sum is ~0 and dividing by it (even
+            # clamped at 1e-9) sends the loss to infinity: measured -746,178 on
+            # the very first iteration of the signed arm.  |w| is the sum for
+            # unsigned weights, so the unsigned path is unchanged.
+            loss = -(lw * lp).sum() / lw.abs().sum().clamp_min(1e-9)
             loss.backward()
             nn.utils.clip_grad_norm_(net.parameters(), 1.0)
             opt.step(); opt.zero_grad(set_to_none=True)
@@ -623,7 +1039,7 @@ def imitate_update(net: ContPolicyNet, records: List[Dict], reached: List[Tensor
                 acc["ce"] += float(loss)
                 acc["nll"] += float(nn.functional.cross_entropy(logits, acts[idx]))   # reported, not optimised
                 _m = (logits.argmax(-1) == acts[idx]).float()
-                acc["acc"] += float((lw * _m).sum() / lw.sum().clamp_min(1e-9))
+                acc["acc"] += float((lw.abs() * _m).sum() / lw.abs().sum().clamp_min(1e-9))
                 acc["nb"] += 1
     nb = max(1, acc["nb"])
     with torch.no_grad():

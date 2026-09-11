@@ -34,6 +34,26 @@ F = 8                                     # feature width shared by every token
 ACT_SCALE = 64.0                          # an action token's id rides in feature 0 of an INSTR token, over this
 
 
+def drop_oldest_event(chain: Tensor, ctypes: Tensor, cmask: Tensor):
+    """Make room in a full chain by dropping each row's oldest EVENT, never the
+    goal preface.
+
+    The preface is every row's FIRST VALID entry (the tokenizer inserts it
+    first, and both the right-align sort and `collate`'s left-padding are
+    stable, so padding stays in front of it).  So a row carrying padding can
+    give up index 0 -- that slot is padding -- while a full row must give up
+    index 1 instead.  The flat `chain[:, -kc:]` this replaces took index 0 from
+    every row alike, which evicted the preface on the first component append of
+    every decision once the window had filled.
+    """
+    n, L = ctypes.shape
+    cut = (~cmask[:, 0]).to(torch.long)            # 1 where index 0 IS the preface
+    ix = torch.arange(L, device=ctypes.device)[None].expand(n, L)
+    keep = ix[ix != cut[:, None]].view(n, L - 1)
+    return (torch.gather(chain, 1, keep[..., None].expand(-1, -1, chain.shape[-1])),
+            torch.gather(ctypes, 1, keep), torch.gather(cmask, 1, keep))
+
+
 def yaw_of(R: Tensor) -> Tensor:
     return torch.atan2(R[..., 1, 0], R[..., 0, 0])
 
@@ -63,10 +83,27 @@ class Tokenizer:
         for sen in sensors or ():
             kind = getattr(sen, "kind", getattr(sen, "name", ""))
             if hasattr(sen, "n_beams") and hasattr(sen, "spread"):
+                # Bearings derived from the SAME body-frame construction the
+                # sensor casts with, not rebuilt from n_beams/spread/elevations.
+                # Rebuilding them was wrong for any fan not in the horizontal
+                # plane: `_dirs` forms [cos(off)cos(el), sin(off)cos(el),
+                # sin(el)], so at el = -pi/2 the cos(el) factor is ZERO and the
+                # azimuth collapses -- `range_down`'s four "splayed" beams are
+                # four identical straight-down rays and its spread does nothing.
+                # The tokenizer meanwhile labelled them -17, -8.6, 0, +8.6
+                # degrees, so a quarter of the beam tokens carried directions
+                # the sensor never looked in.  Deriving from the shared formula
+                # makes the two incapable of disagreeing.
                 n = int(sen.n_beams); k = torch.arange(n, dtype=torch.float64)
-                az = (k / n - 0.5) * float(sen.spread)
-                el = torch.tensor(list(getattr(sen, "elevations", (0.0,))), dtype=torch.float64)
-                bear = torch.stack([az.repeat(len(el)), el.repeat_interleave(n)], -1)
+                off = (k / n - 0.5) * float(sen.spread)
+                rows = []
+                for e in getattr(sen, "elevations", (0.0,)):
+                    ce, se = math.cos(float(e)), math.sin(float(e))
+                    d = torch.stack([torch.cos(off) * ce, torch.sin(off) * ce,
+                                     torch.full_like(off, se)], -1)
+                    rows.append(torch.stack([torch.atan2(d[:, 1], d[:, 0]),
+                                             torch.asin(d[:, 2].clamp(-1.0, 1.0))], -1))
+                bear = torch.cat(rows, 0)
                 self.layout.append((sen.name, "beam", bear, float(sen.max_range), None))
             elif hasattr(sen, "W") and hasattr(sen, "hfov"):
                 # the image as PATCH tokens: every patch carries the bearing of
@@ -178,8 +215,20 @@ class Tokenizer:
         events = [(m["t"], "m", m) for m in (ctx.get("chain", []) or [])] + \
                  [(e[0], "i", (e[1], e[2] if len(e) > 2 else None)) for e in chain_instr]
         events.sort(key=lambda e: (e[0], e[1] == "i"))
-        ch_rows, ch_types, ch_valid = [], [], []
-        for t_e, kind, val in events[-self.kc:]:
+        # THE PREFACE.  Every chain opens with the goal the task handed this
+        # row, typed GOAL, valid on every row, and NOT something the composer
+        # can emit -- it is context, not an action, so it never appears in the
+        # vocabulary and no token id maps to it.  The chain blocks are causally
+        # masked, which makes position 0 the one entry every later entry can
+        # attend to: each measurement and each instruction is then read
+        # relative to the objective rather than in isolation.  It also means
+        # the chain is never empty, so `read_out` no longer skips the chain
+        # path outright on the first decision of a leg.  It costs one slot of
+        # the `k_chain` window, and the oldest event is the one displaced.
+        ch_rows = [goal_tok]
+        ch_types = [GOAL]
+        ch_valid = [torch.ones(B, dtype=torch.bool, device=dev)]
+        for t_e, kind, val in (events[-(self.kc - 1):] if self.kc > 1 else []):
             age = torch.full((B,), (now - t_e) / 200.0, dtype=dt, device=dev)   # 4 s = 1.0
             if kind == "i":
                 ids, valid, args = (val + (None,))[:3] if isinstance(val, tuple) else (val, None, None)
@@ -207,5 +256,22 @@ class Tokenizer:
         ctypes = (torch.tensor(ch_types, dtype=torch.long, device=dev).expand(B, -1) if ch_rows
                   else torch.zeros(B, 0, dtype=torch.long, device=dev))
         cmask = ~torch.stack(ch_valid, 1) if ch_rows else torch.zeros(B, 0, dtype=torch.bool, device=dev)   # True = padding
+        if ch_rows and bool(cmask.any()):
+            # RIGHT-ALIGN each row's own valid events.  An instruction belongs
+            # only to the rows that were asked, so the newest event in the
+            # shared timeline is padding for everyone else -- and `read_out`
+            # takes `ch[:, -1:]` as "the latest chain state".  Measured: with
+            # decisions confined to the report clock 0% of rows had that slot
+            # padded, but once a beam can interrupt a SUBSET of rows it was
+            # 58.4%, so most rows summarised their history from a masked slot.
+            # Sorting by validity (stable, so time order survives within each
+            # group) puts every row's real events at the end and its padding at
+            # the front, which also closes the holes left mid-history.  `age`
+            # carries the timing explicitly, so compacting loses nothing.
+            ctypes = ctypes.contiguous()
+            order = torch.argsort((~cmask).to(torch.int64), dim=1, stable=True)
+            chain = torch.gather(chain, 1, order[..., None].expand(-1, -1, F))
+            ctypes = torch.gather(ctypes, 1, order)
+            cmask = torch.gather(cmask, 1, order)
         return {"self": self_tok, "goal": goal_tok, "entities": per, "ent_types": per_types, "ent_mask": per_mask,
                 "chain": chain, "chain_types": ctypes, "chain_mask": cmask, "psi": psi}

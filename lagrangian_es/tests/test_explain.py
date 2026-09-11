@@ -29,7 +29,12 @@ def test_explain_one_decision():
            "obs": {x.name: x.observe(s, make_gen(3)) for x in sens}}
     ex = explain_decision(comp, ctx, b=1)
     a = ex["attention"]; assert a is not None
-    assert len(a["keys"]) == 2 + 24 + 50 and abs(sum(a["action_query"]) - 1.0) < 1e-6
+    # self + 24 beams + 50 patches + the stream memory.  The stream key is
+    # there even on this FIRST decision, with `ctx["chain"]` empty: every chain
+    # now opens with the goal preface, so it is never zero-length and
+    # `read_out` no longer skips the chain blocks outright.  It used to be 76.
+    assert len(a["keys"]) == 2 + 24 + 50 + 1 and abs(sum(a["action_query"]) - 1.0) < 1e-6
+    assert a["keys"][-1] == "stream memory"
     assert all(abs(sum(q) - 1.0) < 1e-6 for q in a["constraint_queries"])
     sal = ex["saliency"]; assert len(sal["entities"]) == 74 and min(sal["entities"]) >= 0.0
     cf = ex["counterfactual_shift_p"]

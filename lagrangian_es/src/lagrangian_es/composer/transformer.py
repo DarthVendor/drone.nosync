@@ -24,7 +24,7 @@ from torch import Tensor, nn
 
 from .base import COMPOSERS, Composer
 from .spec import TaskSpec
-from .tokens import ACT_SCALE, F, INSTR, N_TYPES, Tokenizer, to_world
+from .tokens import ACT_SCALE, F, INSTR, N_TYPES, Tokenizer, drop_oldest_event, to_world
 
 
 class Block(nn.Module):
@@ -374,8 +374,8 @@ class TransformerComposer(Composer):
                     ctypes = torch.cat([tok["chain_types"], torch.full((n, 1), INSTR, dtype=torch.long, device=ch.device)], 1)
                     cmask = torch.cat([tok["chain_mask"], torch.zeros(n, 1, dtype=torch.bool, device=ch.device)], 1)
                     kc = self.tok.kc
-                    if chain.shape[1] > kc:
-                        chain, ctypes, cmask = chain[:, -kc:], ctypes[:, -kc:], cmask[:, -kc:]
+                    while chain.shape[1] > kc:
+                        chain, ctypes, cmask = drop_oldest_event(chain, ctypes, cmask)
                     tok["chain"], tok["chain_types"], tok["chain_mask"] = chain, ctypes, cmask
                     sc = (scene0[0][idx], scene0[1][idx])
                 self._rows = ids_full[idx]

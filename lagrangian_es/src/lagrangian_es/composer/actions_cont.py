@@ -51,7 +51,20 @@ from .spec import TaskSpec
 
 #: token types
 EOS, WAYPOINT, TURN, PRIORITY, LOOK = 0, 1, 2, 3, 4
-N_TOKENS = 5
+#: LOOK IS OUT OF THE VOCABULARY.  `V` stops at PRIORITY, so index 4 can never
+#: be sampled or emitted; `step` still knows what a LOOK means, so turning it
+#: back on is a one-line change to this number.
+#:
+#: Why: LOOK only sets `yaw_gate = 0`, handing yaw back to the plant's own
+#: look-at -- which is what the plant does anyway unless a TURN took it.  It is
+#: therefore a token that costs nothing and does nothing, and the policy found
+#: it: measured on the live checkpoint, LOOK 78.4% / EOS 20.0% / WAYPOINT 1.6%
+#: / TURN 0% / PRIORITY 0%, arriving 0.490 against a silence baseline of 0.521.
+#: The composer had converged on saying something harmless rather than staying
+#: quiet, and a no-op in the vocabulary is a free place for the update's noise
+#: to accumulate.  An earlier run collapsed onto TURN 100% the same way, so the
+#: pattern is "find the cheapest token", not anything specific to LOOK.
+N_TOKENS = 4
 
 #: how many continuous arguments each type carries (PRIORITY is n_terms, set per instance)
 BASE_ARGS = {EOS: 0, WAYPOINT: 3, TURN: 1, LOOK: 0}      # WAYPOINT is (r, theta, phi)
@@ -60,13 +73,13 @@ BASE_ARGS = {EOS: 0, WAYPOINT: 3, TURN: 1, LOOK: 0}      # WAYPOINT is (r, theta
 #: and the unused tail is ignored, so one Gaussian covers every token type
 MAX_ARGS = 3
 
-TURN_MAX = math.pi / 2          # a single TURN commands at most a quarter turn
-#: how steeply one waypoint may be placed above or below the vehicle.  Not
-#: pi/2: at the extreme that puts the subgoal directly overhead with no
-#: horizontal progress at all, and the whole argument range would be spent on
-#: climb angles no delivery flight uses.  At pi/4 the vertical and horizontal
-#: components are equal at full deflection, which is already a steep climb.
-PHI_MAX = math.pi / 4
+#: The action BOUNDS are the full range now, not a tuned slice of it.  A
+#: squash needs some scale, so a bound cannot be removed -- but choosing pi/2
+#: for a turn and pi/4 for a climb was a judgement about what the vehicle
+#: should want to do, and that is the network's to make.
+TURN_MAX = math.pi
+#: the full vertical range; the network decides what it wants of it
+PHI_MAX = math.pi / 2
 PRIORITY_MAX = 1.0              # how far one PRIORITY token can push a term
 
 
@@ -168,8 +181,36 @@ class ContVocab:
             # around a building but never over one, and it could not lift away
             # from the floor, where most deaths happen.  `phi` is that missing
             # axis; nothing else commands altitude.
-            L0 = g_ego.to(dt).norm(dim=-1)                             # 3-D distance to go, reach units
-            radius = L0.clamp(max=1.0)                                 # never past one reach
+            # min(reach, |goal - x|).  This was briefly a FIXED reach ball, on
+            # the argument that a goal-relative radius computes part of the
+            # placement rather than letting the network choose it.  That
+            # argument is wrong, and the run that tested it arrived 0.000 on an
+            # EMPTY map for six iterations while the frozen low level alone
+            # flies the same rung at 0.96-0.99.
+            #
+            # The radius is the action FRAME, not the answer: the network still
+            # has to learn theta and phi, and nothing here tells it which way
+            # the goal lies (that was `goal_residual`, which added
+            # atanh(bearing) straight into mu, and is gone for good).  What the
+            # frame decides is whether arrival is an ATTRACTOR.  Measured, the
+            # chance a random placement lands inside the 0.25 m tolerance, as
+            # the vehicle closes from 8 m to 0.5 m:
+            #
+            #     |goal-x|      fixed ball     goal-relative
+            #          8.0        6.0e-06          1.5e-06
+            #          1.0        3.4e-04          1.8e-03
+            #          0.5        1.5e-03          1.7e-02
+            #
+            # The goal-relative ball SHRINKS onto the goal, so closing in makes
+            # arriving easier and easier -- below the tolerance every placement
+            # in the ball arrives.  The fixed ball does not: half a metre out
+            # the vehicle is still being flung up to a full reach away, so the
+            # error never settles and arrival is not reachable by approach.
+            # That matters here beyond the flight itself, because the update is
+            # cross-entropy on the composer's OWN successes: at zero arrivals
+            # the filter admits nothing, the loss is nan, and the run cannot
+            # bootstrap at all.  "0 tokens from 0/288", six iterations running.
+            radius = g_ego.norm(dim=-1).to(dt).clamp(max=1.0)
             r = (pend[:, 0].to(dt) + 1.0) * 0.5 * radius               # [-1,1] -> [0, radius]
             theta = math.pi * pend[:, 1].to(dt)                        # [-1,1] -> [-pi, pi], from the nose
             phi = PHI_MAX * pend[:, 2].to(dt)                          # [-1,1] -> [-PHI_MAX, PHI_MAX]

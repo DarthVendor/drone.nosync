@@ -327,3 +327,110 @@ def test_a_sensor_that_shares_nothing_still_works():
     r, j = sen.observe_with_jacobian(s, make_gen(1))
     assert torch.equal(r, sen.observe(s, make_gen(1)))
     assert j.shape[0] == 8
+
+
+def test_token_bearings_match_the_rays_the_sensor_actually_casts():
+    """The tokenizer used to rebuild the fan from n_beams/spread/elevations
+    instead of deriving it from the sensor's own construction, and the two
+    disagreed for any fan outside the horizontal plane.
+
+    `RangeSensor._dirs` forms [cos(off)cos(el), sin(off)cos(el), sin(el)], so at
+    el = -pi/2 the cos(el) factor is ZERO and the azimuth collapses:
+    `range_down`'s four "slightly splayed" beams are four identical
+    straight-down rays and its spread does nothing.  The tokenizer labelled them
+    -17.2, -8.6, 0.0 and +8.6 degrees, so a quarter of the beam tokens carried
+    directions the sensor never looked in -- range attached to the wrong
+    bearing, which no amount of training can undo.
+
+    Compared as VECTORS, because azimuth is undefined for a straight-down ray
+    and comparing two arbitrary values of an undefined quantity proves nothing.
+    """
+    import math
+    import torch
+    from lagrangian_es.config import Config, RolloutCfg
+    from lagrangian_es.es import build, build_sensors
+    from lagrangian_es.composer.tokens import Tokenizer
+
+    cfg = Config(system="quadrotor_nav", trainable="nav_agent", task="city_tour",
+                 environment="singapore_cbd", sensors=("range", "range_down", "depth_camera"),
+                 gating="arrival", seed=0, task_kw=(("n_legs", 2), ("max_leg", 20.0)),
+                 system_kw=(("free_start", True),), trainable_kw=(("learned", True),),
+                 rollout=RolloutCfg(n_eps=4, ep_steps=100))
+    system, trainable, task = build(cfg)
+    sensors = build_sensors(cfg, system)
+    tok = Tokenizer(scale=30.0, reach=10.0, sensors=sensors)
+
+    checked = 0
+    for sen in sensors:
+        if not (hasattr(sen, "n_beams") and hasattr(sen, "spread")):
+            continue
+        lay = [l for l in tok.layout if l[0] == sen.name]
+        assert lay, f"{sen.name} is not in the layout: its readings never become tokens"
+        bear = lay[0][2]
+        n = int(sen.n_beams)
+        off = (torch.arange(n, dtype=torch.float64) / n - 0.5) * float(sen.spread)
+        i = 0
+        for e in getattr(sen, "elevations", (0.0,)):
+            ce, se = math.cos(float(e)), math.sin(float(e))
+            truth = torch.stack([torch.cos(off) * ce, torch.sin(off) * ce,
+                                 torch.full_like(off, se)], -1)
+            for b in range(n):
+                az, el = float(bear[i, 0]), float(bear[i, 1])
+                got = torch.tensor([math.cos(az) * math.cos(el),
+                                    math.sin(az) * math.cos(el), math.sin(el)],
+                                   dtype=torch.float64)
+                ang = math.degrees(math.acos(min(1.0, float((got * truth[b]).sum()))))
+                assert ang < 1.0, (
+                    f"{sen.name} beam {i}: the token says {[round(float(v), 3) for v in got]} "
+                    f"but the sensor casts {[round(float(v), 3) for v in truth[b]]} ({ang:.1f} deg apart)")
+                checked += 1
+                i += 1
+    assert checked >= 28, f"only {checked} beams checked"
+
+
+def test_the_built_map_uses_a_fan_that_can_actually_map():
+    """`RangeDown` subclasses `RangeSensor`, so it reports kind "range" too --
+    and the built map used to take the FIRST such sensor, making the choice a
+    function of config order rather than geometry.
+
+    It matters because a straight-down beam has no horizontal component:
+    `end = p + dirs[..., :2] * rng` is the vehicle's own position, so a
+    downward fan would stamp the drone's own cell as occupied on every scan and
+    the map it builds of the world would be a trail of itself.
+    """
+    import math
+    from lagrangian_es.config import Config, RolloutCfg
+    from lagrangian_es.es import build, build_sensors
+    from lagrangian_es.rollout import Rollout
+
+    for order in (("range", "range_down"), ("range_down", "range")):
+        cfg = Config(system="quadrotor_nav", trainable="nav_agent", task="city_tour",
+                     environment="singapore_cbd", sensors=order, gating="arrival", seed=0,
+                     task_kw=(("n_legs", 2), ("max_leg", 20.0)),
+                     system_kw=(("free_start", True),), trainable_kw=(("learned", True),),
+                     rollout=RolloutCfg(n_eps=4, ep_steps=50))
+        system, trainable, task = build(cfg)
+        rig = Rollout(system, trainable, task, cfg.rollout, build_sensors(cfg, system))
+        assert getattr(rig._beam_sen, "name", None) == "range", (
+            f"with sensors declared {order} the built map chose "
+            f"{getattr(rig._beam_sen, 'name', None)}")
+
+
+def test_a_vertical_fan_marks_the_vehicles_own_cell():
+    """The geometry behind the test above, stated directly: a beam straight
+    down ends where the vehicle is, in the horizontal plane the map lives in."""
+    import torch
+    from lagrangian_es.mapping import BuiltMap
+
+    m = BuiltMap()
+    m.reset(1, torch.device("cpu"), torch.float32)      # the grid is allocated lazily
+    p = torch.zeros(1, 3)
+    down = torch.tensor([[[0.0, 0.0, -1.0]]])          # one straight-down beam
+    rng = torch.tensor([[1.2]])                         # a return well inside range
+    m.update(p, down, rng, max_range=2.0, live=torch.ones(1, dtype=torch.bool), t=1.0)
+    assert m.hits is not None
+    G = m.G
+    centre = (G // 2) * G + (G // 2)
+    assert float(m.hits[0, centre]) > 0.0, (
+        "a straight-down beam did not mark the vehicle's own cell -- the fixture "
+        "no longer demonstrates why the mapping fan must not be vertical")
