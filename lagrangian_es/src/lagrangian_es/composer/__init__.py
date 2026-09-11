@@ -14,11 +14,12 @@ from .oracle import OracleSubgoal
 from .transformer import ComposerNet, TransformerComposer
 from .tokens import Tokenizer
 from .distill import Recorder, collate, fit
-from .policy import PolicyComposer, PolicyNet, ppo_update, returns_from_stream, center_by_task, explore_weights
+from .policy import PolicyComposer, PolicyNet, ppo_update, returns_from_stream, center_by_task, explore_weights, returns_goal_only
 from .policy_cont import ContComposer, ContPolicyNet, ppo_update_cont
 from .explain import Tracer, explain_decision
 
 __all__ = [
+    "returns_goal_only",
     "ppo_update_cont",
     "ContPolicyNet",
     "ContComposer",

@@ -188,6 +188,12 @@ def _work(payload):
                      "logits": rc["logits"][keep] if "logits" in rc else None,
                      "pi_logits": rc["pi_logits"][keep] if "pi_logits" in rc else None,   # the policy at collection: the update's trust region
                      "tok_keep": None if tk is None else tk[keep],
+                     # the continuous vocabulary's extra fields: the sampled
+                     # argument, how many slots the token actually used, and
+                     # the Gaussian that drew it.  Absent for the token
+                     # composer, so this stays None there.
+                     **{k: (rc[k][keep] if torch.is_tensor(rc[k]) and rc[k].shape[:1] == r.shape[:1] else rc[k])
+                        for k in ("u", "n_args", "mu", "log_std") if k in rc},
                      "tok": {k: (v[keep_t].float() if torch.is_tensor(v) and v.is_floating_point()
                                  else (v[keep_t] if torch.is_tensor(v) else v)) for k, v in rc["tok"].items()}})
     chain = [{k: (v[sel] if torch.is_tensor(v) else v) for k, v in tok.items()} for tok in _RIG.chain]

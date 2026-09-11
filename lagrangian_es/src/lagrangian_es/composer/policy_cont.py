@@ -248,6 +248,98 @@ class ContComposer(PolicyComposer):
         return self._decide_cont(ctx, choose)
 
 
+def imitate_update(net: ContPolicyNet, records: List[Dict], reached: List[Tensor],
+                   epochs: int = 2, batch: int = 1024, lr: float = 1e-4,
+                   opt=None, max_samples: int = 0, keep_frac: float = 1.0) -> Dict[str, float]:
+    """Cross-entropy on the composer's OWN successful flights.
+
+    The token model is trained the way a language model is post-trained: sample,
+    keep what worked, and raise the likelihood of exactly those tokens.  No
+    advantage, no value function, no ratio.
+
+    Why this suits the problem.  A policy gradient needs to know WHICH decision
+    in a flight mattered, and measured on a real batch it does not: the
+    advantage separated crashed from surviving flights at z = -166 while its
+    correlation with the braking argument was -0.013, because every decision in
+    a flight carries essentially the same return (consecutive decisions differ
+    by 3 against a spread of 241).  Imitation never asks that question.  The
+    outcome is used as a FILTER over whole flights, and within a kept flight
+    every token is simply made more likely.
+
+    What it gives up: it cannot learn from failure, only from success, so it
+    needs a supply of flights that already arrive -- which is what the
+    difficulty curriculum provides, and why the two belong together.  It also
+    reinforces whatever the successful flights happened to do, including the
+    parts that were irrelevant.
+
+    `keep_frac` < 1 keeps only the best of the successful flights by decision
+    count, a crude proxy for "arrived efficiently".
+    """
+    groups = list(zip(records, reached)) if (records and isinstance(records[0], list)) else [(records, reached)]
+    samples, acts, us, nargs = [], [], [], []
+    n_flights = n_kept = 0
+    for recs, win in groups:
+        w = win.to(torch.bool)
+        n_flights += int(w.numel()); n_kept += int(w.sum())
+        for rec in recs:
+            al = rec["alive"]
+            rows = rec.get("rows")
+            for j in al.nonzero().flatten().tolist():
+                b = int(rows[j]) if rows is not None else j
+                if not bool(w[b]):
+                    continue                      # only flights that arrived
+                samples.append({kk: (v[j].float() if torch.is_tensor(v) and v.is_floating_point()
+                                     else (v[j] if torch.is_tensor(v) else v))
+                                for kk, v in rec["tok"].items()})
+                acts.append(rec["act"][j]); us.append(rec["u"][j]); nargs.append(rec["n_args"][j])
+    if not samples:
+        return {"n": 0, "kept_flights": 0, "flights": n_flights}
+    gen = torch.Generator().manual_seed(0)
+    if max_samples and len(samples) > max_samples:
+        pick = torch.randperm(len(samples), generator=gen)[:max_samples].sort().values.tolist()
+        samples = [samples[i] for i in pick]
+        acts = [acts[i] for i in pick]; us = [us[i] for i in pick]; nargs = [nargs[i] for i in pick]
+    acts = torch.stack(acts).long(); us = torch.stack(us).float(); nargs = torch.stack(nargs).long()
+    tok_all = collate_tok(samples)
+    n = acts.shape[0]
+    opt = opt or torch.optim.Adam(net.parameters(), lr=lr)
+    acc = {"ce": 0.0, "nll": 0.0, "acc": 0.0, "nb": 0}
+    for _ in range(epochs):
+        order = torch.randperm(n, generator=gen)
+        for s0 in range(0, n, batch):
+            idx = order[s0:s0 + batch]
+            tk = {k: (v[idx] if torch.is_tensor(v) else v) for k, v in tok_all.items()}
+            logits, mu, _ = net.pre(tk)
+            if not (torch.isfinite(logits).all() and torch.isfinite(mu).all()):
+                continue
+            # ONE term: the negative log-likelihood of the decision that was
+            # taken -- cross-entropy over the token type and the density of its
+            # arguments, which is the same quantity written once.  No value
+            # loss, no entropy bonus, no KL penalty, no auxiliary anything.
+            # Everything the composer should care about -- not crashing, not
+            # dawdling, not placing needless subgoals -- is IMPLICIT in which
+            # flights got kept to imitate.
+            loss = -cont_log_prob(logits, mu, net.log_std, acts[idx], us[idx], nargs[idx]).mean()
+            loss.backward()
+            nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            opt.step(); opt.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                acc["ce"] += float(loss)
+                acc["nll"] += float(nn.functional.cross_entropy(logits, acts[idx]))   # reported, not optimised
+                acc["acc"] += float((logits.argmax(-1) == acts[idx]).float().mean())
+                acc["nb"] += 1
+    nb = max(1, acc["nb"])
+    with torch.no_grad():
+        p = torch.softmax(net.pre({kk: (v[:512] if torch.is_tensor(v) else v)
+                                   for kk, v in tok_all.items()})[0], -1).mean(0)
+    return {"n": n, "flights": n_flights, "kept_flights": n_kept,
+            "ce": acc["ce"] / nb, "nll": acc["nll"] / nb, "match": acc["acc"] / nb,
+            "kl": 0.0, "clipfrac": 0.0, "entropy": float(cont_entropy(
+                torch.log(p.clamp_min(1e-9))[None], net.log_std.detach()).mean()),
+            "speak": float(1.0 - p[net.vocab.EOS]), "std": float(net.log_std.detach().exp().mean()),
+            "ev": float("nan")}
+
+
 def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_terms: int,
                     epochs: int = 2, batch: int = 1024, lr: float = 1e-4, clip: float = 0.2,
                     vcoef: float = 0.5, ent: float = 0.0, target_kl: float = 0.02,
@@ -294,7 +386,10 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
     # the token update uses)
     tok_all = collate_tok(samples)
     n = acts.shape[0]
-    adv = (rets - rets.mean()) / rets.std().clamp_min(1e-6)
+    # NORMALISED returns, and the value head is fit to THOSE.  Fitting it to raw
+    # returns (spread ~230 here) left it at its initialisation -- explained
+    # variance 0.000 -- so it predicted a constant and absorbed nothing.
+    rets_n = (rets - rets.mean()) / rets.std().clamp_min(1e-6)
     old_lp = cont_log_prob(old_logits, old_mu, old_lsd, acts, us, nargs).detach()
     opt = opt or torch.optim.Adam(net.parameters(), lr=lr)
     acc = {"loss": 0.0, "v_loss": 0.0, "ent": 0.0, "clipfrac": 0.0, "nb": 0, "kl": 0.0}
@@ -311,9 +406,17 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
                 continue
             lp = cont_log_prob(logits, mu, net.log_std, acts[idx], us[idx], nargs[idx])
             ratio = (lp - old_lp[idx]).clamp(-20.0, 20.0).exp()
-            a = adv[idx]
+            # THE STATE BASELINE.  Without subtracting V(s) the advantage is the
+            # raw return, which is dominated by whether the flight eventually
+            # crashed: measured on a real batch, the advantage separated crashed
+            # from surviving flights at z = -166 while its correlation with the
+            # braking argument was -0.013.  Every decision in a bad flight was
+            # pushed down equally, so the gradient carried almost no information
+            # about what the composer actually chose.
+            a = rets_n[idx] - val.detach()
+            a = (a - a.mean()) / a.std().clamp_min(1e-6)
             loss = -torch.min(ratio * a, ratio.clamp(1 - clip, 1 + clip) * a).mean()
-            v_loss = ((val - rets[idx]) ** 2).mean()
+            v_loss = ((val - rets_n[idx]) ** 2).mean()
             h = cont_entropy(logits, net.log_std).mean()
             (loss + vcoef * v_loss - ent * h).backward()
             nn.utils.clip_grad_norm_(net.parameters(), 1.0)
@@ -328,10 +431,15 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
                 stop = True                      # the cap the last continuous run did not have
                 break
     nb = max(1, acc["nb"])
+    with torch.no_grad():
+        sel = torch.randperm(n, generator=gen)[:2048]
+        tk = {k: (v[sel] if torch.is_tensor(v) else v) for k, v in tok_all.items()}
+        v0 = net.pre(tk)[2]
+        ev = float(1.0 - (rets_n[sel] - v0).var() / rets_n[sel].var().clamp_min(1e-9))
     p = torch.softmax(old_logits, -1).mean(0)
     return {"n": n, "kl": acc["kl"] / nb, "clipfrac": acc["clipfrac"] / nb,
             "loss": acc["loss"] / nb, "v_loss": acc["v_loss"] / nb, "entropy": acc["ent"] / nb,
-            "speak": float(1.0 - p[net.vocab.EOS]), "std": float(net.log_std.detach().exp().mean()),
+            "speak": float(1.0 - p[net.vocab.EOS]), "std": float(net.log_std.detach().exp().mean()), "ev": ev,
             "stopped_early": bool(stop)}
 
 

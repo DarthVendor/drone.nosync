@@ -260,6 +260,43 @@ def returns_from_stream(records: List[Dict], chain: List[Dict], gamma: float,
     return R
 
 
+def returns_goal_only(records: List[Dict], reached: Tensor, gamma: float = 0.98) -> Tensor:
+    """Reward ONLY arriving: 1 if the flight reached its goal, 0 if it did not,
+    discounted by how many decisions were still to come.
+
+    Why this is not obviously worse than the shaped return it replaces, and may
+    be better: the shaped return's spread was 241, almost all of it the death
+    charge and the distance still owed, so it said "this flight went badly" and
+    barely anything about which decision made it so (measured: the advantage
+    separated crashed from surviving flights at z = -166 while its correlation
+    with the braking argument was -0.013).  A binary outcome turns the value
+    head's job into predicting the PROBABILITY of arriving, which is bounded,
+    well conditioned, and exactly the quantity a baseline should carry.
+
+    The discount is per DECISION remaining rather than in time, so it needs no
+    episode clock: the last decision before arriving gets the full reward and
+    earlier ones get progressively less.  That is what gives two decisions in
+    the same flight different returns, which a bare terminal reward would not.
+    """
+    n = len(records)
+    if n == 0:
+        return torch.zeros(0, 0)
+    B = reached.shape[0]
+    R = torch.zeros(n, B, dtype=torch.float64)
+    win = reached.to(torch.float64)
+    # how many decisions each row still has ahead of it at record k
+    ahead = torch.zeros(B, dtype=torch.long)
+    for k in range(n - 1, -1, -1):
+        rec = records[k]
+        rows = rec.get("rows")
+        al = rec["alive"]
+        idx = al.nonzero().flatten()
+        b = (rows[idx].to(torch.long) if rows is not None else idx)
+        R[k, b] = win[b] * (gamma ** ahead[b].to(torch.float64))
+        ahead[b] += 1
+    return R
+
+
 def explore_weights(count: Optional[Tensor], V: int, protect: Sequence[int] = ()) -> Optional[Tensor]:
     """Where the exploration mixture should put its mass, given how often each
     token has actually been emitted.
