@@ -409,6 +409,24 @@ class ContComposer(PolicyComposer):
         if len(self._instr) > 4 * self.tok.kc:
             self._instr = self._instr[-2 * self.tok.kc:]
 
+    def _beam_geom(self, device, dtype):
+        """The forward ring's unit directions and max range, from the
+        TOKENIZER's layout -- the same geometry the sensor casts with, so the
+        action cannot disagree with what the beams reported."""
+        cached = getattr(self, "_bg", None)
+        if cached is not None:
+            d, r = cached
+            return d.to(device=device, dtype=dtype), r
+        for name, kind, bear, rmax, _geom in getattr(self.tok, "layout", ()):
+            if kind == "beam" and not str(name).endswith("_down"):
+                az, el = bear[:, 0], bear[:, 1]
+                ce = torch.cos(el)
+                d = torch.stack([torch.cos(az) * ce, torch.sin(az) * ce, torch.sin(el)], -1)
+                self._bg = (d, float(rmax))
+                return d.to(device=device, dtype=dtype), float(rmax)
+        self._bg = (None, 0.0)
+        return None, 0.0
+
     @torch.no_grad()
     def emit(self, ctx):
         """Sample a decision per row and record it for the update."""
@@ -476,6 +494,28 @@ class ContComposer(PolicyComposer):
                 if exploring:
                     s = torch.where(rec[:, None], s * (1.0 + eps), s)
                 u = mu + s * torch.randn_like(mu)
+                # PROBABILISTIC WAYPOINTS FROM THE ACTION.  For the rows whose
+                # token is a WAYPOINT, redraw the argument from exp(-S/T) over
+                # `var_k` of the policy's OWN candidates, S being the two-leg
+                # path action through what the beams see.  The network still
+                # decides where to look; the action decides which of the places
+                # it was already considering is worth going to.  Uniform
+                # exploration in a 10 m ball measured a p95 advantage of
+                # exactly ZERO over 256 paired flights -- nothing it tried ever
+                # helped -- which is why this exists.
+                if float(getattr(self, "var_temp", 0.0)) > 0.0:
+                    wp = (act == self.net.vocab.WAYPOINT)
+                    if bool(wp.any()):
+                        dirs, rmax = self._beam_geom(dev, mu.dtype)
+                        rng_all = (ctx_s.get("obs", {}) or {}).get("range")
+                        if dirs is not None and torch.is_tensor(rng_all):
+                            gk = self.net.goal_ego(tok).to(mu.dtype)[wp]
+                            u = u.clone()
+                            u[wp] = variational_u(
+                                self.net, mu[wp], std, gk, dirs, rng_all[wp].to(mu.dtype),
+                                rmax, self.reach, k=int(getattr(self, "var_k", 16)),
+                                temperature=float(self.var_temp),
+                                lam=float(getattr(self, "var_lam", 2.0)))
             if self.stochastic and rec_rows is not None and bool(rec.any()):
                 V = self.net.vocab
                 n_args = torch.tensor([V.n_arg_of(int(t)) for t in act.tolist()],
@@ -589,6 +629,36 @@ def _subgoal_ego(net: ContPolicyNet, mu: Tensor, g_ego: Tensor) -> Tensor:
     cphi = torch.cos(phi)
     return torch.stack([r * cphi * torch.cos(theta), r * cphi * torch.sin(theta),
                         r * torch.sin(phi)], -1)
+
+
+def variational_u(net: "ContPolicyNet", mu: Tensor, std: Tensor, g_ego: Tensor,
+                  dirs: Optional[Tensor], rng: Optional[Tensor], max_range: float,
+                  reach: float, k: int = 16, temperature: float = 2.0,
+                  lam: float = 2.0) -> Tensor:
+    """Draw a WAYPOINT argument from `exp(-S/T)` over `k` of the policy's own draws.
+
+    The candidates come from the policy -- `mu + std * randn` -- so the network
+    still decides where to look; the action only decides which of the places it
+    was already considering is worth going to.  At a large temperature this is
+    the policy untouched.
+
+    `g_ego` is in REACH units (the convention `_subgoal_ego` works in); the
+    action is computed in metres, because the barrier compares against beam
+    ranges.  Returns the chosen `u`, [n, k_args].
+    """
+    from .variational import beam_points, boltzmann_pick, path_action
+    n, ka = mu.shape
+    cand = mu[:, None, :] + std[None, None, :ka] * torch.randn(
+        n, int(k), ka, dtype=mu.dtype, device=mu.device)
+    flat = cand.reshape(n * int(k), ka)
+    sub = _subgoal_ego(net, flat, g_ego.repeat_interleave(int(k), 0)).reshape(n, int(k), 3) * float(reach)
+    if dirs is None or rng is None or rng.shape[0] != n:
+        return cand[:, 0]                        # no beams this step: the plain draw
+    pts_hit = beam_points(dirs.to(mu.dtype), rng.to(mu.dtype), max_range)
+    S = path_action(sub, g_ego.to(mu.dtype) * float(reach), dirs.to(mu.dtype),
+                    rng.to(mu.dtype), pts_hit[1], lam=lam)
+    idx = boltzmann_pick(S, temperature=temperature)
+    return cand[torch.arange(n, device=mu.device), idx]
 
 
 def time_update(net: ContPolicyNet, records: List[Dict], t_left: List[Tensor],
@@ -838,6 +908,30 @@ def error_update(net: ContPolicyNet, records: List[Dict], reach: float = 10.0,
 # is worth the DIFFERENCE.  That cancels the low level's own progress exactly,
 # gives every emitted token a weight, and scores silence at zero by
 # construction, since silence IS the control.
+
+
+def projected_time(finish_frac: Tensor, final_err: Tensor, success: Tensor,
+                   span: float) -> Tensor:
+    """Time to the goal, PROJECTED for the flights that never got there.
+
+    A flight that arrives is scored by when it arrived.  One that does not has
+    no arrival time, and `finish_frac` gives every such flight exactly 1.0 --
+    so in a paired comparison two failures tie at zero and teach nothing, even
+    when one crashed at two seconds and the other died a metre short.  MEASURED:
+    with arrival at 0.30, ~70% of pairs were both-failures, and only 13% of
+    flights produced any signal at all.
+
+    So a failure is charged 1.0 plus the time the distance it still had to go
+    WOULD have taken at cruise: `final_err / span`, where `span` is how far the
+    vehicle travels in a whole episode.  That keeps one currency -- time -- and
+    ranks failures by how close they got, while never letting a crash look
+    fast: dying early leaves the most distance outstanding and therefore costs
+    the most.  This is the property `soft_time` gets backwards, since it stops
+    accumulating at death and so pays for crashing.
+    """
+    t = finish_frac.to(torch.float64).reshape(-1)
+    extra = final_err.to(torch.float64).reshape(-1) / max(float(span), 1e-9)
+    return torch.where(success.to(torch.bool).reshape(-1), t, t + extra)
 
 
 def paired_advantage(t_arr: Tensor, t_ctl: Tensor) -> Tensor:

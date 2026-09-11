@@ -114,6 +114,14 @@ class PolicyComposer(TransformerComposer):
         # injected twin is what an emitted token is worth, and it is the only
         # credit signal in the update now.
         self.mute = bool(kw.pop("mute", False))
+        # PROBABILISTIC WAYPOINTS FROM THE PATH ACTION.  `var_temp` 0 is off.
+        # A WAYPOINT's argument is redrawn from exp(-S/T) over `var_k` of the
+        # policy's own candidate draws, S being the two-leg path action through
+        # the beams (see composer/variational.py).  `var_lam` weighs the
+        # obstacle barrier against path length, in metres.
+        self.var_temp = float(kw.pop("var_temp", 0.0))
+        self.var_k = int(kw.pop("var_k", 16))
+        self.var_lam = float(kw.pop("var_lam", 2.0))
         self._tok_count = None
         self._tok_decay = float(kw.pop("explore_decay", 0.5))   # counts kept across ~2 batches
         super().__init__(system, trainable, **kw)
