@@ -114,6 +114,17 @@ class PolicyComposer(TransformerComposer):
         # injected twin is what an emitted token is worth, and it is the only
         # credit signal in the update now.
         self.mute = bool(kw.pop("mute", False))
+        # A ROUTER ALWAYS ROUTES: with this set, EOS is masked out of the type
+        # logits, the type stops being an action, and the placement is the
+        # whole policy.  See `route_update` and `composer-routes-low-level-avoids`.
+        self.route_only = bool(kw.pop("route_only", False))
+        # COMMON RANDOM NUMBERS for the CONTINUOUS argument draw, and the sign
+        # that makes a pair antithetic.  `crn_sample` already does this for the
+        # discrete token; the argument -- which is the whole action for a
+        # router -- was left on independent noise.  See the note at the draw
+        # site in `policy_cont`.
+        self.crn_u = kw.pop("crn_u", None)
+        self.noise_sign = float(kw.pop("noise_sign", 1.0))
         # PROBABILISTIC WAYPOINTS FROM THE PATH ACTION.  `var_temp` 0 is off.
         # A WAYPOINT's argument is redrawn from exp(-S/T) over `var_k` of the
         # policy's own candidate draws, S being the two-leg path action through
@@ -121,7 +132,25 @@ class PolicyComposer(TransformerComposer):
         # obstacle barrier against path length, in metres.
         self.var_temp = float(kw.pop("var_temp", 0.0))
         self.var_k = int(kw.pop("var_k", 16))
-        self.var_lam = float(kw.pop("var_lam", 2.0))
+        # ZERO, not 2.0.  `var_lam` weights the obstacle-avoidance barrier in
+        # `path_action`, and the composer must NOT do avoidance: the low level
+        # already has the beams and prox_gain 30, so a barrier here is that job
+        # done a SECOND time and the two steer against each other.
+        #
+        # MEASURED as a dose-response, 1024 paired tasks, identical seeds, a
+        # deterministic router deciding at EVERY report (arrive / crash / d vs
+        # the muted control):
+        #     muted      0.551 / 0.449       --
+        #     lam 0.0    0.578 / 0.422    +0.027 +- 0.011   t +2.58
+        #     lam 0.5    0.552 / 0.386    +0.001 +- 0.016   t +0.06
+        #     lam 1.0    0.537 / 0.388    -0.014 +- 0.017   t -0.80
+        #     lam 2.0    0.476 / 0.438    -0.075 +- 0.017   t -4.42
+        # The barrier DOES work -- crashes fall 0.449 -> 0.386 as it is weighted
+        # up -- but arrivals fall faster: it buys safety by not going anywhere.
+        # lam 0 is the first configuration in this project to beat silence at
+        # significance.  Every earlier placement test ran lam 2 and so was
+        # measuring this term, not the value of routing.
+        self.var_lam = float(kw.pop("var_lam", 0.0))
         self._tok_count = None
         self._tok_decay = float(kw.pop("explore_decay", 0.5))   # counts kept across ~2 batches
         super().__init__(system, trainable, **kw)

@@ -234,9 +234,60 @@ class ContVocab:
             # the filter admits nothing, the loss is nan, and the run cannot
             # bootstrap at all.  "0 tokens from 0/288", six iterations running.
             radius = g_ego.norm(dim=-1).to(dt).clamp(max=1.0)
-            r = (pend[:, 0].to(dt) + 1.0) * 0.5 * radius               # [-1,1] -> [0, radius]
-            theta = math.pi * pend[:, 1].to(dt)                        # [-1,1] -> [-pi, pi], from the nose
-            phi = PHI_MAX * pend[:, 2].to(dt)                          # [-1,1] -> [-PHI_MAX, PHI_MAX]
+            # THE ORIGIN MUST BE EXACTLY THE DO-NOTHING ACTION.
+            #
+            # `(a0+1)/2 * radius` puts mu = 0 at HALF the goal distance, so an
+            # untrained router places a subgoal halfway to the goal -- not the
+            # identity.  Silence is `delta = 0`, the subgoal BEING the goal, and
+            # a router with EOS masked cannot decline to place: it is forced
+            # into a slightly harmful move and can only choose which one.
+            # MEASURED: on the judge the fresh router opens at 0.242 against
+            # silence's 0.2692 +- 0.0045, and 30 uninterrupted iterations with
+            # every diagnostic healthy (EV +0.37, kl 0.006-0.009 inside the cap,
+            # clipfrac 0.17-0.34, speak flat) never recovered it: 0.199, 0.156,
+            # 0.191.  A sound estimator cannot climb out of a floor set by the
+            # action frame.
+            #
+            # `1 + min(0, tanh(a0))` is 1 at the origin (subgoal ON the goal =
+            # silence), falls to 0 as a0 -> -inf, and is flat above -- r cannot
+            # usefully exceed the goal anyway, so the flat side costs nothing.
+            # `pend` is ALREADY squashed (the live path calls `V.squash(u)`
+            # before `step`), so no tanh here -- `_subgoal_ego` squashes
+            # internally instead.  Applying it twice made the rollout geometry
+            # and the loss's mirror disagree; there is a test.
+            r = (1.0 + torch.clamp(pend[:, 0].to(dt), max=0.0)) * radius
+            # THE BEARING IS MEASURED FROM THE GOAL, not from the nose.
+            #
+            # From the nose, the full +-180 degrees is compressed into
+            # a1 in [-1,1], so the network must reproduce atan2(g_y, g_x) to a
+            # few degrees at EVERY decision or the flight fails -- and the error
+            # is amplified by pi.  MEASURED: a student distilled onto a teacher
+            # that arrives 0.576 reached MSE 0.0349 in mu (RMS 0.187, about 33
+            # degrees of bearing) and still arrived 0.000, ruining 213 of 213
+            # flights.  Nearly all the network's capacity went into the goal
+            # geometry, leaving any beam-driven routing a rounding correction on
+            # top of a large learned quantity -- which is why `sens` was ~0.
+            #
+            # Goal-relative, a1 = 0 IS straight at the goal: the identity sits
+            # at the INTERIOR ORIGIN (no boundary optimum, so no |mu| runaway --
+            # it reached 21.7 and tanh'(21.7) ~ 1e-16), and the network's whole
+            # output becomes the DEVIATION, which is the routing decision
+            # itself, with the beams at full leverage.
+            #
+            # This is NOT `goal_residual`, which added atanh(bearing) into mu
+            # PRE-squash and was removed for supplying "99.9% of theta's
+            # variation".  Variance share is not importance: theta mostly DOES
+            # point at the goal, and obstacle deviations are rare and small in
+            # variance while being decisive in effect.  After that removal
+            # perception was still irrelevant (sens ~ 0) and the base competence
+            # was gone too.  Here the correction is in ANGLE space and spans the
+            # whole circle, so the learned part is not a rounding error, and
+            # `sens` measures it in reach units rather than as a variance share.
+            _gn = g_ego.norm(dim=-1).clamp_min(1e-9).to(dt)
+            _gb = torch.atan2(g_ego[:, 1].to(dt), g_ego[:, 0].to(dt))
+            _gp = torch.asin((g_ego[:, 2].to(dt) / _gn).clamp(-1.0, 1.0))
+            theta = _gb + math.pi * pend[:, 1].to(dt)                  # 0 -> straight at the goal
+            phi = (_gp + PHI_MAX * pend[:, 2].to(dt)).clamp(-PHI_MAX, PHI_MAX)
             # The radius is the 3-D distance now, so the arrival degeneracy
             # holds in three dimensions: r at its maximum, aimed at the goal,
             # puts the subgoal exactly ON the goal.  Measuring it horizontally
@@ -261,14 +312,23 @@ class ContVocab:
 
 
 def log_prob(tok_logits: Tensor, mu: Tensor, log_std: Tensor, tok: Tensor, u: Tensor,
-             n_args: Tensor) -> Tensor:
+             n_args: Tensor, type_is_action: bool = True) -> Tensor:
     """Log-density of `[type, arguments]`, [B].
 
     Categorical over the type, plus a diagonal Gaussian over the UNSQUASHED
     arguments that type actually uses -- a token with no arguments contributes
     only its type term, so EOS and LOOK are pure classification.
     """
-    lp = torch.log_softmax(tok_logits, -1).gather(-1, tok[:, None]).squeeze(-1)
+    # `type_is_action=False` drops the categorical term.  Under `route_only`
+    # EOS is masked at rollout and every act is WAYPOINT, so the type is a
+    # CONSTANT, not a decision -- and a constant in the likelihood ratio still
+    # inflates the KL, eating the trust-region budget the real action (the
+    # placement) needs, and still carries gradient into the type head.
+    # MEASURED: `speak` drifting 0.401 -> 0.204 toward an action that is masked
+    # and cannot be taken, while clipfrac sat at 0.43-0.61 with kl pinned at the
+    # 0.02 cap -- the budget spent on a phantom choice.
+    lp = (torch.log_softmax(tok_logits, -1).gather(-1, tok[:, None]).squeeze(-1)
+          if type_is_action else torch.zeros(mu.shape[0], dtype=mu.dtype, device=mu.device))
     k = mu.shape[-1]
     idx = torch.arange(k, device=mu.device)[None, :]
     used = idx < n_args[:, None]                                   # [B, k]

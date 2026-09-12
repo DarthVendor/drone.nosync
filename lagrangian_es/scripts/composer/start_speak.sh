@@ -23,11 +23,35 @@
 # 0.0133 at 1152 episodes; trend +0.0004 +- 0.0005, t = 0.79).  It converged by
 # iteration 11 and then reproduced itself for 12 more.
 #
+# THE ENVIRONMENT BUG THIS RUN CAME BACK FROM.  The numbers above were taken
+# when a placement was PERMANENT: the controller targets `goal + delta`, EOS
+# means "no change" so it never cleared `delta`, and `inject_at` made the
+# injected steps the only ones a row decided at -- so the vehicle flew to
+# `goal + delta` and parked there for the rest of the episode.  A waypoint was
+# not a waypoint, it was an irreversible goal displacement, which is why every
+# bearing cost the same.  `Rollout._composer_step` now retires a placement the
+# vehicle has REACHED.  Same test, same seeds, after the fix:
+#
+#     +90 deg  -0.258 -> -0.078   |  +180 deg  -0.254 -> -0.051
+#     0 deg    -0.254 -> -0.062   |  final_err +3.1 m -> +0.8 m
+#
+# Parking was ~75-80% of the harm.  A forced waypoint is still mildly costly at
+# an arbitrary bearing -- an unmotivated detour on a 20 m leg -- and direction
+# is still not separated (spread 0.027 against a paired SE of about the same).
+# What changed is that a CHOSEN waypoint now has room to come out ahead.
+#
 # WHAT SUCCESS LOOKS LIKE.  `speak` must MOVE.  If emitting is uniformly bad it
 # should fall toward the 0.1 exploration floor and `arrive` climb toward the
 # muted 0.539; if it is contextually useful the bandit keeps it where it pays.
 # Either way this is the first objective in the project that can reach the
 # decision, so a flat `speak` now means a real bug, not a weak signal.
+#
+# On the BROKEN environment this run drove speak 0.370 -> 0.000 in 13
+# iterations and parked the judge at 0.270 +- 0.005 for 122 more -- the correct
+# answer to an action space with no beneficial region.  That trace is the
+# baseline to beat: if speak again collapses to zero on the FIXED environment,
+# the waypoint really is worthless to this low level and the next question is
+# the low level, not the composer.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

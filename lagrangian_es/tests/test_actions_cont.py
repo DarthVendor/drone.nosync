@@ -57,14 +57,35 @@ def test_the_waypoint_is_polar_in_the_vehicles_own_frame():
 
 def test_r_spans_from_a_full_stop_to_the_whole_reach():
     """r is the only brake the task level has: -1 puts the subgoal on the
-    vehicle (stop), +1 puts it at the edge of what it can reach."""
+    vehicle (stop), 0 puts it at the edge of what it can reach.
+
+    ZERO IS THE WHOLE REACH, not the midpoint. `r = (1 + min(0, a0)) * radius`
+    replaced `(a0 + 1)/2 * radius` so that the ORIGIN of the action space is the
+    do-nothing move -- a0 = 0 with the goal-relative bearing is "subgoal on the
+    goal", i.e. exactly silence.
+      Under the old midpoint form an untrained router placed every subgoal at
+    HALF the goal distance, a move it could not decline because `route_only`
+    masks EOS: measured, it opened on the judge at 0.242 against silence's
+    0.2692 +- 0.0045 and 30 uninterrupted iterations with every diagnostic
+    healthy (EV +0.37, kl inside the 0.02 cap, clipfrac 0.17-0.34, speak flat)
+    never recovered -- 0.199, 0.156, 0.191. A sound estimator cannot climb out
+    of a floor set by the action frame. With the origin corrected an UNTRAINED
+    net scores 0.578 against a muted 0.555.
+      a0 > 0 is flat at the whole reach: r cannot usefully exceed the goal, so
+    the clamp costs nothing.
+    """
     V = ContVocab(2)
     x, goal, stop = _place(V, -1.0, 0.0)
-    assert float((goal + stop.delta)[0][:2].sub(x[0][:2]).norm()) < 1e-9, "r=-1 should be a full stop"
-    _, goal2, far = _place(V, 1.0, 0.0)
-    assert abs(float((goal2 + far.delta)[0][:2].sub(x[0][:2]).norm()) - 10.0) < 1e-6
-    _, goal3, mid = _place(V, 0.0, 0.0)
-    assert abs(float((goal3 + mid.delta)[0][:2].sub(x[0][:2]).norm()) - 5.0) < 1e-6
+    assert float((goal + stop.delta)[0][:2].sub(x[0][:2]).norm()) < 1e-9, "r=-1 is a full stop"
+    _, goal2, far = _place(V, 0.0, 0.0)
+    assert abs(float((goal2 + far.delta)[0][:2].sub(x[0][:2]).norm()) - 10.0) < 1e-6, \
+        "r=0 is the WHOLE reach -- the origin must be the do-nothing action"
+    _, goal3, mid = _place(V, -0.5, 0.0)
+    assert abs(float((goal3 + mid.delta)[0][:2].sub(x[0][:2]).norm()) - 5.0) < 1e-6, \
+        "the brake lives on the negative side now"
+    _, goal4, over = _place(V, 1.0, 0.0)
+    assert abs(float((goal4 + over.delta)[0][:2].sub(x[0][:2]).norm()) - 10.0) < 1e-6, \
+        "a0 > 0 is flat at the whole reach"
 
 
 def test_the_placement_ball_shrinks_onto_the_goal_so_arrival_is_an_attractor():
@@ -201,12 +222,22 @@ def test_the_update_runs_and_moves_both_heads_under_its_trust_region():
     for t in range(T):
         tok = _fake_tok(B, 20.0, net.goal_gain)
         act = torch.randint(0, V.V, (B,))
-        recs.append({"t": float(t * 20), "act": act, "u": torch.randn(B, V.n_args),
+        # THE BEHAVIOUR POLICY MUST BE THE NET'S OWN.  A random `mu`/`pi_logits`
+        # puts the importance ratio at e^+-20 before the update begins, and an
+        # honestly enforced trust region then refuses to step at all -- which is
+        # correct behaviour on data that far off-policy, but tests nothing.
+        # Real records are written by the net being updated, so take them from
+        # it and perturb by one exploration draw.
+        with torch.no_grad():
+            _lg, _mu_all, _ = net.pre(tok)
+            _mu = _mu_all[torch.arange(B), act]
+            _u = _mu + net.log_std.exp() * torch.randn(B, V.n_args)
+        recs.append({"t": float(t * 20), "act": act, "u": _u,
                      "n_args": torch.tensor([V.n_arg_of(int(z)) for z in act.tolist()]),
                      "moved": act == V.WAYPOINT, "alive": torch.ones(B, dtype=torch.bool),
                      "rows": torch.arange(B), "tok_keep": None,
-                     "logits": torch.randn(B, V.V), "pi_logits": torch.randn(B, V.V),
-                     "mu": torch.randn(B, V.n_args), "log_std": net.log_std.detach().clone(),
+                     "logits": _lg.clone(), "pi_logits": _lg.clone(),
+                     "mu": _mu.clone(), "log_std": net.log_std.detach().clone(),
                      "tok": tok})
     R = torch.randn(T, B, dtype=torch.float64)
     before = {k: v.detach().clone() for k, v in net.state_dict().items()}
@@ -215,9 +246,24 @@ def test_the_update_runs_and_moves_both_heads_under_its_trust_region():
     moved = {k for k, v in net.state_dict().items() if not torch.equal(v, before[k])}
     assert any(k.startswith("head_act") for k in moved), "the type head did not move"
     assert any(k.startswith("arg_w") for k in moved), "the argument heads did not move"
-    # the spread is FROZEN on purpose: fitting it by maximum likelihood on the
-    # policy's own successes shrinks it every update until exploration dies
-    assert "log_std" not in moved, "the argument spread should be frozen"
+    # THE SPREAD IS THE MODEL'S TO CHOOSE under PPO.
+    #
+    # It was frozen because fitting it by MAXIMUM LIKELIHOOD on the policy's own
+    # successes shrinks it every update until exploration dies -- true of the
+    # imitation path, where the objective IS a likelihood fit. Under a policy
+    # gradient the update on the spread is advantage-weighted, not a fit to
+    # residuals, so that mechanism does not apply.
+    #   Frozen, it was also the constant that forced saturation: REINFORCE
+    # sharpens around actions that paid, and with the width fixed the only way
+    # to become more certain is to push `mu` toward the tanh boundary --
+    # "sharpen" and "run to the extreme" become the same move. MEASURED,
+    # mean |mu| went 0.37 -> 21.7 in 13 iterations, tanh'(21.7) ~ 1e-16, and the
+    # network collapsed to a constant function of its inputs.
+    assert "log_std" in moved, "the spread must be learnable, not pinned"
+    # ... but it must not COLLAPSE: exploration dying is the failure the freeze
+    # was guarding against, and nothing here replaces that guard except this.
+    assert float(net.log_std.exp().min()) > 0.5 * float(before["log_std"].exp().min()), \
+        "the spread must not collapse in a single update"
     # a huge learning rate must trip the cap rather than run away
     net2 = _cont_net()
     st2 = ppo_update_cont(net2, recs, R, 2, epochs=8, batch=16, lr=5.0, target_kl=0.01)

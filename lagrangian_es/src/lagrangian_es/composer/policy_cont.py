@@ -124,8 +124,21 @@ class ContPolicyNet(PolicyNet):
         self.goal_residual = False
         self.time_head = nn.Sequential(nn.Linear(d + 3, d), nn.GELU(),
                                        nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1))
+        # LEARNABLE.  Frozen, this is the constant that forced the placement head
+        # into saturation: REINFORCE sharpens around actions that paid, and with
+        # `std` fixed the ONLY way to become more certain is to push `mu` toward
+        # the tanh boundary -- "sharpen" and "run to the extreme" are the same
+        # move.  MEASURED (router_2107, 13 iterations): mean |mu| 0.37 -> 21.7,
+        # tanh'(21.7) ~ 1e-16, and probing that checkpoint the commanded subgoal
+        # shifted 0.0013 reach units when every beam was shuffled and 0.0000 when
+        # the GOAL was -- a 964k-parameter network collapsed to a constant.
+        #
+        # Learnable, the policy can sharpen IN PLACE by lowering its own noise
+        # and leave `mu` interior, where tanh is responsive and perception can
+        # still reach the placement.  This REMOVES a hand-set constant rather
+        # than adding a barrier to fight its consequences.
         self.log_std = nn.Parameter(torch.full((k,), math.log(0.12)),
-                                    requires_grad=False)
+                                    requires_grad=True)
         # A remembered instruction IS its type together with its arguments.
         # Carrying them only as raw numbers in feature slots 2-3 conflated them
         # with what those slots mean for a MEASUREMENT token, where they are the
@@ -468,7 +481,23 @@ class ContComposer(PolicyComposer):
             if getattr(self, "mute", False):        # the control: say nothing
                 b_logits = torch.full_like(b_logits, -1e9)
                 b_logits[:, self.net.vocab.EOS] = 0.0
-            p_sp = float(getattr(self, "speak_floor", 0.0))
+            elif getattr(self, "route_only", False):
+                # A ROUTER ALWAYS ROUTES.  The composer picks where to go while
+                # the low level flies the kinematics, so "stay silent" is not
+                # one of its moves -- the type stops being an action at all and
+                # the placement becomes the whole policy.  EOS is masked out
+                # here rather than merely discouraged, so nothing has to learn
+                # to avoid it and the argument head carries every gradient.
+                b_logits = b_logits.clone()
+                b_logits[:, self.net.vocab.EOS] = -1e9
+            # NOT WHEN MUTED.  `speak_floor` used to fire regardless, so a
+            # control configured with both `mute` and a speak floor was forced
+            # to emit a WAYPOINT on every decision -- the exact opposite of a
+            # control.  It silently produced a "muted" baseline of arrive 0.000
+            # against a true 0.551, which would have made any arm it was paired
+            # against look spectacular.  The mute branch above is the whole
+            # point of a control and nothing may override it.
+            p_sp = 0.0 if getattr(self, "mute", False) else float(getattr(self, "speak_floor", 0.0))
             if self.stochastic and p_sp > 0.0 and step == 0:
                 force = torch.rand(B, device=dev) < p_sp
                 if bool(force.any()):
@@ -502,7 +531,41 @@ class ContComposer(PolicyComposer):
                 s = std[None].expand_as(mu)
                 if exploring:
                     s = torch.where(rec[:, None], s * (1.0 + eps), s)
-                u = mu + s * torch.randn_like(mu)
+                # COMMON RANDOM NUMBERS ON THE ARGUMENT DRAW.
+                #
+                # `crn_sample` gives the discrete token draw common random
+                # numbers -- measured here, it took genome ranking across two
+                # task draws from Spearman +0.02 (noise) to +0.51 -- but the
+                # CONTINUOUS argument was left on independent `randn_like`, and
+                # for a router the argument IS the whole action.
+                #   MEASURED consequence: the PPO gradient on disjoint halves of
+                # one batch agreed at cosine +0.044, while the same batch with
+                # the advantage SHUFFLED agreed at +0.259.  The credit term is
+                # not weak signal, it is noise, and it destroys even the
+                # structural agreement the states alone provide.  Each update
+                # duly spends its whole KL budget (|dmu| ~ 0.024, steps 4-6 of
+                # 30) in an uncorrelated direction, so 90 updates netted 0.018
+                # of drift: the policy diffuses instead of learning.
+                #   `crn_u` makes epsilon a deterministic function of (row,
+                # decision index, seed), so two flights of the SAME task share
+                # their exploration noise, and `noise_sign` flips it -- an
+                # ANTITHETIC pair whose outcome difference isolates the
+                # directional derivative with task, seed and sensor noise all
+                # shared.  Off by default: plain independent noise is unchanged.
+                _crn_u = getattr(self, "crn_u", None)
+                if _crn_u is not None:
+                    _E, _sd = int(_crn_u[0]), int(_crn_u[1])
+                    _k = int(getattr(self, "_crn_k", 0))
+                    # `ids` are this decision's row indices (the rollout passes
+                    # `ids_full[idx]` in); epsilon is drawn per EPISODE for the
+                    # k-th decision, so the same task sees the same exploration
+                    # noise in both arms of a pair.
+                    _g = torch.Generator(device="cpu").manual_seed(int(_sd * 1_000_003 + _k) % (2 ** 63 - 1))
+                    _base = torch.randn(_E, mu.shape[-1], generator=_g, dtype=torch.float64)
+                    _eps = _base[(ids.cpu().to(torch.int64) % _E)].to(mu.dtype).to(mu.device)
+                    u = mu + s * (_eps * float(getattr(self, "noise_sign", 1.0)))
+                else:
+                    u = mu + s * torch.randn_like(mu)
                 # PROBABILISTIC WAYPOINTS FROM THE ACTION.  For the rows whose
                 # token is a WAYPOINT, redraw the argument from exp(-S/T) over
                 # `var_k` of the policy's OWN candidates, S being the two-leg
@@ -524,7 +587,7 @@ class ContComposer(PolicyComposer):
                                 self.net, mu[wp], std, gk, dirs, rng_all[wp].to(mu.dtype),
                                 rmax, self.reach, k=int(getattr(self, "var_k", 16)),
                                 temperature=float(self.var_temp),
-                                lam=float(getattr(self, "var_lam", 2.0)))
+                                lam=float(getattr(self, "var_lam", 0.0)))
             if self.stochastic and rec_rows is not None and bool(rec.any()):
                 V = self.net.vocab
                 n_args = torch.tensor([V.n_arg_of(int(t)) for t in act.tolist()],
@@ -536,7 +599,22 @@ class ContComposer(PolicyComposer):
                     "logits": b_logits[rec].float().clone(),
                     "pi_logits": logits[rec].float().clone(),
                     "mu": mu[rec].float().clone(),
-                    "log_std": self.net.log_std.detach().float().clone(),
+                    # THE WIDTH THE ACTION WAS ACTUALLY DRAWN AT, which is
+                    # `log_std * temperature`, not the bare parameter.  `choose`
+                    # samples with `log_std.exp() * temp`; recording the bare
+                    # value made every importance ratio wrong by that factor.
+                    # MEASURED at temp 8 (std 0.96 sampled, 0.12 assumed): with
+                    # var 0.0144 and draws ~1.0 from the mean, d(logp)/d(mu) =
+                    # (u-mu)/var ~ 69, so a mu shift of 0.1 moves the log-ratio
+                    # by ~7 and the ratio by ~1000.  PPO's KL hit 100.97 against
+                    # a 0.02 cap with 97% of samples clipped, and the policy loss
+                    # reached 3e5 -- which then starved the value head, because
+                    # clip_grad_norm_(1.0) rescales the WHOLE gradient and left
+                    # the critic ~3e-6 of it.  EV sat at -0.006: the state
+                    # baseline was inert, not because the critic could not learn
+                    # but because it never got any gradient.
+                    "log_std": (self.net.log_std.detach().float()
+                                + math.log(max(float(getattr(self, "temperature", 1.0)), 1e-6))).clone(),
                     "alive": ctx_s["alive"][rec].clone(), "rows": ids[rec].clone(),
                     # WHERE THE VEHICLE WAS, for the error loss.  The composer's
                     # output is a claim about where the drone can be by the next
@@ -632,9 +710,19 @@ def _subgoal_ego(net: ContPolicyNet, mu: Tensor, g_ego: Tensor) -> Tensor:
     a = torch.tanh(mu)                                   # [n, k] squashed arguments
     L0 = g_ego.norm(dim=-1)
     radius = L0.clamp(max=1.0)
-    r = (a[:, 0] + 1.0) * 0.5 * radius
-    theta = math.pi * a[:, 1]
-    phi = PHI_MAX * a[:, 2] if a.shape[-1] > 2 else torch.zeros_like(theta)
+    # mu = 0 is the subgoal ON the goal, i.e. exactly silence -- mirroring
+    # `ContVocab.finish`.  See the note there.
+    r = (1.0 + torch.clamp(a[:, 0], max=0.0)) * radius
+    # GOAL-RELATIVE, mirroring `ContVocab.finish` exactly -- these two must
+    # agree or the loss optimises a different geometry than the rollout flies.
+    # a1 = 0 is straight at the goal, so the identity is at the interior origin
+    # and the network's output is the DEVIATION.  See the note in finish().
+    gn = g_ego.norm(dim=-1).clamp_min(1e-9)
+    gb = torch.atan2(g_ego[:, 1], g_ego[:, 0])
+    gp = torch.asin((g_ego[:, 2] / gn).clamp(-1.0, 1.0))
+    theta = gb + math.pi * a[:, 1]
+    phi = (gp + PHI_MAX * a[:, 2]).clamp(-PHI_MAX, PHI_MAX) if a.shape[-1] > 2 \
+        else torch.zeros_like(theta)
     cphi = torch.cos(phi)
     return torch.stack([r * cphi * torch.cos(theta), r * cphi * torch.sin(theta),
                         r * torch.sin(phi)], -1)
@@ -659,10 +747,43 @@ def variational_u(net: "ContPolicyNet", mu: Tensor, std: Tensor, g_ego: Tensor,
     n, ka = mu.shape
     cand = mu[:, None, :] + std[None, None, :ka] * torch.randn(
         n, int(k), ka, dtype=mu.dtype, device=mu.device)
-    flat = cand.reshape(n * int(k), ka)
-    sub = _subgoal_ego(net, flat, g_ego.repeat_interleave(int(k), 0)).reshape(n, int(k), 3) * float(reach)
+    # ALWAYS OFFER "HEAD STRAIGHT FOR THE GOAL".
+    #
+    # Silence -- a bare EOS -- used to be the identity move: it left `delta` at
+    # zero, so the subgoal WAS the goal and the flight inherited the low level's
+    # own competence.  `route_only` masks EOS out, because a router always
+    # routes, and that removed the identity without replacing it: every
+    # placement became a perturbation of an untrained mean and the judge opened
+    # at arrive 0.000 three times running (crash 0.992, then 0.910 once the
+    # proposal was widened).
+    #
+    # The hand-built router that measured +0.027 always had this candidate in
+    # its set, which is most of why it worked: with lam 0 the score
+    # |sub| + |goal-sub| is minimised ON the line to the goal, and since
+    # `radius = |g_ego|.clamp(max=1)` that candidate IS the goal once inside
+    # reach.  Sampling around mu only ever approximates it.
+    #
+    # So the identity is appended to the draws rather than hoped for.  The
+    # selector is free to reject it -- it is one candidate among k+1, not a
+    # floor -- but the router can always choose to just keep going.
+    # THE IDENTITY IS NOW THE ORIGIN.  In the goal-relative frame a1 = 0 is the
+    # goal bearing, a2 = 0 its elevation, and a0 = 0 the full radius, so
+    # "head straight for the goal" is simply mu = 0.  This used to build it by
+    # hand as [0.999, atan2(g)/pi, asin(g_z)/PHI_MAX] for the old nose-relative
+    # frame; left unchanged it would have fed the selector a candidate from a
+    # geometry that no longer exists.
+    _ident = torch.zeros_like(mu)
+    cand = torch.cat([cand, _ident[:, None, :]], 1)
+    K = cand.shape[1]                        # k draws PLUS the identity, not k
+    flat = cand.reshape(n * K, ka)
+    sub = _subgoal_ego(net, flat, g_ego.repeat_interleave(K, 0)).reshape(n, K, 3) * float(reach)
     if dirs is None or rng is None or rng.shape[0] != n:
-        return cand[:, 0]                        # no beams this step: the plain draw
+        # NO BEAMS THIS STEP -> the IDENTITY, not `cand[:, 0]`.  That returned
+        # the first random draw, which under a widened proposal (LES_TEMP 8,
+        # std ~0.96 in tanh space) is a placement anywhere on the sphere -- a
+        # wild guess flown precisely when the router can see nothing to justify
+        # it.  With nothing to go on, head for the goal.
+        return _ident
     pts_hit = beam_points(dirs.to(mu.dtype), rng.to(mu.dtype), max_range)
     S = path_action(sub, g_ego.to(mu.dtype) * float(reach), dirs.to(mu.dtype),
                     rng.to(mu.dtype), pts_hit[1], lam=lam)
@@ -889,6 +1010,131 @@ def speak_update(net: ContPolicyNet, records: List[Dict],
             "ce": acc["pg"] / nb, "nll": acc["spoke"] / nb,
             "match": float(A.mean()),
             "speak": float(1.0 - p[EOS]), "std": float(net.log_std.detach().exp().mean()),
+            "kl": 0.0, "clipfrac": 0.0, "entropy": 0.0, "ev": float("nan"),
+            "w_up": 0.0, "w_abs": 0.0}
+
+
+def route_update(net: ContPolicyNet, records: List[Dict],
+                 advantage: Optional[List[Tensor]] = None, epochs: int = 3,
+                 batch: int = 1024, lr: float = 2e-4, opt=None,
+                 max_samples: int = 10_000, temperature: float = 1.0) -> Dict[str, float]:
+    """SUPERSEDED -- kept for its tests; use `ppo_update_cont` instead.
+
+    THE DEFECT.  This scores every decision in a flight with the SAME
+    flight-level paired advantage, so its within-flight variance is exactly
+    ZERO by construction: with ~60 decisions a flight, all within-flight credit
+    information is discarded before the gradient is formed.  A decision whose
+    causal horizon is one report interval (0.4 s, after which its subgoal is
+    overwritten) is charged with a 36 s outcome -- a ~90:1 mismatch.
+    `ppo_update_cont`'s own comment records this failure being measured in this
+    project already: without a state baseline the advantage "separated crashed
+    from surviving flights at z = -166 while its correlation with the braking
+    argument was -0.013".
+    THE CONSEQUENCE is the goal-only collapse.  Pointing at the goal helps at
+    EVERY decision, so that component correlates with the return between
+    flights and accumulates; a beam response matters at a handful of decisions
+    and receives the flight's advantage at all the rest, which is noise.  A
+    randomly-initialised beam response also makes placements worse, so the
+    advantage drives it to zero and no beam-space exploration remains to find a
+    good one -- measured, `sens` fell 0.31 -> 0.04 at |mu| ~ 0.5, where tanh is
+    fully responsive, so this is NOT saturation.
+    `ppo_update_cont` is the correct estimator and was already the default: per
+    decision returns from the cost stream, minus a learned V(s), normalised,
+    clipped, with a KL cap.
+
+    The composer as a ROUTER: it always emits a waypoint, so the only
+    decision left is WHERE, and that is the whole policy.
+
+    `speak_update` learns WHETHER to speak and is the wrong shape for this: the
+    value lives in the placement.  MEASURED with a deterministic router scoring
+    fixed beam-ring candidates, 1024 paired tasks, only the placement rule
+    differing (arrive / d vs the muted control 0.551):
+
+        lam 0.0   0.578   +0.027 +- 0.011   t +2.58
+        lam 2.0   0.476   -0.075 +- 0.017   t -4.42
+
+    Nothing separates those two arms but where the subgoal goes.  So the loss
+    is the Gaussian log-density of the PLACEMENT that was flown, weighted by
+    its flight's paired advantage -- REINFORCE on the arguments alone.
+
+    The type term of `actions_cont.log_prob` is deliberately NOT included: with
+    `route_only` the type is a constant, not an action, and scoring a constant
+    adds a term with no gradient and a spurious contribution to the loss.
+
+    `log_std` stays frozen (requires_grad=False), so this trains the MEAN
+    placement under fixed exploration -- the continuous analogue of the
+    deterministic router that produced the +0.027 above, which is the bar.
+    """
+    groups = records if (records and isinstance(records[0], list)) else [records]
+    advs = list(advantage) if isinstance(advantage, (list, tuple)) else [advantage]
+    samples, us, wts = [], [], []
+    W = net.vocab.WAYPOINT
+    for gi, recs in enumerate(groups):
+        adv = advs[gi] if gi < len(advs) else None
+        if adv is None:
+            continue
+        for rec in recs:
+            if not rec.get("tok"):
+                continue
+            rows = rec.get("rows")
+            for j in rec["alive"].nonzero().flatten().tolist():
+                b = int(rows[j]) if rows is not None else j
+                samples.append({k: (v[j] if torch.is_tensor(v) else v)
+                                for k, v in rec["tok"].items()})
+                us.append(rec["u"][j]); wts.append(float(adv[b]))
+    if not samples:
+        return {"n": 0, "flights": 0, "kept_flights": 0, "ess": 0.0}
+    gen = torch.Generator().manual_seed(0)
+    if max_samples and len(samples) > max_samples:
+        pick = torch.randperm(len(samples), generator=gen)[:max_samples].sort().values.tolist()
+        samples = [samples[i] for i in pick]
+        us = [us[i] for i in pick]; wts = [wts[i] for i in pick]
+    from .policy import collate_tok
+    tok_all = collate_tok(samples)
+    U = torch.stack(us).float()
+    A = torch.tensor(wts, dtype=torch.float32)
+    # Standardised: the paired control already removed the task's difficulty,
+    # so what is left is how this flight compared with its own twin.
+    A = (A - A.mean()) / A.std().clamp_min(1e-6)
+    n_arg = int(net.vocab.n_arg_of(int(W)))
+    n = U.shape[0]
+    opt = opt or torch.optim.Adam(net.parameters(), lr=lr)
+    acc = {"pg": 0.0, "mu": 0.0, "nb": 0}
+    for _ in range(epochs):
+        order = torch.randperm(n, generator=gen)
+        for s0 in range(0, n, batch):
+            idx = order[s0:s0 + batch]
+            tk = {k: (v[idx] if torch.is_tensor(v) else v) for k, v in tok_all.items()}
+            _, mu_all, _ = net.pre(tk)
+            if not torch.isfinite(mu_all).all():
+                continue
+            mu = mu_all[:, W][:, :n_arg]
+            # THE SAMPLING std, not the bare `log_std`.  `choose` draws with
+            # `log_std.exp() * temperature`, so evaluating the density at
+            # `log_std` alone is the wrong distribution: at LES_TEMP 8 the true
+            # std is ~0.96 against 0.12, a variance off by 64x, and the gradient
+            # (u - mu)/var is inflated ~69x.  The update then behaves as
+            # "regress mu onto far-flung samples at enormous gain" and the head
+            # runs away -- MEASURED on the live run, mean |mu| climbed 8.1 ->
+            # 19.3 over ten iterations.  Past |mu| ~ 3 `tanh` is saturated, its
+            # derivative vanishes, and NOTHING can move the placement any more:
+            # the same checkpoint shifted its subgoal by 0.1% of its own length
+            # when every beam and pixel was shuffled.  Sensor-blindness by
+            # saturation, not because the task lacks a sensor solution.
+            lsd = net.log_std[:n_arg] + math.log(max(float(temperature), 1e-6))
+            var = (2.0 * lsd).exp()
+            g = -0.5 * (((U[idx][:, :n_arg] - mu) ** 2) / var
+                        + 2.0 * lsd + math.log(2 * math.pi))
+            loss = -(g.sum(-1) * A[idx]).mean()
+            loss.backward()
+            nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            opt.step(); opt.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                acc["pg"] += float(loss); acc["mu"] += float(mu.abs().mean()); acc["nb"] += 1
+    nb = max(1, acc["nb"])
+    return {"n": n, "flights": n, "kept_flights": n, "ess": 0.0,
+            "ce": acc["pg"] / nb, "nll": acc["mu"] / nb, "match": float(A.mean()),
+            "speak": 1.0, "std": float(net.log_std.detach().exp().mean()),
             "kl": 0.0, "clipfrac": 0.0, "entropy": 0.0, "ev": float("nan"),
             "w_up": 0.0, "w_abs": 0.0}
 
@@ -1278,7 +1524,9 @@ def imitate_update(net: ContPolicyNet, records: List[Dict], reached: List[Tensor
 def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_terms: int,
                     epochs: int = 2, batch: int = 1024, lr: float = 1e-4, clip: float = 0.2,
                     vcoef: float = 0.5, ent: float = 0.0, target_kl: float = 0.02,
-                    opt=None, max_samples: int = 0) -> Dict[str, float]:
+                    opt=None, max_samples: int = 0, temperature: float = 1.0,
+                    type_is_action: bool = True, td: bool = False,
+                    gamma: float = 0.99, accum: int = 0) -> Dict[str, float]:
     """Clipped surrogate over `[type, arguments]`.
 
     The ratio is taken against the policy AT COLLECTION (`pi_logits`, `mu`,
@@ -1292,7 +1540,8 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
     """
     groups = list(zip(records, returns)) if (records and isinstance(records[0], list)) else [(records, returns)]
     samples, acts, us, nargs, rets, plog, pmu, plsd = [], [], [], [], [], [], [], []
-    for recs, R in groups:
+    kb = []
+    for gi, (recs, R) in enumerate(groups):
         for k, rec in enumerate(recs):
             al = rec["alive"]
             rows = rec.get("rows")
@@ -1304,14 +1553,19 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
                 acts.append(rec["act"][j]); us.append(rec["u"][j]); nargs.append(rec["n_args"][j])
                 rets.append(R[k, b]); plog.append(rec["pi_logits"][j]); pmu.append(rec["mu"][j])
                 plsd.append(rec["log_std"])
+                # (decision index, row) so a TD target can find the NEXT
+                # decision of the same flight.  `R` is the MC discounted return,
+                # so the per-decision reward is recoverable exactly:
+                # R_t = r_t + gamma*R_{t+1}  =>  r_t = R_t - gamma*R_{t+1}.
+                kb.append((k, b, gi))
     if not samples:
         return {"n": 0}
     gen = torch.Generator().manual_seed(0)
     if max_samples and len(samples) > max_samples:
         pick = torch.randperm(len(samples), generator=gen)[:max_samples].sort().values.tolist()
         take = lambda a: [a[i] for i in pick]
-        samples, acts, us, nargs, rets, plog, pmu, plsd = map(
-            take, (samples, acts, us, nargs, rets, plog, pmu, plsd))
+        samples, acts, us, nargs, rets, plog, pmu, plsd, kb = map(
+            take, (samples, acts, us, nargs, rets, plog, pmu, plsd, kb))
     acts = torch.stack(acts).long(); us = torch.stack(us).float()
     nargs = torch.stack(nargs).long(); rets = torch.stack(rets).float()
     old_logits = torch.stack(plog).float(); old_mu = torch.stack(pmu).float()
@@ -1325,13 +1579,129 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
     # returns (spread ~230 here) left it at its initialisation -- explained
     # variance 0.000 -- so it predicted a constant and absorbed nothing.
     rets_n = (rets - rets.mean()) / rets.std().clamp_min(1e-6)
-    old_lp = cont_log_prob(old_logits, old_mu, old_lsd, acts, us, nargs).detach()
+    # ---- TD CREDIT -------------------------------------------------------
+    # MEASURED: Monte-Carlo credit over this horizon carries no resolvable
+    # gradient.  Disjoint halves of one batch agreed at cosine +0.044 while the
+    # same batch with the advantage SHUFFLED agreed at +0.259 -- the credit term
+    # is noise and destroys even the structural agreement the states provide.
+    # The cause is chaos: flipping the sign of the exploration noise (+-0.12
+    # sigma, ~21 degrees of bearing, at each of ~60 decisions) gives an almost
+    # independent flight, so common random numbers bought only a 1.3x variance
+    # reduction (paired sd 0.397 against a single arm's 0.371) where good CRN
+    # gives 3-10x.  A 0.033 effect against sd 0.40 needs ~700 flights for ONE
+    # scalar direction.
+    #   Token effects DO grow with horizon (+0.5 at 2 s, +23 whole), so a short
+    # MC horizon is a proxy and lowering gamma is wrong -- but the VARIANCE grows
+    # faster, so MC signal-to-noise collapses past the decorrelation time.  TD
+    # resolves both: the action is charged with its own pre-chaos interval and
+    # the CRITIC carries the far future, which it can now do (EV +0.58).  The
+    # objection to short horizons applies to MC, where the future is DROPPED,
+    # not bootstrapped.
+    #   `R` is the MC discounted return, so the reward is exact:
+    # R_t = r_t + gamma*R_{t+1}  =>  r_t = R_t - gamma*R_{t+1}.
+    td_next = None
+    if td and kb:
+        pos = {(k, b, g): i for i, (k, b, g) in enumerate(kb)}
+        nxt = torch.full((n,), -1, dtype=torch.long)
+        for i, (k, b, g) in enumerate(kb):
+            j = pos.get((k + 1, b, g))
+            if j is not None:
+                nxt[i] = j
+        r_step = rets_n.clone()
+        have = nxt >= 0
+        r_step[have] = rets_n[have] - gamma * rets_n[nxt[have]]
+        td_next = (nxt, r_step)
+        n_td = int(have.sum())
+    # ----------------------------------------------------------------------
+    old_lp = cont_log_prob(old_logits, old_mu, old_lsd, acts, us, nargs,
+                           type_is_action=type_is_action).detach()
+    # WHERE THIS UPDATE STARTS, which is NOT the behaviour policy.
+    #
+    # The trainer pipelines: update k-1 runs in a thread while rollout k flies,
+    # so iteration k's records were collected by workers reading weights saved
+    # BEFORE update k-1 finished.  The data is one update stale, and the policy
+    # already sits at KL ~0.13 from it before this update changes anything.
+    # That staleness is fine -- the importance ratio against the BEHAVIOUR
+    # policy is exactly what corrects it -- but `target_kl` is a STEP SIZE
+    # control, and capping the total meant the budget was spent before the
+    # first step: measured, loss 0.000 and clipfrac 0.00 on every iteration,
+    # i.e. the policy never moved at all.
+    # So the ratio stays against the behaviour policy (correctness) while the
+    # cap is applied to the DRIFT FROM THE START OF THIS UPDATE (step size).
+    with torch.no_grad():
+        _lp0 = []
+        for _s0 in range(0, n, 2048):
+            _sl = slice(_s0, min(_s0 + 2048, n))
+            _tk = {k: (v[_sl] if torch.is_tensor(v) else v) for k, v in tok_all.items()}
+            _lg, _mu_all, _ = net.pre(_tk)
+            _mu = _mu_all[torch.arange(_mu_all.shape[0]), acts[_sl]]
+            _lsd0 = net.log_std + math.log(max(float(temperature), 1e-6))
+            _lp0.append(cont_log_prob(_lg, _mu, _lsd0, acts[_sl], us[_sl], nargs[_sl],
+                                      type_is_action=type_is_action))
+        lp_start = torch.cat(_lp0).detach()
     opt = opt or torch.optim.Adam(net.parameters(), lr=lr)
     acc = {"loss": 0.0, "v_loss": 0.0, "ent": 0.0, "clipfrac": 0.0, "nb": 0, "kl": 0.0}
     stop = False
+    # ---- GRADIENT ACCUMULATION ACROSS TASK DRAWS -------------------------
+    # `accum > 1` makes ONE pass over this batch, scales the gradient by
+    # 1/accum, and does NOT step -- the caller steps once every `accum`
+    # iterations.  The policy is unchanged throughout the window, so every
+    # batch is exactly on-policy (ratio 1, clipping inert) and nothing goes
+    # stale: this is a large-batch policy gradient, assembled one rollout at a
+    # time.
+    #   MEASURED, why it is needed: the MC gradient agrees between disjoint
+    # halves of the SAME task set at cosine +0.46 (shuffled null -0.69) but
+    # between two INDEPENDENT task sets at -0.45.  Consecutive updates undo each
+    # other, which is why 90 updates permitted |dmu| ~ 0.024 each netted 0.018
+    # of drift.  That is TASK variance and only more tasks per STEP reduces it --
+    # and more tasks per ROLLOUT does not fit: 4608 episodes and then 2304 were
+    # both killed before one iteration on this 16 GB machine.  Accumulation buys
+    # the same effective batch for wall-clock instead of memory.
+    if accum and accum > 1:
+        for _ in range(1):
+            order = torch.randperm(n, generator=gen)
+            for s0 in range(0, n, batch):
+                idx = order[s0:s0 + batch]
+                tk = {k: (v[idx] if torch.is_tensor(v) else v) for k, v in tok_all.items()}
+                logits, mu_all, val = net.pre(tk)
+                if not (torch.isfinite(logits).all() and torch.isfinite(mu_all).all()):
+                    continue
+                mu = mu_all[torch.arange(mu_all.shape[0], device=mu_all.device), acts[idx]]
+                lsd_now = net.log_std + math.log(max(float(temperature), 1e-6))
+                lp = cont_log_prob(logits, mu, lsd_now, acts[idx], us[idx], nargs[idx],
+                                   type_is_action=type_is_action)
+                a = rets_n[idx] - val.detach()
+                a = (a - a.mean()) / a.std().clamp_min(1e-6)
+                pol = -(lp * a).mean()
+                vl = ((val - rets_n[idx]) ** 2).mean()
+                ((pol + vcoef * vl) / float(accum) / max(1, n // batch)).backward()
+                with torch.no_grad():
+                    acc["loss"] += float(pol); acc["v_loss"] += float(vl); acc["nb"] += 1
+        nb = max(1, acc["nb"])
+        with torch.no_grad():
+            sel = torch.randperm(n, generator=gen)[:2048]
+            tkv = {k: (v[sel] if torch.is_tensor(v) else v) for k, v in tok_all.items()}
+            v0 = net.pre(tkv)[2]
+            ev = float(1.0 - (rets_n[sel] - v0).var() / rets_n[sel].var().clamp_min(1e-9))
+        p_ = torch.softmax(old_logits, -1).mean(0)
+        return {"n": n, "nb": acc["nb"], "kl": 0.0, "clipfrac": 0.0,
+                "loss": acc["loss"] / nb, "v_loss": acc["v_loss"] / nb, "entropy": 0.0,
+                "speak": float(1.0 - p_[net.vocab.EOS]),
+                "std": float(net.log_std.detach().exp().mean()), "ev": ev,
+                "stopped_early": False, "accumulating": True}
+    # ----------------------------------------------------------------------
     for _ in range(epochs):
         if stop:
             break
+        if td_next is not None:
+            # V for every sample, once per epoch, for the TD bootstrap
+            with torch.no_grad():
+                _v = []
+                for _s0 in range(0, n, 2048):
+                    _sl = slice(_s0, min(_s0 + 2048, n))
+                    _tk = {k: (v[_sl] if torch.is_tensor(v) else v) for k, v in tok_all.items()}
+                    _v.append(net.pre(_tk)[2])
+                v_all = torch.cat(_v)
         order = torch.randperm(n, generator=gen)
         for s0 in range(0, n, batch):
             idx = order[s0:s0 + batch]
@@ -1340,7 +1710,15 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
             if not (torch.isfinite(logits).all() and torch.isfinite(mu_all).all()):
                 continue
             mu = mu_all[torch.arange(mu_all.shape[0], device=mu_all.device), acts[idx]]
-            lp = cont_log_prob(logits, mu, net.log_std, acts[idx], us[idx], nargs[idx])
+            # BOTH SIDES AT THE SAMPLING WIDTH.  `choose` draws with
+            # `log_std.exp() * temperature`, and the records now carry that.
+            # Evaluating the new policy at the bare `log_std` would put the two
+            # densities in different families and the ratio would be wrong even
+            # at an unchanged policy -- and `log_std` is learnable, so it does
+            # not cancel.
+            lsd_now = net.log_std + math.log(max(float(temperature), 1e-6))
+            lp = cont_log_prob(logits, mu, lsd_now, acts[idx], us[idx], nargs[idx],
+                               type_is_action=type_is_action)
             ratio = (lp - old_lp[idx]).clamp(-20.0, 20.0).exp()
             # THE STATE BASELINE.  Without subtracting V(s) the advantage is the
             # raw return, which is dominated by whether the flight eventually
@@ -1349,23 +1727,85 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
             # braking argument was -0.013.  Every decision in a bad flight was
             # pushed down equally, so the gradient carried almost no information
             # about what the composer actually chose.
-            a = rets_n[idx] - val.detach()
+            if td_next is not None:
+                # A_t = r_t + gamma*V(s_{t+1}) - V(s_t), with V(next) = 0 at the
+                # end of a flight.  One forward pass already gives V for this
+                # minibatch; the NEXT decision's V comes from `v_all`, refreshed
+                # each epoch so it tracks the critic without a second graph.
+                _nxt, _r = td_next
+                _vn = torch.where(_nxt[idx] >= 0, v_all[_nxt[idx].clamp_min(0)],
+                                  torch.zeros_like(val.detach()))
+                a = _r[idx] + gamma * _vn - val.detach()
+                v_target = (_r[idx] + gamma * _vn).detach()
+            else:
+                a = rets_n[idx] - val.detach()
+                v_target = rets_n[idx]
             a = (a - a.mean()) / a.std().clamp_min(1e-6)
             loss = -torch.min(ratio * a, ratio.clamp(1 - clip, 1 + clip) * a).mean()
-            v_loss = ((val - rets_n[idx]) ** 2).mean()
-            h = cont_entropy(logits, net.log_std).mean()
+            v_loss = ((val - v_target) ** 2).mean()
+            h = cont_entropy(logits, lsd_now).mean()
+            # ENFORCE THE TRUST REGION BEFORE STEPPING, not after.
+            #
+            # The cap used to be checked on the RUNNING MEAN across minibatches
+            # and only broke once that mean was already over, so it stopped long
+            # after the damage.  MEASURED on a live run with target_kl 0.02: the
+            # reported kl was 0.14-0.40, seven to twenty times the cap, and
+            # arrival fell monotonically 0.383 -> 0.273 over five iterations.
+            # At sigma 0.12 the log-density's sensitivity is (u-mu)/sigma^2 ~ 69,
+            # so one std of mean shift moves the log-ratio by ~1: holding KL at
+            # 0.02 needs steps of ~0.002 sigma, which Adam clears in a few
+            # minibatches.  A trust region that is measured but not enforced is
+            # not a trust region.
+            #
+            # This POLICY step is skipped when the batch is already past the
+            # cap; the value head still gets its gradient, because the critic
+            # being under-fit (EV 0.010) is what made the advantage noisy in the
+            # first place and stopping its training would entrench that.
+            with torch.no_grad():
+                # A TRUST REGION MUST BE SYMMETRIC.  `mean(lp_start - lp)` is a
+                # SIGNED mean log-ratio, not a KL: when the policy moves to
+                # RAISE the likelihood of the actions it sampled, it goes
+                # negative and the cap never fires, so steps in that direction
+                # were unbounded.  MEASURED: iterations reporting -0.19, -0.21
+                # and -0.15 against a 0.02 cap, with clipfrac 0.50-0.60, and
+                # arrival falling 0.351 -> 0.277 across exactly those steps --
+                # the policy reinforcing its own batch without limit, which with
+                # any advantage noise is overfitting to it.
+                # Schulman's k3: unbiased and non-negative by construction.
+                _lr = (lp - lp_start[idx]).clamp(-20.0, 20.0)
+                kl_mb = float((_lr.exp() - 1.0 - _lr).mean())
+            if target_kl > 0 and kl_mb > target_kl:
+                (vcoef * v_loss).backward()
+                nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+                opt.step(); opt.zero_grad(set_to_none=True)
+                acc["kl"] += kl_mb; acc["nb"] += 1
+                stop = True
+                break
             (loss + vcoef * v_loss - ent * h).backward()
             nn.utils.clip_grad_norm_(net.parameters(), 1.0)
             opt.step(); opt.zero_grad(set_to_none=True)
             with torch.no_grad():
-                kl = float((old_lp[idx] - lp).mean())
+                kl = kl_mb
                 acc["kl"] += kl
+                acc["kl_behav"] = acc.get("kl_behav", 0.0) + float((old_lp[idx] - lp).mean())
                 acc["clipfrac"] += float(((ratio - 1).abs() > clip).float().mean())
                 acc["loss"] += float(loss); acc["v_loss"] += float(v_loss); acc["ent"] += float(h)
                 acc["nb"] += 1
-            if target_kl > 0 and acc["nb"] and acc["kl"] / acc["nb"] > target_kl:
-                stop = True                      # the cap the last continuous run did not have
-                break
+            # THE REDUNDANT SECOND STOP IS GONE.  A running-mean check lived
+            # here as well as the per-minibatch one above, and because k3 is
+            # NON-NEGATIVE and grows as the policy drifts, the running mean
+            # crossed `target_kl` after a couple of minibatches and killed every
+            # update -- so the cap was enforced twice and the second one bit
+            # first.  MEASURED over 90 iterations (3 epochs x ~10 minibatches =
+            # ~2700 possible steps): the policy drifted |mu| 0.0097 -> 0.0277,
+            # a bearing change of 1.8 -> 3.1 degrees, and `std` 0.120 -> 0.118.
+            # It never moved, so the apparent arrival "trend" (t +4.43 over the
+            # first 42 iterations, then t -4.22) was a fit to task-draw noise --
+            # fresh tasks each iteration, which is why the observed sd was 2.44x
+            # the BINOMIAL floor, a floor that omits task variance.
+            # The per-minibatch check before the step is the correct one: it
+            # bounds THIS step, where a running mean bounds the average of steps
+            # already taken and so tightens without limit as the update runs.
     nb = max(1, acc["nb"])
     with torch.no_grad():
         sel = torch.randperm(n, generator=gen)[:2048]
@@ -1373,7 +1813,7 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
         v0 = net.pre(tk)[2]
         ev = float(1.0 - (rets_n[sel] - v0).var() / rets_n[sel].var().clamp_min(1e-9))
     p = torch.softmax(old_logits, -1).mean(0)
-    return {"n": n, "kl": acc["kl"] / nb, "clipfrac": acc["clipfrac"] / nb,
+    return {"n": n, "nb": acc["nb"], "kl": acc["kl"] / nb, "clipfrac": acc["clipfrac"] / nb,
             "loss": acc["loss"] / nb, "v_loss": acc["v_loss"] / nb, "entropy": acc["ent"] / nb,
             "speak": float(1.0 - p[net.vocab.EOS]), "std": float(net.log_std.detach().exp().mean()), "ev": ev,
             "stopped_early": bool(stop)}

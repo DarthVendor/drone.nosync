@@ -51,7 +51,8 @@ def beam_points(dirs: Tensor, rng: Tensor, max_range: float) -> Tuple[Tensor, Te
 
 
 def barrier(sub: Tensor, dirs: Tensor, rng: Tensor, hit: Tensor, clear: float = 2.0,
-            eps: float = 0.5, kappa: float = 0.034) -> Tensor:
+            eps: float = 0.5, kappa: float = 0.034,
+            w_occ: float = 1.0, w_near: float = 1.0) -> Tensor:
     """Soft barrier from the beams, in two parts.
 
     OCCLUSION is the one that matters, and the one a proximity-only barrier
@@ -82,11 +83,27 @@ def barrier(sub: Tensor, dirs: Tensor, rng: Tensor, hit: Tensor, clear: float = 
     d = torch.linalg.vector_norm(sub[:, :, None, :] - pts[:, None, :, :], dim=-1)
     near = torch.nn.functional.softplus((float(clear) - d) / max(float(eps), 1e-6))
 
-    return ((occ + near) * hit[:, None, :].to(occ.dtype)).sum(-1)          # [B,K]
+    # WEIGHTED SEPARATELY, because the two halves do OPPOSITE jobs and a single
+    # `lam` scaled them together.  OCCLUSION is ROUTING: a subgoal behind a wall
+    # is unreachable, and a reactive low level cannot know that -- it is exactly
+    # what the layer above is for, and it READS THE BEAMS.  CLEARANCE is
+    # AVOIDANCE: keep off the wall, which the low level already does with the
+    # same beams and prox_gain 30, so weighting it here is that job done twice
+    # and the two steer against each other.
+    #   The dose-response that set `var_lam` to 0 (lam 0 +0.027 t+2.58, lam 2
+    # -0.075 t-4.42) moved BOTH at once, and lam 0 wins by consulting no sensor
+    # at all: S = |sub| + |goal-sub| is pure geometry and always elects the
+    # straight-to-goal candidate.  That is a NULL router, and distilling it
+    # would install sensor-blindness permanently -- the `sens ~ 0` pathology
+    # this project keeps hitting.  Splitting the terms is how a sensor-USING
+    # rule gets its own measurement.
+    return ((float(w_occ) * occ + float(w_near) * near)
+            * hit[:, None, :].to(occ.dtype)).sum(-1)                      # [B,K]
 
 
 def path_action(sub: Tensor, g: Tensor, dirs: Tensor, rng: Tensor, hit: Tensor,
-                lam: float = 2.0, clear: float = 2.0) -> Tensor:
+                lam: float = 2.0, clear: float = 2.0,
+                w_occ: float = 1.0, w_near: float = 1.0) -> Tensor:
     """`S[sub] = |sub| + |g - sub| + lam * barrier`, in the body frame.
 
     The vehicle is at the origin of that frame, so `|sub|` is the first leg.
@@ -95,7 +112,8 @@ def path_action(sub: Tensor, g: Tensor, dirs: Tensor, rng: Tensor, hit: Tensor,
     """
     leg1 = torch.linalg.vector_norm(sub, dim=-1)
     leg2 = torch.linalg.vector_norm(g[:, None, :] - sub, dim=-1)
-    return leg1 + leg2 + float(lam) * barrier(sub, dirs, rng, hit, clear=clear)
+    return leg1 + leg2 + float(lam) * barrier(sub, dirs, rng, hit, clear=clear,
+                                              w_occ=w_occ, w_near=w_near)
 
 
 def boltzmann_pick(S: Tensor, temperature: float = 2.0,

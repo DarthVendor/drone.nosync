@@ -634,6 +634,58 @@ class Rollout:
             report = (t % m_every == 0)
             if cs["leg_last"] is None:
                 cs["leg_last"] = leg.clone()
+            # A WAYPOINT IS CONSUMED WHEN IT IS REACHED.
+            #
+            # Without this a placement stood for the REST OF THE EPISODE: the
+            # controller's target is `goal + hold.target.delta`, EOS means "no
+            # change" and so never clears `delta`, and under `inject_at` the
+            # injected steps are the only ones a row decides at -- so nothing
+            # could ever put it back. The vehicle flew to `goal + delta` and
+            # PARKED there. `_composer_start`'s own docstring had already
+            # written down the symptom for the scripted opening ("flies to that
+            # single random waypoint and parks") without it being connected to
+            # the composer's own tokens.
+            #
+            # MEASURED, 256 paired tasks, identical seeds, 20 m legs / 25%
+            # buildings, a WAYPOINT forced at full reach:
+            #     muted 0.539  |  +90 deg 0.281  |  +180 deg 0.285  |  0 deg 0.285
+            # A quarter of the arrival rate at EVERY bearing, because the
+            # bearing only chose WHERE to park, and final_err rose 5.46 -> 8.5 m
+            # -- parked inside the 10 m reach ball around the goal. That made
+            # silence optimal, and a bandit on the type decision correctly drove
+            # speak 0.370 -> 0.000 in 13 iterations: the action space had no
+            # beneficial region to find.
+            #
+            # Retiring a reached waypoint restores what the word means -- a
+            # place to go THROUGH, with the goal still waiting after it. Only
+            # the TARGET is zeroed; `SpecHold.step` slews `realized` back at
+            # `rate_m`, so the low level sees no step input. This is NOT a
+            # decision: the composer is still asked exactly `inject` times, so
+            # the whole outcome stays attributable to the token that placed it.
+            # ORDER MATTERS: `_reached` is computed BEFORE the delta is
+            # zeroed, and is then what `due` reads as "achieved" below.
+            # Retiring first and recomputing afterwards silently cancels the
+            # event that asks the composer again -- `achieved` is derived from
+            # `delta`, so a zeroed delta is never "achieved" and an event-driven
+            # composer degenerates into one that is asked exactly once
+            # (caught by test_decisions_are_events_not_ticks).
+            _reached = torch.zeros_like(alive)
+            if report:
+                _pl = hold.target.delta
+                _reached = (alive & ~arrived & (_pl.norm(dim=-1) > cs["tol"])
+                            & ((x - (goal + _pl)).norm(dim=-1) < cs["tol"]))
+                # NOT ALSO "the goal is in hand".  It looked like a second bug
+                # of the same family -- arrival is scored at the real goal and
+                # must be HELD for `dwell_s`, so a live subgoal should park the
+                # vehicle beside it and block the dwell.  Measured, that case
+                # barely occurs: `_subgoal_ego` sets `radius = L0.clamp(max=1)`,
+                # so the subgoal shrinks WITH the goal distance and |delta| is
+                # already inside `tol` by the time it would matter.  Adding the
+                # rule moved the every-report arm -0.070 -> -0.105 (+-0.036) --
+                # nothing, inside the noise.  Left out deliberately.
+                if bool(_reached.any()):
+                    hold.target.delta = torch.where(_reached[:, None],
+                                                    torch.zeros_like(_pl), _pl)
             live = alive & ~arrived
             _inj = cs.get("inject_at")
             if _inj is not None:                  # only this row's injected steps
@@ -654,9 +706,10 @@ class Rollout:
                     cs["n_sub"] += moved.to(cs["n_sub"].dtype)
                     cs["t_last"] = torch.where(rows_, torch.full_like(cs["t_last"], t), cs["t_last"])
             else:
-                placed = hold.target.delta
-                achieved = ((x - (goal + placed)).norm(dim=-1) < cs["tol"]) & (placed.norm(dim=-1) > cs["tol"])
-                due = live & (achieved | (t - cs["t_last"] >= every) | (leg != cs["leg_last"])) \
+                # `_reached` from above, NOT a fresh read of `delta`: the
+                # waypoint that was just retired is exactly the one whose
+                # arrival earns this row another decision.
+                due = live & (_reached | (t - cs["t_last"] >= every) | (leg != cs["leg_last"])) \
                     if report else alarm
                 if bool(due.any()):
                     spec = self._emit_live(comp, s, goal, alive, arrived, leg, t, hold, rows=due)

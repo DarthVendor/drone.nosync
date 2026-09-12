@@ -21,7 +21,7 @@ import json, math, shutil, sys, time, torch
 sys.path.insert(0, "/Users/maddoxnoon/Desktop/drone.nosync/lagrangian_es/src")
 from lagrangian_es.config import Config, RolloutCfg
 from lagrangian_es.composer import center_by_task, returns_from_stream, returns_goal_only
-from lagrangian_es.composer.policy_cont import error_update, imitate_update, ppo_update_cont, speak_update, time_update
+from lagrangian_es.composer.policy_cont import _subgoal_ego, error_update, imitate_update, ppo_update_cont, route_update, speak_update, time_update
 from lagrangian_es.es import build, build_composer, build_sensors
 from lagrangian_es.composer.policy_cont import paired_advantage, projected_time
 from lagrangian_es.metric import identity_preconditioner
@@ -129,7 +129,17 @@ WORKERS, GAMMA, JUDGE_EVERY, REC = 6, 0.99, 10, (1.0 if FREEZE_LOW else 0.25)
 # protect, so half the batch can be recorded instead of a quarter: ~1150
 # recorded flights an update, the same volume as before, from a batch of
 # distinct tasks rather than 288 flown sixteen times.   # FULL horizon: a token's effect on the expected outcome keeps growing past 2 s (straight PLACE +0.5 at 2 s, +23 over the flight); the 2 s horizon threw that away    # gamma per report (0.2 s): a 2 s horizon, the measured time for two near-identical flights to separate; at 0.99 (20 s) the half-batch gradients agreed at cos 0.42, at 0.9 at 0.87   # a quarter of the rows explore and record: one token per report per row is many samples
-MAX_SAMPLES = 10_000
+# THE UPDATE WAS DISCARDING 85% OF THE BATCH.  1152 episodes x ~60 decisions is
+# ~70,000 recorded decisions and the cap took 10,000.  That is free variance:
+# the rollout is already paid for.
+#   But note WHICH variance it cuts.  MEASURED on one batch, the MC gradient
+# agrees between disjoint halves of the SAME task set at cosine +0.46 (against a
+# shuffled null of -0.69), and between two INDEPENDENT task sets at -0.45.  So
+# the gradient is reproducible within a task draw and ANTI-correlated across
+# them: consecutive updates undo each other, which is why 90 updates of |dmu| ~
+# 0.024 each netted 0.018 of drift.  More decisions from the same tasks sharpens
+# the +0.46; only more TASKS moves the -0.45, and that is what LES_EPS buys.
+MAX_SAMPLES = int(__import__("os").environ.get("LES_MAXS", "40000"))
 #: how far the vehicle covers in one whole episode at its airspeed limit; the
 #: projection charges outstanding distance in these units, so "one episode of
 #: flying still to do" costs exactly 1.0 of extra time
@@ -197,6 +207,49 @@ INJECT = int(_os.environ.get("LES_INJECT", "1"))     # ONE token a flight: with
 # VARIATIONAL WAYPOINTS (LES_VART, 0 = off).  See composer/variational.py.
 VAR_T = float(_os.environ.get("LES_VART", "2.0"))
 VAR_K = int(_os.environ.get("LES_VARK", "16"))
+# ZERO.  `var_lam` weights the obstacle-avoidance barrier, and the composer must
+# not duplicate the low level's avoidance -- measured as a dose-response over
+# 1024 paired tasks (d vs a muted control of 0.551): lam 0 +0.027 (t +2.58),
+# lam 0.5 +0.001, lam 1 -0.014, lam 2 -0.075 (t -4.42).  Crashes FALL as it
+# rises (0.449 -> 0.386) and arrivals fall faster: it buys safety by not going
+# anywhere.
+VAR_LAM = float(_os.environ.get("LES_VARLAM", "0.0"))
+# A router always routes: EOS masked out, the placement is the whole policy.
+ROUTE_ONLY = int(_os.environ.get("LES_ROUTE", "0")) == 1
+# WHICH MAP THE COMPOSER TRAINS ON.  Default unchanged.
+#   MEASURED with the CBD-trained router (256 tasks, own mean, no selector):
+#     singapore_cbd 25%   muted 0.539  trained 0.711   geometry wins, sens 1.6%
+#     singapore_cbd 100%  muted 0.266  trained 0.480   geometry wins MORE
+#     occluded            muted 0.000  trained 0.000   nothing flies: no signal
+#     corridors           muted 0.082  trained 0.348   flyable, huge headroom
+# Corridors are 4 m streets between tall blocks, so straight-to-goal MUST fail --
+# you cannot fly through a building.  It is the only rung where perception can
+# be rewarded AND the frozen low level can still fly.
+TRAIN_ENV = _os.environ.get("LES_ENV", "singapore_cbd")
+# Task draws accumulated into one step.  1 = step every iteration (as before).
+ACCUM = int(_os.environ.get("LES_ACCUM", "1"))
+_accum_i = [0]
+from torch import nn as _nn_mod
+nn_utils = _nn_mod.utils
+if ROUTE_ONLY:
+    # DO NOT CHARGE FOR AN ACTION THAT IS NOT OPTIONAL.
+    #
+    # `SUBGOAL_COST` exists so a composer that CHOOSES when to speak reaches the
+    # goal with the fewest subgoals.  Under `route_only` EOS is masked and the
+    # composer places at every report -- ~37-63 times a flight -- so the charge
+    # is a tax on doing its job, and `returns_from_stream` puts it in the
+    # DISCOUNTED RETURN at every future decision: at gamma 0.99 over ~90 reports
+    # that is ~177 against a cost scale of ~900, about a fifth of the return.
+    # The only way a policy can reduce it is to END THE FLIGHT, and crashing is
+    # far easier than arriving.
+    #
+    # MEASURED, that is exactly what happened once the estimator was otherwise
+    # sound (EV +0.292, kl inside the 0.02 cap, policy stepping): arrive fell
+    # 0.383 -> 0.273, crash rose 0.610 -> 0.725, and `speak` drifted 0.401 ->
+    # 0.187 -- the gradient pushing toward a silence that is masked and cannot
+    # even be taken.  Three symptoms, one cause: the objective was paying the
+    # composer to stop flying.
+    SUBGOAL_COST = 0.0
 # LES_SPEAK: probability a decision may not open on EOS, so it must say
 # something.  Guards the absorbing state -- see `PolicyComposer.speak_floor`.
 SPEAK_FLOOR = float(_os.environ.get("LES_SPEAK", "0.0"))
@@ -301,7 +354,18 @@ EPOCHS_C = int(_os.environ.get("LES_EPOCHS", "3"))
 # minibatch larger than the whole batch meant ONE step per epoch, and steps
 # were the scarce resource (2 per iteration at epochs=2).
 MB_C = int(_os.environ.get("LES_MB", "1024"))
-TEMPERATURE = 1.0        # MEASURED: raising it does not help.  384 flights on the
+# OVERRIDABLE (LES_TEMP) ONLY WHERE A SELECTOR EXISTS.  The measurement below
+# raised the temperature of the EXECUTED action -- the drone flew the noisy
+# sample -- and reach collapsed.  With `var_temp` on, the flown action is the
+# best of `var_k` candidates scored by |sub| + |goal-sub|, so width feeds a
+# PROPOSAL that a selector then filters, which is the regime this very note
+# ends by asking for ("what was missing is the selecting").  At std 0.12 the
+# 16 candidates are near-identical placements around an untrained mean, and the
+# router judge opened at arrive 0.000 / crash 0.992 twice running; the
+# hand-built router that measured +0.027 scored candidates spanning the sphere.
+# Leave at 1.0 for any arm WITHOUT a selector.
+TEMPERATURE = float(__import__("os").environ.get("LES_TEMP", "1.0"))
+# MEASURED: raising it does not help.  384 flights on the
 # same tasks at T = 1.0 / 1.4 / 1.8 / 2.5 moved the best-30% finish time by under
 # 1% (0.2785 -> 0.2771 -> 0.2808 -> 0.2777) while reach collapsed 0.880 -> 0.185.
 # More noise destroys good flights without finding better ones -- good behaviour
@@ -413,7 +477,17 @@ NOISE_HOLD = sys.argv[9] if len(sys.argv) > 9 else 1                # decisions 
 JUDGE_N = 256                                                  # judged every 10 on 256 episodes: half the noise of 128 every 5, same cost
 TARGET_KL, LR0, LR_MAX = 0.02, 2e-5, 1e-3     # the composer's trust region; the rate adapts to it
 W = f"{SP}/v11_{ARM}_composer.pt"; G = f"{SP}/v11_{ARM}_genome.json"; STATE = f"{SP}/v11_{ARM}_state.json"
-W0 = ""   # no warm start: the token checkpoint has a different action head
+# WARM START (LES_W0).  Empty by default -- an old token checkpoint has a
+# different action head, which is what this note originally recorded.  But a
+# ROUTER cannot start cold: `route_only` masks EOS, which removes the no-op that
+# silence used to provide, and an untrained placement head re-planning ~58 times
+# a flight opened the judge at arrive 0.000 (then 0.027, then 0.215 as the
+# selector was sharpened) against a muted 0.551.  From there every routed flight
+# fails, so the paired advantage reflects how good each CONTROL was rather than
+# anything the routing did -- hopeless failures rank nothing and REINFORCE has
+# nothing to climb.  Point this at a distilled checkpoint to start from a policy
+# that already matches the baseline.
+W0 = __import__("os").environ.get("LES_W0", "")
 # The frozen stage-A low level every arm flies.  v10 never named this because
 # its genome file already existed; the arms each get their own path, so the
 # seed has to be explicit or the first arm to run NameErrors here.
@@ -439,7 +513,7 @@ def cfg_for(env, max_leg, steps, n, composer="policy_cont", early=False, sensors
     w = W if weights is None else weights
     # fresh exploration noise per decision: a decision is now an event, not a tick
     ckw = (("reach", 10.0), ("every", EVERY), ("measure_every", EVERY_M), ("k_chain", K_CHAIN), ("temperature", TEMPERATURE), ("noise_hold", NOISE_HOLD), ("explore_eps", EXPLORE_EPS), ("tok_frac", TOK_FRAC), ("inject", INJECT), ("speak_floor", SPEAK_FLOOR),
-           ("var_temp", VAR_T), ("var_k", VAR_K)) + ((("weights", w),) if w else ()) if composer else ()   # kids fly the parent's decisions: the GA compares low levels, not dice
+           ("var_temp", VAR_T), ("var_k", VAR_K), ("var_lam", VAR_LAM), ("route_only", ROUTE_ONLY)) + ((("weights", w),) if w else ()) if composer else ()   # kids fly the parent's decisions: the GA compares low levels, not dice
     return Config(system="quadrotor_nav", trainable="nav_agent", task="city_tour", environment=env,
                   sensors=sensors, sensor_kw=skw, gating="arrival", seed=0, composer=composer, composer_kw=ckw,
                   task_kw=(("n_legs", 2), ("max_leg", max_leg)),
@@ -474,7 +548,7 @@ def cfg_for(env, max_leg, steps, n, composer="policy_cont", early=False, sensors
 def log(m): print(m, flush=True); open(f"{SP}/cotrain_v8.log", "a").write(m + "\n")
 
 import os, shutil
-tcfg = cfg_for("singapore_cbd", LEG_MAX, T_TRAIN, E, early=True)
+tcfg = cfg_for(TRAIN_ENV, LEG_MAX, T_TRAIN, E, early=True)
 sysm, tr, task = build(tcfg)
 FRESH = False                                             # v8 = v7's best pair placed in the corridor city (user: it struggles most in enclosed environments)
 if not FRESH and not os.path.exists(G): shutil.copy(G0, G)
@@ -487,7 +561,7 @@ if th.numel() == tr.dim + 3:
     th = th[:tr.dim]; json.dump({"theta": th.tolist()}, open(G, "w"))
 assert th.numel() == tr.dim, (th.numel(), tr.dim)
 torch.manual_seed(NET_SEED)
-comp = build_composer(tcfg if os.path.exists(W) else cfg_for("singapore_cbd", LEG_MAX, T_TRAIN, E, early=True, weights=""), sysm, tr)
+comp = build_composer(tcfg if os.path.exists(W) else cfg_for(TRAIN_ENV, LEG_MAX, T_TRAIN, E, early=True, weights=""), sysm, tr)
 torch.save(comp.net.state_dict(), W)                 # a fresh net's random body and its HOLD / continue-straight prior, when no file yet
 V = comp.net.vocab
 torch.set_num_threads(1)
@@ -511,7 +585,7 @@ TH = (th[None].clone() if FREEZE_LOW else
 tasks = {}
 def sampler(max_leg):
     if max_leg not in tasks:
-        _, _, tasks[max_leg] = build(cfg_for("singapore_cbd", max_leg, T_TRAIN, E, early=True))
+        _, _, tasks[max_leg] = build(cfg_for(TRAIN_ENV, max_leg, T_TRAIN, E, early=True))
     return tasks[max_leg]
 
 def token_use(instr):
@@ -537,7 +611,10 @@ def judge(env, max_leg, steps, seed, n=JUDGE_N):
             float(res.cost.std() / n ** 0.5), float(r2.n_subgoals.double().mean()), spoke, kinds, crash)
 
 def judge_all(tag):
-    c = judge("singapore_cbd", 20.0, 1800, 9_900_001)
+    # THE JUDGE FLIES THE TRAINING MAP.  Judging on the CBD while training on
+    # corridors would compare a policy against a baseline from another
+    # population -- the mismatch that produced two wrong calls already.
+    c = judge(TRAIN_ENV, 20.0, 1800, 9_900_001)
     k = c[6]
     log(f"  {tag:>9}  city20 {c[0]:.3f}/{c[1]:.3f}  cost {c[2]:7.2f} +-{c[3]:4.1f}  |  crashes: median {c[7][0]:4.1f} s, {c[7][1]:.0%} inside 1 s  |  "
         f"subgoals/flight {c[4]:4.1f}  spoke {c[5]:4.1f}/flight (place {k.get('place', 0):.0%} priority {k.get('priority', 0):.0%} heading {k.get('heading', 0):.0%})")
@@ -572,13 +649,49 @@ def _update(groups_r, groups_R, holder, groups_win=None, groups_score=None, grou
     t = time.time()
     # target_kl is a REAL cap here: the argument mean is unbounded and the last
     # continuous composer this project ran was uncapped and reached KL 18
-    if LOSS == "speak":
+    if LOSS == "route":
+        # THE ROUTER.  It always emits a waypoint, so the only decision is
+        # WHERE -- REINFORCE on the placement's Gaussian density, weighted by
+        # the flight's paired advantage.  See `route_update`.
+        holder["st"] = route_update(comp.net, groups_r, groups_adv, epochs=EPOCHS_C,
+                                    batch=MB_C, lr=LR_C, opt=opt_c, max_samples=MAX_SAMPLES,
+                                    temperature=TEMPERATURE)
+    elif LOSS == "speak":
         # THE SIMPLE ONE.  A waypoint costs 0.25 of the arrival rate and three
         # bearings 90 degrees apart do identical damage, so the action space is
         # binary: speak or stay silent.  One log-probability, one paired
         # advantage, no critic.  See `speak_update`.
         holder["st"] = speak_update(comp.net, groups_r, groups_adv, epochs=EPOCHS_C,
                                     batch=MB_C, lr=LR_C, opt=opt_c, max_samples=MAX_SAMPLES)
+    elif LOSS == "ppo":
+        # THE CORRECT ESTIMATOR, selected explicitly because `IMITATE` is
+        # hardcoded True and makes the `else:` branch unreachable.
+        # Per-decision returns from the cost stream minus a learned V(s),
+        # normalised, clipped, KL-capped.  `route_update` scored every decision
+        # in a flight with the SAME flight-level advantage -- zero within-flight
+        # variance by construction -- which is the failure this file's own
+        # VCOEF note already measured: with a mean baseline the tokens read
+        # +0.31 / -0.45..-1.02 (the STATES they were chosen in, not their
+        # effect); with V(s) they read +0.02 / -0.04 / -0.13 / +0.11 and the
+        # half-batch gradients agreed at 0.95 against 0.75.
+        holder["st"] = ppo_update_cont(comp.net, groups_r, groups_R, comp.n_terms,
+                                       epochs=EPOCHS_C, batch=MB_C, lr=LR_C, vcoef=VCOEF,
+                                       ent=0.0, target_kl=0.02, opt=opt_c,
+                                       max_samples=MAX_SAMPLES, temperature=TEMPERATURE,
+                                       # under route_only the type is forced, not chosen
+                                       type_is_action=not ROUTE_ONLY, accum=ACCUM)
+        if ACCUM > 1:
+            # ONE STEP EVERY `ACCUM` TASK DRAWS.  The policy is untouched while
+            # gradients accumulate, so every batch in the window is exactly
+            # on-policy; the step lands when the window closes.  This is the
+            # large effective batch the -0.45 cross-task cosine calls for, paid
+            # for in wall-clock because 4608 and then 2304 episodes were both
+            # killed for memory on this machine.
+            _accum_i[0] += 1
+            if _accum_i[0] % ACCUM == 0:
+                nn_utils.clip_grad_norm_(comp.net.parameters(), 1.0)
+                opt_c.step(); opt_c.zero_grad(set_to_none=True)
+                holder["st"]["stepped"] = True
     elif LOSS == "time":
         # PURELY TIME: fit T_hat to the time each decision actually needed,
         # then move the policy down T_hat.  Nothing else is in it.
@@ -669,7 +782,7 @@ def _sens(groups_r, n=192):
     exactly as it was.  Blinding them to "nothing within range" is the weaker
     test -- most beams already read nothing, so it barely perturbs anything.
 
-    Returned as the fraction of the token distribution that moves.  It was
+    Returned as how far the commanded SUBGOAL moves, in reach units.  It was
     0.0001 while the composer was ignoring its sensors entirely.
     """
     from lagrangian_es.composer.tokens import BEAM, PIXEL
@@ -689,9 +802,25 @@ def _sens(groups_r, n=192):
             m0 = sel[0]
             e[:, m0] = e[torch.randperm(e.shape[0])][:, m0]
             t1["entities"] = e
-            p0 = torch.softmax(comp.net.pre(tk)[0], -1)
-            p1 = torch.softmax(comp.net.pre(t1)[0], -1)
-            dP += float((p0 - p1).abs().sum(-1).mean()); k += 1
+            # THE PLACEMENT, not the token type.
+            #
+            # This used to read `softmax(pre(tk)[0])` -- the type distribution,
+            # EOS vs WAYPOINT.  For a ROUTER that is constant by construction
+            # (`route_only` masks EOS out), so it would report 0.0000 however
+            # sensor-driven the routing was.  Even for the speak arm it was the
+            # wrong quantity: it says whether the decision to SPEAK reads the
+            # beams and nothing about whether the PLACEMENT does, and the
+            # placement is where the value lives.
+            #
+            # Reported now as the distance the commanded subgoal moves, in
+            # REACH units, when the beams and pixels are shuffled.  0 means the
+            # placement is a function of the goal alone.
+            o0, o1 = comp.net.pre(tk), comp.net.pre(t1)
+            W = comp.net.vocab.WAYPOINT
+            g_ego = comp.net.goal_ego(tk).to(o0[1].dtype)
+            s0 = _subgoal_ego(comp.net, o0[1][:, W], g_ego)
+            s1 = _subgoal_ego(comp.net, o1[1][:, W], g_ego)
+            dP += float((s0 - s1).norm(dim=-1).mean()); k += 1
     return dP / max(1, k)
 
 
@@ -710,10 +839,34 @@ def _emit(r, st, t_u):
         # more -- measured: speak 0.250 -> 0.291 took the loss 0.072 -> 0.007
         # while arrival went 0.736 -> 0.719.  `nll` carries no argument term
         # and is the one to read.
-        f"  | loss {st.get('ce', float('nan')):7.3f} nll {st.get('nll', float('nan')):5.3f} match {st.get('match', float('nan')):.2f}"
-        f" on {st.get('n', 0)} tokens from {st.get('kept_flights', 0)}/{st.get('flights', 0)} weighted {_sel}"
+        # PPO returns loss/v_loss/kl/clipfrac/EV, none of which are `ce`,
+        # `nll` or `match` -- printing those gave `loss nan nll nan match nan`
+        # and hid the only number that verifies the estimator.  `ev` is the
+        # value head's EXPLAINED VARIANCE: at ~0 the critic predicts a constant,
+        # the state baseline does nothing, and the advantage collapses back to
+        # the raw return -- which this file's VCOEF note measured reading the
+        # STATES a token was chosen in (+0.31 / -0.45..-1.02) rather than its
+        # effect (+0.02 / -0.04 / -0.13 / +0.11 with V), half-batch gradient
+        # agreement 0.75 -> 0.95.  It is the check that the fix is real.
+        + (f"  | loss {st.get('loss', float('nan')):7.3f} v {st.get('v_loss', float('nan')):5.3f}"
+           f" EV {st.get('ev', float('nan')):+.3f} kl {st.get('kl', float('nan')):.4f}"
+           # HOW MANY STEPS THE UPDATE ACTUALLY TOOK.  Without this the log
+           # cannot distinguish "the trust region is respected" from "the
+           # update stopped after two minibatches and the policy never moved":
+           # measured, 90 iterations x 3 epochs x ~10 minibatches is ~2700
+           # possible steps, and the policy drifted |mu| 0.0097 -> 0.0277, far
+           # less than the cap alone would allow in a SINGLE update
+           # (sigma*sqrt(2*0.02) ~ 0.024).
+           f" clip {st.get('clipfrac', float('nan')):.2f}"
+           f" steps {st.get('nb', 0)}{'!' if st.get('stopped_early') else ''}"
+           f" on {st.get('n', 0)} decisions"
+           if "ev" in st else
+           f"  | loss {st.get('ce', float('nan')):7.3f} nll {st.get('nll', float('nan')):5.3f}"
+           f" match {st.get('match', float('nan')):.2f}"
+           f" on {st.get('n', 0)} tokens from {st.get('kept_flights', 0)}/{st.get('flights', 0)} weighted {_sel}")
+        + (
         f" | speak {st.get('speak', float('nan')):.3f} std {st.get('std', float('nan')):.3f} sens {r.get('sens', float('nan')):.4f}"
-        f"  [roll {r['t_r']:.0f}s update {t_u:.0f}s | {r['mins']:.1f}m]{r['note']}")
+        f"  [roll {r['t_r']:.0f}s update {t_u:.0f}s | {r['mins']:.1f}m]{r['note']}"))
 
 
 for it in range(1, OUTER + 1):
@@ -760,10 +913,28 @@ for it in range(1, OUTER + 1):
     # Only the paired losses need a control.  LOSS="time" regresses the time a
     # decision actually needed and never looks at a twin, so flying one would
     # double the rollout for nothing.
-    _ctl = None
+    _ctl = None; _ctl_sh = []
     if LOSS != "time":
-        _ctl, _ = par.run_with_records(TH, goals_it, 5_100_000 + it, stochastic=True,
-                                       record_frac=0.0, difficulty=DIFF, noise=0, mute=True)
+        # RECORD THE CONTROL'S COST STREAM TOO (record_frac, not 0.0).
+        #
+        # The per-decision return is overwhelmingly dominated by whether the
+        # flight crashed: MEASURED on 192 flights, decisions in arrived flights
+        # carry +8.3 and in crashed flights -730.1, a separation of z = +331.
+        # V(s) removes only about a third of that (EV ~0.3), so the surviving
+        # advantage is essentially a crash indicator -- every decision in a
+        # crashed flight gets ~-730, including the ~30 that were fine, and PPO
+        # pushes the policy away from all of them.  Crashes here are chaotic and
+        # mostly the frozen low level's doing, so that is a large CORRELATED
+        # NOISE signal, which is why arrival degraded under every combination of
+        # ratio, trust-region and step-size fixes.
+        #
+        # The control flies the SAME task with the SAME seed, so it shares the
+        # luck.  Its cost stream gives a common-random-numbers baseline WITH
+        # per-decision resolution -- which neither estimator had: PPO used
+        # per-decision returns without the control, `route_update` used the
+        # control without per-decision resolution.
+        _ctl, _ctl_sh = par.run_with_records(TH, goals_it, 5_100_000 + it, stochastic=True,
+                                             record_frac=REC, difficulty=DIFF, noise=0, mute=True)
     # FINISH_FRAC, not soft_time.  soft_time accumulates only while a row is
     # alive, so a flight that crashes at step 100 scores LOWER -- looks faster --
     # than one that flies 500 steps and arrives; as a paired advantage that
@@ -845,6 +1016,19 @@ for it in range(1, OUTER + 1):
         else:
             R = returns_from_stream(sh["records"], sh["chain"], GAMMA, subgoal_cost=SUBGOAL_COST, unit=EVERY_M,
                                     speed_bonus=SPEED_BONUS, speed_ref=SPEED_REF).double()
+            # COMMON RANDOM NUMBERS, per decision.  The control's cost stream is
+            # read at THIS flight's decision times, so the difference is what
+            # the routing was worth on a task and a dice roll both flights
+            # shared.  The crash luck that dominates R (z = +331 between
+            # arrived and crashed decisions) is present in both and cancels.
+            _cs = next((c for c in _ctl_sh if int(c["rows"][0]) == int(sh["rows"][0])), None) \
+                if _ctl_sh else None
+            if _cs is not None and _cs.get("chain"):
+                R_ctl = returns_from_stream(sh["records"], _cs["chain"], GAMMA,
+                                            subgoal_cost=0.0, unit=EVERY_M,
+                                            speed_bonus=SPEED_BONUS, speed_ref=SPEED_REF).double()
+                if R_ctl.shape == R.shape:
+                    R = R - R_ctl
         if sh.get("n_sub") is not None: n_sub.append(float(sh["n_sub"]))
         _Rs.append(R); _rows.append(sh["rows"])
     # The TASK's difficulty, not the policy's doing, is most of a return's
