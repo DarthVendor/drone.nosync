@@ -756,7 +756,24 @@ def time_update(net: ContPolicyNet, records: List[Dict], t_left: List[Tensor],
             # never seen and believing what it found there.  Bounded, the worst
             # it can claim is "instant", and the model saturates instead of
             # running away.
-            t_hat = torch.sigmoid(net.time_head(torch.cat([q.detach(), g.detach()], -1)).squeeze(-1))
+            # `q` is NOT detached: the MSE has to train the PERCEPTION, not just
+            # the head.  It was detached here, which left the 964k-parameter
+            # encoder receiving gradient from `l_policy` alone -- a term that
+            # only pushes the prediction DOWN and never asks it to be right.
+            # A head on an unpredictive representation correctly collapses to
+            # the mean, and MEASURED on the live checkpoint it had: T_hat sd
+            # 0.0003 (a constant 0.465 for every input), RMSE 0.3880 against
+            # 0.3804 for simply predicting the true mean, Pearson -0.19.
+            # `L_policy = T_hat(s, g)` was therefore descending noise, and
+            # arrival fell to 0.19 against a silent baseline of ~0.52.  It also
+            # explains `sens ~ 0.0005` in every run: nothing in the objective
+            # had ever required the sensors to matter, which is exactly what
+            # this function's docstring claims is the whole point of it.
+            #
+            # `g` STAYS detached.  The policy must not be trained to make
+            # itself predictable -- that would reward placements the model
+            # happens to be confident about rather than quick ones.
+            t_hat = torch.sigmoid(net.time_head(torch.cat([q, g.detach()], -1)).squeeze(-1))
             l_model = ((t_hat - T[idx]) ** 2).mean()
             # (2) move the policy DOWN the model.  The model's own parameters
             #     still receive gradient from (1) only, because this term is
@@ -778,6 +795,102 @@ def time_update(net: ContPolicyNet, records: List[Dict], t_left: List[Tensor],
             "ce": acc["pol"] / nb, "nll": acc["model"] / nb, "match": acc["err"] / nb,
             "speak": float(1.0 - p[net.vocab.EOS]), "std": float(net.log_std.detach().exp().mean()),
             "kl": 0.0, "clipfrac": 0.0, "entropy": 0.0, "ev": float("nan"), "w_up": 0.0, "w_abs": 0.0}
+
+
+def speak_update(net: ContPolicyNet, records: List[Dict],
+                 advantage: Optional[List[Tensor]] = None, epochs: int = 3,
+                 batch: int = 1024, lr: float = 2e-4, opt=None,
+                 max_samples: int = 10_000) -> Dict[str, float]:
+    """REINFORCE on the ONLY decision that carries signal: speak, or stay silent.
+
+    MEASURED on this frozen low level -- 256 paired tasks, identical seeds, a
+    WAYPOINT forced at full reach on every decision:
+
+        muted (no tokens at all)      arrive 0.539
+        forced WAYPOINT   +90 deg     arrive 0.281
+        forced WAYPOINT  +180 deg     arrive 0.285
+        forced WAYPOINT    0 deg      arrive 0.285
+
+    Speaking costs a quarter of the arrival rate, and three bearings spanning
+    180 degrees do the same damage to three decimal places.  WHERE the subgoal
+    goes carries nothing; WHETHER one is emitted carries everything.
+
+    So the action space is binary and this is the entire learner for it: the
+    log-probability of the token type that was chosen, times the paired time
+    advantage of the flight it was chosen in.  No critic, no time model, no
+    argument density, no value baseline -- the paired control IS the baseline.
+
+    This replaces `time_update`, which could not have worked: its policy term
+    is `T_hat(q, g)` and `g` comes from the WAYPOINT ARGUMENTS, so the type
+    logits appear in neither of its terms.  It trained the one thing that does
+    not matter and had no gradient path to the one that does, which is why
+    `speak` read 0.509-0.515 for nineteen straight iterations while `nll` fell
+    0.113 -> 0.047 and `arrive` never left the sampling noise (observed sd
+    0.0155 against a binomial floor of 0.0133 at 1152 episodes).
+    """
+    groups = records if (records and isinstance(records[0], list)) else [records]
+    advs = list(advantage) if isinstance(advantage, (list, tuple)) else [advantage]
+    samples, acts, wts = [], [], []
+    for gi, recs in enumerate(groups):
+        adv = advs[gi] if gi < len(advs) else None
+        if adv is None:
+            continue
+        for rec in recs:
+            if not rec.get("tok"):
+                continue
+            rows = rec.get("rows")
+            for j in rec["alive"].nonzero().flatten().tolist():
+                b = int(rows[j]) if rows is not None else j
+                samples.append({k: (v[j] if torch.is_tensor(v) else v)
+                                for k, v in rec["tok"].items()})
+                acts.append(rec["act"][j]); wts.append(float(adv[b]))
+    if not samples:
+        return {"n": 0, "flights": 0, "kept_flights": 0, "ess": 0.0}
+    gen = torch.Generator().manual_seed(0)
+    if max_samples and len(samples) > max_samples:
+        pick = torch.randperm(len(samples), generator=gen)[:max_samples].sort().values.tolist()
+        samples = [samples[i] for i in pick]
+        acts = [acts[i] for i in pick]; wts = [wts[i] for i in pick]
+    from .policy import collate_tok
+    tok_all = collate_tok(samples)
+    acts = torch.stack(acts).long()
+    A = torch.tensor(wts, dtype=torch.float32)
+    # Standardised, so the step size does not depend on how long an episode is.
+    # The paired control already removed the task's own difficulty, which is
+    # what a value baseline would have been fitted to estimate.
+    A = (A - A.mean()) / A.std().clamp_min(1e-6)
+    n = acts.shape[0]
+    opt = opt or torch.optim.Adam(net.parameters(), lr=lr)
+    acc = {"pg": 0.0, "spoke": 0.0, "nb": 0}
+    EOS = net.vocab.EOS
+    for _ in range(epochs):
+        order = torch.randperm(n, generator=gen)
+        for s0 in range(0, n, batch):
+            idx = order[s0:s0 + batch]
+            tk = {k: (v[idx] if torch.is_tensor(v) else v) for k, v in tok_all.items()}
+            logits, _, _ = net.pre(tk)
+            if not torch.isfinite(logits).all():
+                continue
+            lp = torch.log_softmax(logits.float(), -1)
+            lp_a = lp[torch.arange(idx.shape[0]), acts[idx]]
+            loss = -(lp_a * A[idx]).mean()
+            loss.backward()
+            nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            opt.step(); opt.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                acc["pg"] += float(loss)
+                acc["spoke"] += float((acts[idx] != EOS).double().mean())
+                acc["nb"] += 1
+    nb = max(1, acc["nb"])
+    with torch.no_grad():
+        p = torch.softmax(net.pre({k: (v[:512] if torch.is_tensor(v) else v)
+                                   for k, v in tok_all.items()})[0], -1).mean(0)
+    return {"n": n, "flights": n, "kept_flights": n, "ess": 0.0,
+            "ce": acc["pg"] / nb, "nll": acc["spoke"] / nb,
+            "match": float(A.mean()),
+            "speak": float(1.0 - p[EOS]), "std": float(net.log_std.detach().exp().mean()),
+            "kl": 0.0, "clipfrac": 0.0, "entropy": 0.0, "ev": float("nan"),
+            "w_up": 0.0, "w_abs": 0.0}
 
 
 def error_update(net: ContPolicyNet, records: List[Dict], reach: float = 10.0,

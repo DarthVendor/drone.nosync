@@ -21,7 +21,7 @@ import json, math, shutil, sys, time, torch
 sys.path.insert(0, "/Users/maddoxnoon/Desktop/drone.nosync/lagrangian_es/src")
 from lagrangian_es.config import Config, RolloutCfg
 from lagrangian_es.composer import center_by_task, returns_from_stream, returns_goal_only
-from lagrangian_es.composer.policy_cont import error_update, imitate_update, ppo_update_cont, time_update
+from lagrangian_es.composer.policy_cont import error_update, imitate_update, ppo_update_cont, speak_update, time_update
 from lagrangian_es.es import build, build_composer, build_sensors
 from lagrangian_es.composer.policy_cont import paired_advantage, projected_time
 from lagrangian_es.metric import identity_preconditioner
@@ -69,7 +69,13 @@ GOAL_BONUS = 60.0                                          # per leg held (was 1
 # agreed at +0.28 and the elite of one batch beat the rest on the other by
 # 4.4.  So: a third of the genomes with three times the episodes each (noise
 # 6.0 < spread), and double the mutation.  Same 4608 rows an iteration.
-K_CHAIN = 128            # the composer's memory, in events.  A flight is 1800 steps
+K_CHAIN = int(__import__("os").environ.get("LES_KCHAIN", "64"))   # the composer's memory, in events.
+# 64, not 128.  `read_out` consumes only `ch[:, -1:]`, and the LAST chain block
+# already computes just that position, but the first block still does full
+# causal self-attention, which is quadratic in this number.  MEASURED, same
+# 4096 samples at mb=1024: k_chain 128 -> 10.2 s, 64 -> 6.1 s, 32 -> 5.1 s.
+# Unlike the minibatch this is a real trade -- 64 events at one report per 20
+# steps is ~21 s of a 36 s flight -- so it is exposed rather than assumed.
 # reporting every 20, so its whole history is ~90 measurement events plus its
 # own instructions; 32 kept only the last ~15 seconds and everything earlier
 # fell off, which is why it could not know it had already tried a corridor.
@@ -212,7 +218,7 @@ ERR_ALPHA = float(_os.environ.get("LES_ALPHA", "1.0"))     # weight on e_reach
 ERR_BETA = float(_os.environ.get("LES_BETA", "1.0"))       # weight on e_aim
 LEG_FIX = float(_os.environ.get("LES_LEG", "0") or 0)      # >0 pins the leg length
 DIFF_FIX = float(_os.environ.get("LES_DIFF", "-1"))        # >=0 pins the difficulty
-ARM = (f"k{REPEAT}{'s' if SIGNED else 'u'}" + ("" if LOSS == "ce" else f"-err{ERR_ALPHA:g}_{ERR_BETA:g}")
+ARM = (f"k{REPEAT}{'s' if SIGNED else 'u'}" + ("" if LOSS == "ce" else (f"-err{ERR_ALPHA:g}_{ERR_BETA:g}" if LOSS == "error" else f"-{LOSS}"))
        + "-pair")
 COMPILE_WORKERS = False                                    # the workers compile the controller's forward passes (one compile thread each; the parent warms the compiler before the fork)
 TOK_FRAC = 1.0   # KEEP EVERY RECORDED ROW'S TOKENS.  At 0.1 nine of ten rows
@@ -279,7 +285,22 @@ LR_C = float(sys.argv[7]) if len(sys.argv) > 7 else 1e-4        # the composer's
 # shifting 0.02-0.06 sigma, about 100x below the 0.02 KL this project once used
 # as a CAP.  The rollout costs 20 s and the update a fraction of that, so steps
 # taken per rollout are nearly free and were being left on the table.
-EPOCHS_C = int(_os.environ.get("LES_EPOCHS", "10"))
+EPOCHS_C = int(_os.environ.get("LES_EPOCHS", "3"))
+# 3, not 10.  EPOCHS IS THE WRONG UNIT -- what costs time is OPTIMIZER STEPS,
+# which is epochs * ceil(n_samples / MB_C).  Dropping the minibatch 4096 -> 1024
+# made each step ~8x cheaper per sample AND quadrupled the steps per epoch, so
+# leaving epochs at 10 took the update from 130 s to 605 s: 40 steps where the
+# old config did 10.  At 3 epochs over ~3300 samples that is ~12 steps, still
+# more than before, at roughly a quarter of the cost.
+# MINIBATCH (LES_MB).  1024, not 4096.  MEASURED, cost to push 4096 samples
+# through one forward+backward of this net on this machine:
+#     mb 4096  81.3 s      mb 2048  18.9 s      mb 1024  10.2 s      mb 512  11.4 s
+# The scaling is SUPERLINEAR above ~1024 -- the same samples in four batches of
+# 1024 cost an eighth of one batch of 4096 -- so the big minibatch was buying
+# nothing and costing 8x.  It is also strictly better for the optimization: a
+# minibatch larger than the whole batch meant ONE step per epoch, and steps
+# were the scarce resource (2 per iteration at epochs=2).
+MB_C = int(_os.environ.get("LES_MB", "1024"))
 TEMPERATURE = 1.0        # MEASURED: raising it does not help.  384 flights on the
 # same tasks at T = 1.0 / 1.4 / 1.8 / 2.5 moved the best-30% finish time by under
 # 1% (0.2785 -> 0.2771 -> 0.2808 -> 0.2777) while reach collapsed 0.880 -> 0.185.
@@ -551,27 +572,34 @@ def _update(groups_r, groups_R, holder, groups_win=None, groups_score=None, grou
     t = time.time()
     # target_kl is a REAL cap here: the argument mean is unbounded and the last
     # continuous composer this project ran was uncapped and reached KL 18
-    if LOSS == "time":
+    if LOSS == "speak":
+        # THE SIMPLE ONE.  A waypoint costs 0.25 of the arrival rate and three
+        # bearings 90 degrees apart do identical damage, so the action space is
+        # binary: speak or stay silent.  One log-probability, one paired
+        # advantage, no critic.  See `speak_update`.
+        holder["st"] = speak_update(comp.net, groups_r, groups_adv, epochs=EPOCHS_C,
+                                    batch=MB_C, lr=LR_C, opt=opt_c, max_samples=MAX_SAMPLES)
+    elif LOSS == "time":
         # PURELY TIME: fit T_hat to the time each decision actually needed,
         # then move the policy down T_hat.  Nothing else is in it.
         holder["st"] = time_update(comp.net, groups_r, groups_left, ep_steps=T_TRAIN,
-                                   epochs=EPOCHS_C, batch=4096, lr=LR_C, opt=opt_c,
+                                   epochs=EPOCHS_C, batch=MB_C, lr=LR_C, opt=opt_c,
                                    max_samples=MAX_SAMPLES)
     elif LOSS == "error":
         # No reward, no return, no labels: the composer claims the vehicle can
         # reach g by the next decision and reality answers.  See error_update.
-        holder["st"] = error_update(comp.net, groups_r, reach=10.0, epochs=EPOCHS_C, batch=4096,
+        holder["st"] = error_update(comp.net, groups_r, reach=10.0, epochs=EPOCHS_C, batch=MB_C,
                                     lr=LR_C, opt=opt_c, max_samples=MAX_SAMPLES,
                                     alpha=ERR_ALPHA, beta=ERR_BETA)
     elif IMITATE:
-        holder["st"] = imitate_update(comp.net, groups_r, groups_win, epochs=EPOCHS_C, batch=4096,
+        holder["st"] = imitate_update(comp.net, groups_r, groups_win, epochs=EPOCHS_C, batch=MB_C,
                                       lr=LR_C, opt=opt_c, max_samples=MAX_SAMPLES,
                                       keep_frac=KEEP_FRAC, score=groups_score, advantage=groups_adv,
                                       weight_tau=WEIGHT_TAU, task=groups_task,
                                       signed=SIGNED, w_max=W_MAX,
                                       reach=10.0)
     else:
-        holder["st"] = ppo_update_cont(comp.net, groups_r, groups_R, comp.n_terms, epochs=EPOCHS_C, batch=4096, lr=LR_C, vcoef=VCOEF, ent=0.0, target_kl=0.02, opt=opt_c, max_samples=MAX_SAMPLES)
+        holder["st"] = ppo_update_cont(comp.net, groups_r, groups_R, comp.n_terms, epochs=EPOCHS_C, batch=MB_C, lr=LR_C, vcoef=VCOEF, ent=0.0, target_kl=0.02, opt=opt_c, max_samples=MAX_SAMPLES)
     holder["t"] = time.time() - t
 # The composer's updates train a CHALLENGER.  Measured (Sept 9, corridor
 # city, judge-matched training): each update is near neutral on the batch and

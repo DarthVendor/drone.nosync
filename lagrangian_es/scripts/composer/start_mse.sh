@@ -51,9 +51,22 @@ export LES_SPEAK="${LES_SPEAK:-0.1}"     # forced WAYPOINT rate; 0 lets it go si
 export LES_INJECT="${LES_INJECT:-4}"     # decisions per flight
 export LES_LEG="${LES_LEG:-20}"          # 20 m legs: where the low level fails
 export LES_DIFF="${LES_DIFF:-0.25}"      # 25% buildings
-export LES_EPOCHS="${LES_EPOCHS:-10}"    # optimizer steps per iteration
+# EPOCHS IS NOT THE UNIT -- steps are: epochs * ceil(n_samples / LES_MB).  With
+# MB 1024 and ~3300 samples that is 4 steps an epoch, so 3 epochs ~ 12 steps.
+# Leaving this at 10 alongside the smaller minibatch took the update 130 s ->
+# 605 s (40 steps).  Raise LES_MB with it if you want more epochs.
+export LES_EPOCHS="${LES_EPOCHS:-3}"
 export LES_EPS="${LES_EPS:-1152}"        # episodes per iteration
 export LES_VART="${LES_VART:-2.0}"       # variational waypoint temperature; 0 = off
+# PERFORMANCE.  Measured cost to push 4096 samples through one fwd+bwd:
+#   mb 4096  81.3 s  |  mb 2048  18.9 s  |  mb 1024  10.2 s  |  mb 512  11.4 s
+# Superlinear above ~1024, so the big minibatch cost 8x and bought nothing --
+# and a minibatch larger than the batch meant ONE optimizer step per epoch,
+# when steps were the scarce resource.  k_chain is quadratic in the first
+# chain block's causal self-attention (the last block already computes only
+# the final position): 128 -> 10.2 s, 64 -> 6.1 s, 32 -> 5.1 s at mb 1024.
+export LES_MB="${LES_MB:-1024}"          # update minibatch
+export LES_KCHAIN="${LES_KCHAIN:-64}"    # chain memory in events (~21 s of a 36 s flight)
 
 WORK="${WORK:-$HOME/drone_runs/mse_$(date +%H%M)}"
 ARM="${ARM:-k1u}" ITERS="${ITERS:-400}" WORK="$WORK" exec "$HERE/train.sh"
