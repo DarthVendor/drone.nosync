@@ -26,6 +26,12 @@ courses, and a sensing layer in which a camera deforms the *desired* Lagrangian
 rather than feeding an estimator. Each is a composition, not a fork: one loop, one
 metric, one set of operators throughout.
 
+On top of that plant sits a second, separately trained layer: a small
+transformer that decides *where* to send a frozen low-level controller, in
+real time, from onboard sensors — subgoals, not torques. See
+`scripts/composer/README.md` for that architecture, its training arms, and
+every `LES_*` config variable.
+
 ## Quickstart
 
 ```bash
@@ -882,7 +888,12 @@ src/lagrangian_es/
   constraints.py               episode-level budgets + multipliers
   metric.py operators.py es.py G(θ) and P; variation/selection; the loops
   evaluate.py viz.py           held-out metrics; figures
+  composer/                    a trainable transformer ROUTER over a frozen
+                                low level; see scripts/composer/README.md
+  environments/maps/           built city/corridor/occluded maps for the
+                                composer's tasks
 scripts/  train.py  ablate.py  replay.py
+  composer/                    the two-stage composer trainer (cotrain_v11.py)
 ```
 
 Registries: `SYSTEMS`, `TRAINABLES`, `TERMS`, `SENSORS`, `CONNECTORS`, `GROUPS`,
