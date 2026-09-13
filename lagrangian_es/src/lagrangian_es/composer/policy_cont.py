@@ -1888,13 +1888,15 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
                 # Schulman's k3: unbiased and non-negative by construction.
                 _lr = (lp - lp_start[idx]).clamp(-20.0, 20.0)
                 kl_mb = float((_lr.exp() - 1.0 - _lr).mean())
-            if target_kl > 0 and kl_mb > target_kl:
-                (vcoef * v_loss).backward()
-                nn.utils.clip_grad_norm_(net.parameters(), 1.0)
-                opt.step(); opt.zero_grad(set_to_none=True)
-                acc["kl"] += kl_mb; acc["nb"] += 1
-                stop = True
-                break
+            # NO EARLY STOP.  `target_kl` is MEASURED and reported, never
+            # enforced -- the composer's rate is fixed, with no KL cap, no
+            # early stop and no backtracking (user's call, twice).
+            #   This branch survived because it is unreachable from the
+            # ACCUMULATION path, which returns before it, so every LES_ACCUM>1
+            # run had it dormant.  Stepping every epoch (LES_ACCUM=1) woke it
+            # up: MEASURED live, updates halted after 2, 3 and 6 of ~20
+            # minibatches, discarding 70-90% of a batch that costs a full
+            # rollout to collect.
             (loss + vcoef * v_loss - ent * h).backward()
             nn.utils.clip_grad_norm_(net.parameters(), 1.0)
             opt.step(); opt.zero_grad(set_to_none=True)

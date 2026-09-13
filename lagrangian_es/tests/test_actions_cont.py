@@ -267,10 +267,24 @@ def test_the_update_runs_and_moves_both_heads_under_its_trust_region():
     # was guarding against, and nothing here replaces that guard except this.
     assert float(net.log_std.exp().min()) > 0.5 * float(before["log_std"].exp().min()), \
         "the spread must not collapse in a single update"
-    # a huge learning rate must trip the cap rather than run away
+    # A huge learning rate no longer trips a cap -- there is none (user's call:
+    # fixed rate, no KL cap, no early stop, no backtracking).  What must still
+    # hold is that the KL is MEASURED and reported honestly, so the log shows
+    # the drift even though nothing acts on it, and that the update stays
+    # finite rather than producing NaN.
     net2 = _cont_net()
     st2 = ppo_update_cont(net2, recs, R, 2, epochs=8, batch=16, lr=5.0, target_kl=0.01)
-    assert st2["stopped_early"], "the trust region never bound at lr 5.0"
+    assert st2["stopped_early"] is False, "nothing may stop the update early"
+    assert st2["kl"] == st2["kl"] and st2["kl"] > 0.01, \
+        f"a 5.0 rate must REPORT a large drift, got kl {st2['kl']}"
+    # NOTE, deliberately: at 5.0 the net DOES diverge. With no cap the only
+    # guardrail left is the rate itself, which is fixed at ~2e-4. That is the
+    # accepted trade, so the finiteness check belongs at the real rate.
+    net3 = _cont_net()
+    st3 = ppo_update_cont(net3, recs, R, 2, epochs=8, batch=16, lr=2e-4, target_kl=0.01)
+    assert st3["stopped_early"] is False
+    assert all(torch.isfinite(p).all() for p in net3.parameters()), \
+        "at the composer's real rate an uncapped update must stay finite"
 
 
 def test_an_argument_a_token_does_not_use_gets_no_gradient():

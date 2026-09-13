@@ -73,8 +73,15 @@ def test_the_update_scores_both_sides_at_the_sampling_width():
         "records must store the width the action was drawn at"
 
 
-def test_the_trust_region_is_enforced_before_the_step_not_after():
-    """A cap that is measured but not enforced is not a cap.
+def test_the_kl_is_measured_before_the_step_even_though_it_is_not_enforced():
+    """The KL is REPORTED, never enforced (user's call, twice): the composer's
+    rate is fixed, with no cap, no early stop and no backtracking.
+
+    It still has to be measured on THIS minibatch before the step, or the
+    number in the log describes a policy that has already moved. The history
+    behind it: the check once ran on the RUNNING MEAN across minibatches and
+    fired only once that mean was already over -- reported kl 0.14-0.40 (7-20x
+    a 0.02 cap) while arrival fell 0.383 -> 0.273 over five iterations.
 
     It used to be checked on the RUNNING MEAN across minibatches and broke only
     once that mean was already over. MEASURED with target_kl 0.02: reported kl
@@ -90,9 +97,8 @@ def test_the_trust_region_is_enforced_before_the_step_not_after():
     i_check = src.index("kl_mb = float(")
     i_step = src.index("(loss + vcoef * v_loss - ent * h).backward()")
     assert i_check < i_step, "the KL must be measured before the policy step"
-    assert "if target_kl > 0 and kl_mb > target_kl:" in src
-    assert "(vcoef * v_loss).backward()" in src, \
-        "the critic must keep training even when the policy step is skipped"
+    assert "if target_kl > 0 and kl_mb > target_kl:" not in src, \
+        "measured, not enforced -- see test_the_update_never_stops_early_on_kl"
 
 
 def test_the_cap_bounds_this_updates_drift_not_the_stale_offset():
@@ -150,8 +156,11 @@ def test_the_update_uses_the_k3_estimator():
         "the signed mean must not be the cap"
 
 
-def test_there_is_exactly_one_stopping_condition():
-    """The cap was enforced TWICE -- a per-minibatch check before the step and a
+def test_no_stopping_condition_survives_anywhere():
+    """There is no stopping condition at all any more, of either kind.
+
+    History, because both failure modes are worth not repeating. The cap was
+    once enforced TWICE -- a per-minibatch check before the step and a
     running-mean check after it -- and the second bit first.
 
     k3 is non-negative and grows as the policy drifts, so `acc['kl']/acc['nb']`
@@ -168,9 +177,9 @@ def test_there_is_exactly_one_stopping_condition():
 
     from lagrangian_es.composer.policy_cont import ppo_update_cont
     src = inspect.getsource(ppo_update_cont)
-    assert src.count("stop = True") == 1, "exactly one stopping condition"
+    assert src.count("stop = True") == 0, "no stopping condition of any kind"
     assert 'acc["kl"] / acc["nb"] > target_kl' not in src, "no running-mean stop"
-    assert "if target_kl > 0 and kl_mb > target_kl:" in src, "the per-step check remains"
+    assert "if target_kl > 0 and kl_mb > target_kl:" not in src, "no per-step stop"
     assert '"nb": acc["nb"]' in src, "the step count must be observable"
 
 
@@ -209,3 +218,50 @@ def test_a_batch_with_no_outcome_spread_is_skipped_not_normalised():
     after = net.state_dict()
     assert all(torch.equal(after[k], before[k]) for k in before), \
         "a batch that ranks nothing must not move the policy"
+
+
+def test_the_update_never_stops_early_on_kl():
+    """The composer's rate is fixed: no KL cap, no early stop, no backtracking
+    (user's call, twice). `target_kl` is measured and reported, never enforced.
+
+    The branch survived because the ACCUMULATION path returns before reaching
+    it, so every LES_ACCUM>1 run had it dormant. Stepping every epoch woke it
+    up and updates halted after 2, 3 and 6 of ~20 minibatches -- discarding
+    70-90% of a batch that costs a whole rollout to collect.
+    """
+    import inspect
+    from lagrangian_es.composer import policy_cont
+    src = inspect.getsource(policy_cont.ppo_update_cont)
+    assert "stop = True" not in src, "no early stop may be reintroduced"
+    assert "if target_kl > 0 and kl_mb > target_kl" not in src, \
+        "target_kl must be reported, not enforced"
+
+
+def test_every_minibatch_is_used():
+    """With the cap gone, an update must take a step per minibatch."""
+    import sys
+    sys.path.insert(0, "tests")
+    import torch
+    from test_actions_cont import _cont_net, _fake_tok
+    from lagrangian_es.composer.actions_cont import ContVocab
+    from lagrangian_es.composer.policy_cont import ppo_update_cont
+    V = ContVocab(2); B, T = 64, 4
+    torch.manual_seed(0); net = _cont_net()
+    recs = []
+    for t in range(T):
+        tok = _fake_tok(B, 20.0, net.goal_gain); act = torch.full((B,), V.WAYPOINT)
+        with torch.no_grad():
+            lg, mu_all, _ = net.pre(tok); mu = mu_all[torch.arange(B), act]
+            u = mu + net.log_std.exp() * torch.randn(B, V.n_args)
+        recs.append({"t": float(t * 20), "act": act, "u": u,
+                     "n_args": torch.tensor([V.n_arg_of(int(z)) for z in act.tolist()]),
+                     "moved": torch.ones(B, dtype=torch.bool),
+                     "alive": torch.ones(B, dtype=torch.bool),
+                     "rows": torch.arange(B), "tok_keep": None, "logits": lg.clone(),
+                     "pi_logits": lg.clone(), "mu": mu.clone(),
+                     "log_std": net.log_std.detach().clone(), "tok": tok})
+    R = torch.randn(T, B, dtype=torch.float64) * 50.0
+    # a deliberately provocative rate: the old cap would have halted this at once
+    st = ppo_update_cont(net, recs, R, 2, epochs=1, batch=32, lr=5e-3, target_kl=0.02)
+    assert st["stopped_early"] is False, "must not stop early"
+    assert st["nb"] >= (T * B) // 32, f"took only {st['nb']} steps of {(T*B)//32}"
