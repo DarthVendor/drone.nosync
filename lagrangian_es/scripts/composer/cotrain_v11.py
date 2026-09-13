@@ -498,6 +498,19 @@ SIGMA_XY = float(sys.argv[8]) if len(sys.argv) > 8 else SIGMA0_COMPOSER
 # consistent RUN pays.  I.i.d. gives a run of k with probability eps^k
 # (0.126^3 ~ 0.002); holding the centre gives eps.
 NOISE_HOLD = int(_os.environ.get("LES_HOLD", "1"))
+# ONE GOAL PER ITERATION, MANY STARTS.  Every episode of an iteration flies
+# to the SAME goal from its own random start, and the goal rotates with the
+# iteration so no single pocket is overfitted.
+#   Why: the advantage is then a comparison WITHIN one task.  Drawing a
+# different goal per episode confounds "this action was better" with "this
+# task was easier", which is the ranking failure already recorded for the
+# imitation arm -- it ranked TASKS, not decisions.  It is also the direct
+# attack on the -0.45 cross-draw gradient cosine that forced LES_ACCUM=16:
+# consecutive draws that share a goal and differ only in starts should
+# agree far better, and an update every iteration becomes affordable.
+ONE_GOAL = _os.environ.get("LES_ONEGOAL", "0") == "1"
+# starts sampled from free space rather than the map's 16 waypoints
+FREE_START = _os.environ.get("LES_FREESTART", "0") == "1"
 JUDGE_N = 256                                                  # judged every 10 on 256 episodes: half the noise of 128 every 5, same cost
 TARGET_KL, LR0, LR_MAX = 0.02, 2e-5, 1e-3     # the composer's trust region; the rate adapts to it
 W = f"{SP}/v11_{ARM}_composer.pt"; G = f"{SP}/v11_{ARM}_genome.json"; STATE = f"{SP}/v11_{ARM}_state.json"
@@ -541,7 +554,7 @@ def cfg_for(env, max_leg, steps, n, composer="policy_cont", early=False, sensors
     return Config(system="quadrotor_nav", trainable="nav_agent", task="city_tour", environment=env,
                   sensors=sensors, sensor_kw=skw, gating="arrival", seed=0, composer=composer, composer_kw=ckw,
                   task_kw=(("n_legs", 2), ("max_leg", max_leg)),
-                  system_kw=(("prox_gain", 30.0), ("free_start", True), ("reset_yaw", 3.14159265), ("speed_limit", 5.0)) + ((("yaw_mode", "lagrangian"),) if yaw else ()),   # 5 m/s airspeed limit (user)
+                  system_kw=(("prox_gain", 30.0), ("free_start", "random" if FREE_START else True), ("reset_yaw", 3.14159265), ("speed_limit", 5.0)) + ((("yaw_mode", "lagrangian"),) if yaw else ()),   # 5 m/s airspeed limit (user)
                   trainable_kw=tkw,
                   # the task and nothing else: distance over time, the bonus for
                   # arriving, the charge for dying.  No saturation, effort or
@@ -942,6 +955,9 @@ for it in range(1, OUTER + 1):
     # task differ by DECISION alone, which is what makes their spread credit.
     E_T = E // REPEAT
     goals_it = task_it.sample(E_T, make_gen(5_000_000 + it))
+    if ONE_GOAL:
+        # one row of the draw, held across the whole batch; `it` rotates it
+        goals_it = goals_it[it % goals_it.shape[0]].unsqueeze(0).expand_as(goals_it).contiguous()
     shards, res_list = [], []
     for _r in range(REPEAT):
         _res, _sh = par.run_with_records(TH, goals_it, 5_100_000 + it, stochastic=True,

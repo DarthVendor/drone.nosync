@@ -89,11 +89,13 @@ class QuadrotorNav(QuadrotorSE3):
         self.needs_course = bool(self.env.groups)
         self.start_pool = None
         if free_start:
-            self.use_free_start()
+            # `free_start="random"` ignores the waypoint pool and samples free
+            # space, so every episode starts somewhere different.
+            self.use_free_start(prefer_waypoints=(free_start != "random"))
 
     def use_free_start(self, n: int = 2048, margin: float = 0.45,
                        extent: Optional[float] = None, z_range=(0.6, 1.6),
-                       seed: int = 999):
+                       seed: int = 999, prefer_waypoints: bool = True):
         """Start episodes in free space rather than at the origin.
 
         Needed for imported scenes, where the drawing's origin is very often
@@ -103,10 +105,18 @@ class QuadrotorNav(QuadrotorSE3):
         are street vertices: already clearance-checked, and unlike
         rejection-sampled free space they are places a vehicle would actually
         lift off from rather than the air above a low block.
+
+        `prefer_waypoints=False` forces rejection-sampled free space even on a
+        map that carries waypoints.  The waypoint pool is a handful of DISCRETE
+        points -- 16 on `occluded`, so 1152 episodes launch ~72 flights from
+        each, all dead-centre inside a pocket -- and a batch that repeats 16
+        starting geometries samples the task space far more coarsely than its
+        episode count suggests.  Free starts give every episode its own
+        approach, which is what the gradient is averaging over.
         """
         from ..util import make_gen
         wps = getattr(self.env, "waypoints", None)
-        if wps:
+        if wps and prefer_waypoints:
             self.start_pool = torch.as_tensor(wps, dtype=self.dtype,
                                               device=self.device)
             return self

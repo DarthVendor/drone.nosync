@@ -362,13 +362,30 @@ class CityTour(Task):
         across episodes and still comes from the map.
         """
         p0 = self.system.task_position(s)
-        near = (self.pool[None, :, :2] - goals[:, None, 0, :2]).norm(dim=-1)
+        # WHICH POOL THE START IS PROJECTED ONTO.  The waypoint pool is a
+        # handful of discrete points (16 on `occluded`), so every episode in a
+        # batch launches from one of 16 identical geometries however many
+        # episodes there are -- the batch samples the task space far more
+        # coarsely than its episode count suggests.  When the system carries a
+        # FREE-SPACE pool (`free_start="random"`, 2048 rejection-sampled
+        # points) project onto that instead: the start is then essentially `p0`
+        # itself, distinct per episode, and the projection only has to move it
+        # when it is out of range of the goal.
+        #   The projection itself stays, and this docstring's warning with it:
+        # an unprojected start averages 21 m to a fixed goal against a
+        # `max_leg` of 20, and MEASURED that gives silence arrival 0.000 --
+        # every flight hopeless, so the batch ranks nothing.
+        pool = getattr(self.system, "start_pool", None)
+        if pool is None or pool.shape[0] <= self.pool.shape[0]:
+            pool = self.pool
+        pool = pool.to(self.pool.dtype)
+        near = (pool[None, :, :2] - goals[:, None, 0, :2]).norm(dim=-1)
         ok = (near <= self.max_leg) & (near > 0.0)
-        d = (self.pool[None, :, :2] - p0[:, None, :2]).norm(dim=-1)
+        d = (pool[None, :, :2] - p0[:, None, :2]).norm(dim=-1)
         d = torch.where(ok, d, torch.full_like(d, float("inf")))
         pick = d.argmin(dim=1)
         out = dict(s)
-        out["p"] = self.pool[pick].clone()
+        out["p"] = pool[pick].clone()
         out["v"] = torch.zeros_like(s["v"])
         return out
 

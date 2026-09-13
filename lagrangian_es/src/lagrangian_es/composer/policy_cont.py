@@ -1661,6 +1661,22 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
     # NORMALISED returns, and the value head is fit to THOSE.  Fitting it to raw
     # returns (spread ~230 here) left it at its initialisation -- explained
     # variance 0.000 -- so it predicted a constant and absorbed nothing.
+    # A BATCH WITH NO OUTCOME SPREAD RANKS NOTHING -- do not fabricate a target
+    # from float noise.  With one shared goal per iteration an unreachable goal
+    # makes every flight score the same: measured, arrival 0.522 on one epoch's
+    # goal and 0.000 on the next.  When that happens `rets.std()` falls under
+    # the clamp, `rets_n` collapses toward zero instead of normalising to unit
+    # variance, and EV -- which divides by `var(rets_n)` -- reads -43639, a
+    # divide-by-almost-zero rather than a measurement.  Normalising it anyway
+    # turns numerical noise into the thing the policy is trained to chase.
+    _spread = float(rets.std())
+    _scale = max(1.0, float(rets.abs().mean()))
+    if not (_spread > 1e-6 * _scale):
+        return {"n": n, "nb": 0, "kl": 0.0, "clipfrac": 0.0, "loss": 0.0,
+                "v_loss": 0.0, "entropy": 0.0,
+                "speak": float(1.0 - torch.softmax(old_logits, -1).mean(0)[net.vocab.EOS]),
+                "std": float(net.log_std.detach().exp().mean()),
+                "ev": float("nan"), "stopped_early": False, "degenerate": True}
     rets_n = (rets - rets.mean()) / rets.std().clamp_min(1e-6)
     # ---- TD CREDIT -------------------------------------------------------
     # MEASURED: Monte-Carlo credit over this horizon carries no resolvable

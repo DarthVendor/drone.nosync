@@ -172,3 +172,40 @@ def test_there_is_exactly_one_stopping_condition():
     assert 'acc["kl"] / acc["nb"] > target_kl' not in src, "no running-mean stop"
     assert "if target_kl > 0 and kl_mb > target_kl:" in src, "the per-step check remains"
     assert '"nb": acc["nb"]' in src, "the step count must be observable"
+
+
+def test_a_batch_with_no_outcome_spread_is_skipped_not_normalised():
+    """One shared goal per epoch means an unreachable goal makes EVERY flight
+    score the same. Normalising that divides by the clamp floor, collapses the
+    target toward zero, and makes EV a divide-by-almost-zero (-43639 observed
+    live). There is nothing to learn from such a batch; skip it.
+    """
+    import sys
+    sys.path.insert(0, "tests")
+    import torch
+    from test_actions_cont import _cont_net, _fake_tok
+    from lagrangian_es.composer.actions_cont import ContVocab
+    from lagrangian_es.composer.policy_cont import ppo_update_cont
+    V = ContVocab(2); B, T = 16, 2
+    torch.manual_seed(0); net = _cont_net()
+    recs = []
+    for t in range(T):
+        tok = _fake_tok(B, 20.0, net.goal_gain); act = torch.full((B,), V.WAYPOINT)
+        with torch.no_grad():
+            lg, mu_all, _ = net.pre(tok); mu = mu_all[torch.arange(B), act]
+            u = mu + net.log_std.exp() * torch.randn(B, V.n_args)
+        recs.append({"t": float(t * 20), "act": act, "u": u,
+                     "n_args": torch.tensor([V.n_arg_of(int(z)) for z in act.tolist()]),
+                     "moved": torch.ones(B, dtype=torch.bool),
+                     "alive": torch.ones(B, dtype=torch.bool),
+                     "rows": torch.arange(B), "tok_keep": None, "logits": lg.clone(),
+                     "pi_logits": lg.clone(), "mu": mu.clone(),
+                     "log_std": net.log_std.detach().clone(), "tok": tok})
+    before = {k: v.detach().clone() for k, v in net.state_dict().items()}
+    flat = torch.full((T, B), 1353.45, dtype=torch.float64)      # every flight identical
+    st = ppo_update_cont(net, recs, flat, 2, epochs=2, batch=8, lr=1e-3)
+    assert st.get("degenerate") is True, f"must report the batch as degenerate: {st}"
+    assert st["ev"] != st["ev"], "EV must be nan, not a divide-by-almost-zero"
+    after = net.state_dict()
+    assert all(torch.equal(after[k], before[k]) for k in before), \
+        "a batch that ranks nothing must not move the policy"
