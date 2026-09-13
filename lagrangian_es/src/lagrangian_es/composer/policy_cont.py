@@ -309,9 +309,18 @@ class ContComposer(PolicyComposer):
         """The rollout opens every flight with `vocab.straight`.
 
         For the token composer that was a single component, polar about the
-        GOAL direction, so "straight" needed no argument.  Here theta is
-        measured from the nose, so aiming at the goal is an argument and has to
-        be computed: `WAYPOINT(r=+1, theta=bearing of the goal)`.
+        GOAL direction, so "straight" needed no argument.  That is true again:
+        the frame is GOAL-RELATIVE (`theta = bearing(g_ego) + pi*a1`), so
+        aiming at the goal is a1 = 0 and the opening placement is
+        `WAYPOINT(r=+1, theta=0)`.
+
+        This used to set `a1 = bearing(g_ego)/pi`, left over from the
+        nose-relative frame, which under the goal-relative one DOUBLES the
+        bearing: measured, a goal 90 deg off opened with its subgoal aimed at
+        180 deg, and one 150 deg off at 300 deg.  Every flight in the project
+        since the frame changed opened by being sent the wrong way, and on the
+        occluded map -- where the vehicle starts inside a pocket -- that aims
+        the opening subgoal into a wall.
         """
         V = self.net.vocab
         x, goal = ctx["x"], ctx["goal"]
@@ -320,7 +329,8 @@ class ContComposer(PolicyComposer):
         B = x.shape[0]
         arg = torch.zeros(B, V.n_args, dtype=x.dtype, device=x.device)
         arg[:, 0] = 1.0                                            # the whole reachable radius
-        arg[:, 1] = torch.atan2(g_ego[:, 1], g_ego[:, 0]).to(x.dtype) / math.pi
+        # a1 = 0 IS "straight at the goal" in the goal-relative frame; there is
+        # nothing to compute, and computing it double-counted the bearing.
         spec = V.apply(ids.to(torch.long), arg, self._current(ctx, B), x, goal, psi,
                        g_ego, self.reach, self.z_min)
         self._remember(ctx, ids.to(torch.long))
@@ -405,7 +415,7 @@ class ContComposer(PolicyComposer):
                     ctx_s["range"] = _rng0[idx]
                 act, u = choose(logits, mu, tok, ctx_s, ids_full[idx], step, has[idx])
                 arg = V.squash(u)
-                V.step(act, arg, out, pend, has, psi, rows=idx)
+                V.step(act, arg, out, pend, has, psi, rows=idx, raw=u)
                 self._remember_args(ctx_s, act, arg)
                 last_arg = arg
                 tok_cur, cur_pos, last_act = tok, idx, act
@@ -601,7 +611,10 @@ class ContComposer(PolicyComposer):
                             _rows_n = _idc[_need]; _nd = int(_need.sum())
                             _a0 = (torch.rand(_nd, mu.shape[-1]) * 2.0 - 1.0
                                    ).clamp(-0.999, 0.999)
-                            self._hold_mu[_rows_n] = torch.atanh(_a0).float()
+                            _c0 = torch.atanh(_a0)
+                            if _c0.shape[-1] > 1:        # theta: one full circle, uniformly
+                                _c0[:, 1] = torch.rand(_nd) * 2.0 - 1.0
+                            self._hold_mu[_rows_n] = _c0.float()
                             self._hold_on[_rows_n] = torch.rand(_nd) < _ee
                             self._hold_left[_rows_n] = _nh
                         self._hold_left[_idc] -= 1
@@ -617,6 +630,8 @@ class ContComposer(PolicyComposer):
                         else:
                             _a = (torch.rand_like(mu) * 2.0 - 1.0).clamp(-0.999, 0.999)
                             _draw = torch.atanh(_a)
+                            if _draw.shape[-1] > 1:      # theta is raw: uniform over the CIRCLE
+                                _draw[:, 1] = torch.rand_like(mu[:, 1]) * 2.0 - 1.0
                         u = torch.where(_pick[:, None], _draw, u)                # PROBABILISTIC WAYPOINTS FROM THE ACTION.  For the rows whose
                 # token is a WAYPOINT, redraw the argument from exp(-S/T) over
                 # `var_k` of the policy's OWN candidates, S being the two-leg
@@ -776,7 +791,10 @@ def _subgoal_ego(net: ContPolicyNet, mu: Tensor, g_ego: Tensor) -> Tensor:
     gn = g_ego.norm(dim=-1).clamp_min(1e-9)
     gb = torch.atan2(g_ego[:, 1], g_ego[:, 0])
     gp = torch.asin((g_ego[:, 2] / gn).clamp(-1.0, 1.0))
-    theta = gb + math.pi * a[:, 1]
+    # THETA READS THE RAW ARGUMENT, matching `ContVocab.step`: `pi*tanh` put a
+    # singularity on "directly away from the goal" (a1 -> inf), which is the
+    # one manoeuvre a pocket map demands.  See the note in `actions_cont.step`.
+    theta = gb + math.pi * mu[:, 1]
     phi = (gp + PHI_MAX * a[:, 2]).clamp(-PHI_MAX, PHI_MAX) if a.shape[-1] > 2 \
         else torch.zeros_like(theta)
     cphi = torch.cos(phi)

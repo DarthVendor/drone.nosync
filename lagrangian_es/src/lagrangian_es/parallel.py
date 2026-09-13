@@ -203,8 +203,16 @@ def _work(payload):
                      # argument, how many slots the token actually used, and
                      # the Gaussian that drew it.  Absent for the token
                      # composer, so this stays None there.
+                     # `explore_mu` is the HELD exploration centre: without it
+                     # here the parent scores the mixture with the UNIFORM
+                     # component while the worker SAMPLED from the held
+                     # Gaussian, so the density does not match the behaviour
+                     # policy that drew the action.  Exactly the `pi_logits`
+                     # failure again -- this list is by NAME and silently drops
+                     # anything not in it.
                      **{k: (rc[k][keep] if torch.is_tensor(rc[k]) and rc[k].shape[:1] == r.shape[:1] else rc[k])
-                        for k in ("u", "n_args", "mu", "log_std", "x", "goalw") if k in rc},
+                        for k in ("u", "n_args", "mu", "log_std", "x", "goalw", "explore_mu")
+                        if k in rc and rc[k] is not None},
                      "tok": {k: (v[keep_t].float() if torch.is_tensor(v) and v.is_floating_point()
                                  else (v[keep_t] if torch.is_tensor(v) else v)) for k, v in rc["tok"].items()}})
     chain = [{k: (v[sel] if torch.is_tensor(v) else v) for k, v in tok.items()} for tok in _RIG.chain]

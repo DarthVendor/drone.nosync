@@ -107,3 +107,20 @@ def test_the_base_class_does_not_setattr_kwargs():
     src = inspect.getsource(Composer.__init__)
     assert "setattr" not in src and "self.__dict__.update" not in src, \
         "if this ever changes, the explicit pops above can be relaxed"
+
+
+def test_explore_mu_survives_the_worker_boundary():
+    """`parallel._work` repacks records by NAME and silently drops the rest.
+
+    Without `explore_mu` in that list the parent scored the mixture with the
+    UNIFORM component while the worker had SAMPLED from the held Gaussian --
+    the density did not match the behaviour policy that drew the action. This
+    is the third time this exact list has caused a silent fallback
+    (`pi_logits`, then the continuous vocabulary's `u`/`n_args`/`mu`/`log_std`).
+    """
+    import re
+    src = open("src/lagrangian_es/parallel.py").read()
+    m = re.search(r'for k in \(([^)]*)\)', src)
+    assert m, "could not find the record field list in parallel._work"
+    assert "explore_mu" in m.group(1), \
+        "explore_mu must be repacked, or held exploration is scored as uniform"

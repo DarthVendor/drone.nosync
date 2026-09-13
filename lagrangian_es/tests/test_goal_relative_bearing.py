@@ -49,11 +49,54 @@ def test_the_argument_still_spans_the_whole_circle():
     correction so routing around either side is expressible."""
     net = ContPolicyNet(n_terms=1)
     g = torch.tensor([[1.0, 0.0, 0.0]]) * 0.5
-    left = _subgoal_ego(net, torch.tensor([[0.0, 2.0, 0.0]]), g)      # tanh -> ~+1 -> +180
-    right = _subgoal_ego(net, torch.tensor([[0.0, -2.0, 0.0]]), g)
+    left = _subgoal_ego(net, torch.tensor([[0.0, 1.0, 0.0]]), g)      # pi*1 -> +180
+    right = _subgoal_ego(net, torch.tensor([[0.0, -1.0, 0.0]]), g)
     fwd = _subgoal_ego(net, torch.zeros(1, 3), g)
     assert float(fwd[0, 0]) > 0, "zero aims at the goal (+x here)"
-    assert float(left[0, 0]) < 0 and float(right[0, 0]) < 0, "large |a1| turns away"
+    assert float(left[0, 0]) < 0 and float(right[0, 0]) < 0, "a1 = +-1 turns away"
+
+
+def test_directly_away_from_the_goal_is_reachable_at_a_finite_argument():
+    """THE reason the frame changed.
+
+    `pi*tanh(a1)` covers (-180, 180) -- the whole circle MINUS ONE POINT -- and
+    the missing point is "fly directly away from the goal", needing
+    a1 = infinity.  On `occluded` every pocket opens the same way, so that is
+    the manoeuvre the map most demands: measured, the median leg needs a 90 deg
+    correction just to leave its own pocket (3.9 sigma out at sd 0.12) and 14%
+    of legs need beyond 8 sigma, while tanh' collapses on top of it (at 179 deg
+    the parameter must travel ~500x further per degree gained).
+    """
+    net = ContPolicyNet(n_terms=1)
+    g = torch.tensor([[1.0, 0.0, 0.0]]) * 0.5
+    back = _subgoal_ego(net, torch.tensor([[0.0, 1.0, 0.0]]), g)
+    # a1 = 1 is EXACTLY opposite, at a finite and modest argument
+    assert float(back[0, 0]) < 0 and abs(float(back[0, 1])) < 1e-6, \
+        "a1 = 1 must aim exactly 180 deg from the goal"
+    # and the correction is LINEAR in the argument -- no boundary to saturate
+    for a1, deg in ((0.25, 45.0), (0.5, 90.0), (0.75, 135.0), (1.0, 180.0)):
+        sub = _subgoal_ego(net, torch.tensor([[0.0, a1, 0.0]]), g)
+        got = math.degrees(math.atan2(float(sub[0, 1]), float(sub[0, 0])))
+        assert abs(abs(got) - deg) < 1e-3, f"a1={a1} gave {got}, wanted {deg}"
+
+
+def test_the_bearing_has_no_vanishing_gradient_anywhere():
+    """The old frame's slope died exactly where the map needed it most.
+
+    `d(correction)/d(a1)` was `pi*(1 - tanh^2 a1)`: 180 deg/unit at the
+    identity but 2 deg/unit at 179 deg, a ~500x collapse right where a pocket
+    map needs the travel.  Linear in `a1`, it is pi everywhere.
+    """
+    net = ContPolicyNet(n_terms=1)
+    g = torch.tensor([[1.0, 0.0, 0.0]]) * 0.5
+    h = 1e-4
+    def ang(a1):
+        sub = _subgoal_ego(net, torch.tensor([[0.0, a1, 0.0]]), g)
+        return math.atan2(float(sub[0, 1]), float(sub[0, 0]))
+    for a1 in (0.0, 0.25, 0.5, 0.75, 0.95):
+        d = (ang(a1 + h) - ang(a1 - h)) / (2 * h)     # d(theta)/d(a1)
+        assert abs(d - math.pi) < 1e-2, \
+            f"slope {d:.4f} at a1={a1}, wanted pi everywhere (old frame: collapsed)"
 
 
 def test_the_rollout_geometry_and_the_loss_mirror_agree():

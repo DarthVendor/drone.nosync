@@ -87,3 +87,31 @@ def test_the_widening_is_gone():
     src = open("src/lagrangian_es/composer/policy_cont.py").read()
     assert "s * (1.0 + eps)" not in src
     assert 'getattr(self, "explore_eps", 0.0)' in src
+
+
+def test_uniform_over_the_circle_stops_at_one_full_turn():
+    """theta is RAW (`pi*a1`), so uniform-over-the-action means uniform over
+    a1 in [-1,1] -- one full turn -- not the tanh Jacobian.
+
+    Scoring it the old way, and drawing `atanh(U(-1,1))`, put 23.8% of
+    exploration draws PAST one circle at |a1| up to 5 (40 sigma out), where
+    they carry no gradient and only wreck the flight.
+    """
+    import math
+    import torch
+    from lagrangian_es.composer.actions_cont import ContVocab, log_prob
+    V = ContVocab(2)
+    k = V.n_args
+    ls = torch.full((k,), math.log(5.0))       # a very WIDE Gaussian: nearly flat,
+    #                                            so it cannot explain any sharp drop
+    def dens(a1):
+        u = torch.zeros(1, k); u[0, 1] = a1
+        return float(log_prob(torch.zeros(1, V.V), torch.zeros(1, k), ls,
+                              torch.zeros(1, dtype=torch.long), u,
+                              torch.tensor([2]), type_is_action=False,
+                              explore_eps=0.99).exp())
+    inside, outside = dens(0.5), dens(1.5)
+    flat = dens(0.9) / dens(0.1)
+    assert inside / outside > 50.0, \
+        f"density must fall off past one turn: {inside:.4g} vs {outside:.4g}"
+    assert abs(flat - 1.0) < 0.05, f"and be flat inside it (ratio {flat:.4f})"

@@ -33,7 +33,10 @@ def _place(V, r, th, L=10.0, reach=10.0, psi=0.0, B=4, phi=0.0, dz=0.0):
     g_ego = torch.tensor([[L / reach, 0.0, dz / reach]], dtype=DT).repeat(B, 1)
     a = torch.zeros(B, 3, dtype=DT); a[:, 0] = r; a[:, 1] = th; a[:, 2] = phi
     tok = torch.full((B,), V.WAYPOINT, dtype=torch.long)
-    sp = V.apply(tok, a, _spec(B), x, goal, torch.full((B,), psi, dtype=DT), g_ego, reach, 0.3)
+    # `a` holds the ACTION arguments: r and phi in squashed space, theta RAW
+    # (the frame is periodic -- `pi*a1`, so a1 = 1 is exactly 180 deg).
+    sp = V.apply(tok, a, _spec(B), x, goal, torch.full((B,), psi, dtype=DT), g_ego, reach, 0.3,
+                 raw=a)
     return x, goal, sp
 
 

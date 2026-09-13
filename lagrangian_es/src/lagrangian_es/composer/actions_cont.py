@@ -137,12 +137,13 @@ class ContVocab:
         """A working copy plus the pending-waypoint slots."""
         out = cur.clone() if hasattr(cur, "clone") else cur
         B = psi.shape[0]
-        pend = torch.zeros(B, 3, dtype=psi.dtype, device=psi.device)     # (r, theta, phi), squashed
+        pend = torch.zeros(B, 3, dtype=psi.dtype, device=psi.device)     # (r, theta, phi); r/phi squashed, theta RAW
         has = torch.zeros(B, dtype=torch.bool, device=psi.device)
         return out, pend, has
 
     def step(self, tok: Tensor, arg: Tensor, out: TaskSpec, pend: Tensor, has: Tensor,
-             psi: Tensor, rows: Optional[Tensor] = None) -> None:
+             psi: Tensor, rows: Optional[Tensor] = None,
+             raw: Optional[Tensor] = None) -> None:
         """One component, in place.
 
         `tok` [n] token type and `arg` [n, n_args] (already squashed to
@@ -160,6 +161,24 @@ class ContVocab:
         w = tok == WAYPOINT
         if bool(w.any()):
             pend[idx[w]] = a[w, :3]
+            # THETA IS NOT SQUASHED.  `pi*tanh(a1)` covers (-180, 180) -- the
+            # whole circle MINUS ONE POINT, and that point is "fly directly
+            # away from the goal", which needs a1 = infinity.  On a map whose
+            # pockets all open the same way that is exactly the manoeuvre
+            # required: MEASURED on `occluded`, the median leg needs a 90 deg
+            # correction to leave its own pocket (3.9 sigma out at sd 0.12) and
+            # 14% of legs need more than 8 sigma, while tanh' collapses on top
+            # of that -- at 179 deg the parameter must travel ~500x further per
+            # degree gained.  Both failures stack in the same place.
+            #   This is the same boundary pathology the range argument had
+            # before `(1 + min(0, a0))` -- an optimum reachable only as
+            # |mu| -> inf, which drove |mu| to 21.7 where tanh' ~ 1e-16 and the
+            # net went constant.  `pi * a1` on the RAW argument agrees with
+            # `pi*tanh(a1)` to first order at the identity (so a1 = 0 is still
+            # straight at the goal and the local scale is unchanged) and simply
+            # has no boundary: 180 deg is a1 = 1, and the angle wraps.
+            _th = raw if raw is not None else torch.atanh(a.clamp(-1 + 1e-6, 1 - 1e-6))
+            pend[idx[w], 1] = _th[w, 1].to(pend.dtype)
             has[idx[w]] = True
         t = tok == TURN
         if bool(t.any()) and out.yaw is not None:
@@ -286,7 +305,7 @@ class ContVocab:
             _gn = g_ego.norm(dim=-1).clamp_min(1e-9).to(dt)
             _gb = torch.atan2(g_ego[:, 1].to(dt), g_ego[:, 0].to(dt))
             _gp = torch.asin((g_ego[:, 2].to(dt) / _gn).clamp(-1.0, 1.0))
-            theta = _gb + math.pi * pend[:, 1].to(dt)                  # 0 -> straight at the goal
+            theta = _gb + math.pi * pend[:, 1].to(dt)     # 0 -> at the goal; RAW, so 180 deg is a1=1 and the angle wraps
             phi = (_gp + PHI_MAX * pend[:, 2].to(dt)).clamp(-PHI_MAX, PHI_MAX)
             # The radius is the 3-D distance now, so the arrival degeneracy
             # holds in three dimensions: r at its maximum, aimed at the goal,
@@ -304,10 +323,16 @@ class ContVocab:
         return out
 
     def apply(self, tok: Tensor, arg: Tensor, cur: TaskSpec, x: Tensor, goal: Tensor, psi: Tensor,
-              g_ego: Tensor, reach: float, z_min: float) -> TaskSpec:
-        """One component then EOS -- the opening placement, and the tests."""
+              g_ego: Tensor, reach: float, z_min: float,
+              raw: Optional[Tensor] = None) -> TaskSpec:
+        """One component then EOS -- the opening placement, and the tests.
+
+        `raw` is the UNSQUASHED argument.  Omit it and it is recovered with
+        `atanh`, the exact inverse of `squash`, so a caller passing
+        `V.squash(u)` gets `u` back and needs no change.
+        """
         out, pend, has = self.begin(cur, psi.to(x.dtype))
-        self.step(tok, arg, out, pend, has, psi.to(x.dtype), rows=None)
+        self.step(tok, arg, out, pend, has, psi.to(x.dtype), rows=None, raw=raw)
         return self.finish(out, pend, has, x, goal, psi.to(x.dtype), g_ego, reach, z_min)
 
 
@@ -385,6 +410,18 @@ def log_prob(tok_logits: Tensor, mu: Tensor, log_std: Tensor, tok: Tensor, u: Te
         else:
             a = torch.tanh(u)
             lj = torch.log1p(-(a * a).clamp(max=1.0 - 1e-6)) - math.log(2.0)
+            if lj.shape[-1] > 1:
+                # THETA IS NOT SQUASHED, so "uniform over the action" is uniform
+                # over the CIRCLE: theta = pi*a1, and a1 in [-1, 1] is exactly
+                # one full turn, density 1/2 there and zero outside.  Scoring it
+                # with the tanh Jacobian instead (and drawing atanh(U(-1,1)))
+                # sent 23.8% of exploration draws PAST one circle, to |a1| of 5+
+                # -- 40 sigma out, where the gradient weight is ~0 and the only
+                # effect is a wrecked flight.
+                lj = lj.clone()
+                lj[:, 1] = torch.where(u[:, 1].abs() <= 1.0,
+                                       torch.full_like(u[:, 1], -math.log(2.0)),
+                                       torch.full_like(u[:, 1], -60.0))
             lu = (lj * used.to(lj.dtype)).sum(-1)
         g = torch.logaddexp(g + math.log(1.0 - explore_eps),
                             lu + math.log(explore_eps))
