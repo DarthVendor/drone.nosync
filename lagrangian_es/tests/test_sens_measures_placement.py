@@ -57,3 +57,66 @@ def test_a_placement_head_that_ignores_beams_scores_zero():
         assert float((s0 - same).norm(dim=-1).max()) == 0.0
     assert moved >= 0.0
     assert moved == moved, "must be finite"
+
+
+def _load_sens():
+    """Exec the real `_sens` against stubs, so the test runs the shipped code."""
+    import re
+    import types
+    import torch as _t
+    from lagrangian_es.composer.policy_cont import ContPolicyNet, _subgoal_ego
+    src = open("scripts/composer/cotrain_v11.py").read()
+    m = re.search(r"\n_SENS_PROBE = \[\].*?\ndef _sens\(.*?\n(?=\n\w|\nrow_prev)", src, re.S)
+    assert m, "could not locate _sens and its probe store"
+    _t.manual_seed(0)
+    net = ContPolicyNet(n_terms=1)
+    ns = {"torch": _t, "_subgoal_ego": _subgoal_ego,
+          "comp": types.SimpleNamespace(net=net)}
+    exec(m.group(0), ns)
+    return ns, net
+
+
+def _draw(seed, B=32, E=12):
+    """One task draw's records: different states every time, as in training."""
+    from lagrangian_es.composer.tokens import BEAM, PIXEL, F
+    g = torch.Generator().manual_seed(seed)
+    ty = torch.where(torch.arange(E) % 2 == 0, BEAM, PIXEL).repeat(B, 1)
+    tk = {"self": torch.randn(B, F, generator=g),
+          "goal": torch.randn(B, F, generator=g),
+          "entities": torch.randn(B, E, F, generator=g),
+          "ent_types": ty,
+          "ent_mask": torch.ones(B, E, dtype=torch.bool),
+          "chain": torch.zeros(B, 1, F),
+          "chain_types": torch.ones(B, 1, dtype=torch.long),
+          "chain_mask": torch.zeros(B, 1, dtype=torch.bool),
+          "psi": torch.zeros(B)}
+    return [[{"tok": tk} for _ in range(6)]]
+
+
+def test_sens_holds_still_while_the_policy_does():
+    """The bug this file exists to prevent from coming back.
+
+    An ACCUM window takes NO optimiser step for its first N-1 iterations, so
+    the policy is bit-for-bit frozen and `sens` must report the same number.
+    The shipped version drew 8 fresh records and an UNSEEDED randperm each
+    call, and read 0.0034 -> 0.0069 on a frozen net: a 2x swing that was taken
+    all session as the composer's sensor use rising and falling.
+    """
+    ns, net = _load_sens()
+    sens = ns["_sens"]
+    v = [sens(_draw(s)) for s in (1, 2, 3, 4)]   # four DIFFERENT task draws
+    assert all(x == x for x in v), f"must be finite, got {v}"
+    assert max(v) - min(v) == 0.0, \
+        f"frozen policy must give one number across task draws, got {v}"
+
+
+def test_sens_still_moves_when_the_policy_does():
+    """Held fixed is only useful if it is not held CONSTANT."""
+    ns, net = _load_sens()
+    sens = ns["_sens"]
+    before = sens(_draw(1))
+    with torch.no_grad():                        # a real change to the weights
+        for p in net.parameters():
+            p.add_(0.05 * torch.randn_like(p))
+    after = sens(_draw(2))
+    assert after != before, "sens must track the weights it is measuring"

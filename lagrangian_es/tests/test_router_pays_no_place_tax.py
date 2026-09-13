@@ -15,12 +15,23 @@ cannot be taken. The objective was paying the composer to stop flying.
 
 
 def test_route_only_zeroes_the_per_placement_charge():
+    # STRUCTURAL, not a fixed character window: an earlier version read 2000
+    # chars after `ROUTE_ONLY = int(` and broke when an unrelated knob was added
+    # between them, reporting a defect that did not exist.
+    import ast
     src = open("scripts/composer/cotrain_v11.py").read()
-    i = src.index("ROUTE_ONLY = int(")
-    tail = src[i:i + 2000]
-    assert "SUBGOAL_COST = 0.0" in tail, \
-        "a mandatory placement must not be charged"
-    assert "DO NOT CHARGE FOR AN ACTION THAT IS NOT OPTIONAL" in tail
+    tree = ast.parse(src)
+    blocks = [n for n in ast.walk(tree)
+              if isinstance(n, ast.If) and isinstance(n.test, ast.Name)
+              and n.test.id == "ROUTE_ONLY"]
+    assert blocks, "no `if ROUTE_ONLY:` block at module level"
+    zeroed = any(
+        isinstance(st, ast.Assign)
+        and any(getattr(t, "id", None) == "SUBGOAL_COST" for t in st.targets)
+        and getattr(st.value, "value", None) == 0.0
+        for b in blocks for st in b.body)
+    assert zeroed, "a mandatory placement must not be charged"
+    assert "DO NOT CHARGE FOR AN ACTION THAT IS NOT OPTIONAL" in src
 
 
 def test_the_charge_still_applies_when_speaking_is_a_choice():

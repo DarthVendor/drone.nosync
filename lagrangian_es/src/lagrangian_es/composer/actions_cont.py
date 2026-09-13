@@ -312,7 +312,8 @@ class ContVocab:
 
 
 def log_prob(tok_logits: Tensor, mu: Tensor, log_std: Tensor, tok: Tensor, u: Tensor,
-             n_args: Tensor, type_is_action: bool = True) -> Tensor:
+             n_args: Tensor, type_is_action: bool = True,
+             explore_eps: float = 0.0) -> Tensor:
     """Log-density of `[type, arguments]`, [B].
 
     Categorical over the type, plus a diagonal Gaussian over the UNSQUASHED
@@ -334,7 +335,34 @@ def log_prob(tok_logits: Tensor, mu: Tensor, log_std: Tensor, tok: Tensor, u: Te
     used = idx < n_args[:, None]                                   # [B, k]
     var = (2.0 * log_std).exp()
     g = -0.5 * (((u - mu) ** 2) / var + 2.0 * log_std + math.log(2 * math.pi))
-    return lp + (g * used.to(g.dtype)).sum(-1)
+    g = (g * used.to(g.dtype)).sum(-1)
+    if explore_eps and explore_eps > 0.0:
+        # EXACT MIXTURE DENSITY for uniform-in-ACTION exploration.
+        #
+        #   pi(u) = (1-eps) * N(u; mu, sigma) + eps * Uniform(a) * |da/du|
+        #
+        # with a = tanh(u), so the uniform piece has density (1/2)^k times
+        # prod(1 - tanh^2(u_i)) -- normalisable, which a uniform over the
+        # UNBOUNDED u is not.  That is why this was previously rejected: the
+        # note said "a uniform mixture over an unbounded variable does not
+        # [keep the density exact]", true of u and false of the bounded action.
+        # And exploration was switched off entirely because CROSS-ENTROPY has
+        # no importance ratio to correct the sampling distribution (measured:
+        # 30% uniform walked the speak rate to exactly 0.324, the mixture's own
+        # value).  PPO has that ratio, so the objection does not carry over.
+        #
+        # Why it is needed: exploration is Gaussian with sigma 0.12, i.e. about
+        # +-21 degrees of bearing, while routing around a block needs ~+-90.
+        # A policy cannot learn what it never samples, which is the standing
+        # explanation for a placement that reads its beams at 1.6% of its own
+        # spread while the beams are informative (53% of them hit) and the
+        # gradient path is alive (0.70 of the goal's).
+        a = torch.tanh(u)
+        lj = torch.log1p(-(a * a).clamp(max=1.0 - 1e-6)) - math.log(2.0)
+        lu = (lj * used.to(lj.dtype)).sum(-1)
+        g = torch.logaddexp(g + math.log(1.0 - explore_eps),
+                            lu + math.log(explore_eps))
+    return lp + g
 
 
 def entropy(tok_logits: Tensor, log_std: Tensor) -> Tensor:

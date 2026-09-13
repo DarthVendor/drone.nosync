@@ -529,8 +529,10 @@ class ContComposer(PolicyComposer):
                 # recorded rows, which keeps the density exact (a uniform
                 # mixture over an unbounded variable does not)
                 s = std[None].expand_as(mu)
-                if exploring:
-                    s = torch.where(rec[:, None], s * (1.0 + eps), s)
+                # THE WIDENING IS GONE, replaced by a uniform mixture below.
+                # `s * (1 + eps)` also had a density mismatch: the recorded
+                # `log_std` never included the widening, so an explored row's
+                # importance ratio was scored at the wrong sigma.
                 # COMMON RANDOM NUMBERS ON THE ARGUMENT DRAW.
                 #
                 # `crn_sample` gives the discrete token draw common random
@@ -566,7 +568,23 @@ class ContComposer(PolicyComposer):
                     u = mu + s * (_eps * float(getattr(self, "noise_sign", 1.0)))
                 else:
                     u = mu + s * torch.randn_like(mu)
-                # PROBABILISTIC WAYPOINTS FROM THE ACTION.  For the rows whose
+                # UNIFORM-IN-ACTION EXPLORATION, with an exact mixture density.
+                # Gaussian sigma 0.12 is about +-21 degrees of bearing; routing
+                # around a block needs ~+-90, and a policy cannot learn what it
+                # never samples.  With probability `explore_eps` the placement
+                # is drawn UNIFORMLY over the action box instead, which covers
+                # the whole circle.  `actions_cont.log_prob(explore_eps=...)`
+                # scores the mixture exactly, so PPO's ratio stays correct --
+                # the thing cross-entropy could not do, which is why this was
+                # switched off before.
+                _ee = float(getattr(self, "explore_eps", 0.0) or 0.0)
+                if _ee > 0.0:
+                    _pick = torch.rand(mu.shape[0], device=dev) < _ee
+                    if rec_rows is not None:
+                        _pick = _pick & rec          # only rows the update sees
+                    if bool(_pick.any()):
+                        _a = (torch.rand_like(mu) * 2.0 - 1.0).clamp(-0.999, 0.999)
+                        u = torch.where(_pick[:, None], torch.atanh(_a), u)                # PROBABILISTIC WAYPOINTS FROM THE ACTION.  For the rows whose
                 # token is a WAYPOINT, redraw the argument from exp(-S/T) over
                 # `var_k` of the policy's OWN candidates, S being the two-leg
                 # path action through what the beams see.  The network still
@@ -1526,7 +1544,8 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
                     vcoef: float = 0.5, ent: float = 0.0, target_kl: float = 0.02,
                     opt=None, max_samples: int = 0, temperature: float = 1.0,
                     type_is_action: bool = True, td: bool = False,
-                    gamma: float = 0.99, accum: int = 0) -> Dict[str, float]:
+                    gamma: float = 0.99, accum: int = 0,
+                    explore_eps: float = 0.0) -> Dict[str, float]:
     """Clipped surrogate over `[type, arguments]`.
 
     The ratio is taken against the policy AT COLLECTION (`pi_logits`, `mu`,
@@ -1614,7 +1633,8 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
         n_td = int(have.sum())
     # ----------------------------------------------------------------------
     old_lp = cont_log_prob(old_logits, old_mu, old_lsd, acts, us, nargs,
-                           type_is_action=type_is_action).detach()
+                           type_is_action=type_is_action,
+                           explore_eps=explore_eps).detach()
     # WHERE THIS UPDATE STARTS, which is NOT the behaviour policy.
     #
     # The trainer pipelines: update k-1 runs in a thread while rollout k flies,
@@ -1628,17 +1648,24 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
     # i.e. the policy never moved at all.
     # So the ratio stays against the behaviour policy (correctness) while the
     # cap is applied to the DRIFT FROM THE START OF THIS UPDATE (step size).
+    # The accumulation branch never reads `lp_start` -- it takes no step, so
+    # there is no drift from the start of the update to cap.  MEASURED: this
+    # pass is a full forward over every decision (20k) and 26.8% of the
+    # update's network compute, spent on a tensor nothing reads.
+    lp_start = None
     with torch.no_grad():
         _lp0 = []
-        for _s0 in range(0, n, 2048):
+        for _s0 in (range(0, n, 2048) if not (accum and accum > 1) else ()):
             _sl = slice(_s0, min(_s0 + 2048, n))
             _tk = {k: (v[_sl] if torch.is_tensor(v) else v) for k, v in tok_all.items()}
             _lg, _mu_all, _ = net.pre(_tk)
             _mu = _mu_all[torch.arange(_mu_all.shape[0]), acts[_sl]]
             _lsd0 = net.log_std + math.log(max(float(temperature), 1e-6))
             _lp0.append(cont_log_prob(_lg, _mu, _lsd0, acts[_sl], us[_sl], nargs[_sl],
-                                      type_is_action=type_is_action))
-        lp_start = torch.cat(_lp0).detach()
+                                      type_is_action=type_is_action,
+                                      explore_eps=explore_eps))
+        if _lp0:
+            lp_start = torch.cat(_lp0).detach()
     opt = opt or torch.optim.Adam(net.parameters(), lr=lr)
     acc = {"loss": 0.0, "v_loss": 0.0, "ent": 0.0, "clipfrac": 0.0, "nb": 0, "kl": 0.0}
     stop = False
@@ -1669,7 +1696,8 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
                 mu = mu_all[torch.arange(mu_all.shape[0], device=mu_all.device), acts[idx]]
                 lsd_now = net.log_std + math.log(max(float(temperature), 1e-6))
                 lp = cont_log_prob(logits, mu, lsd_now, acts[idx], us[idx], nargs[idx],
-                                   type_is_action=type_is_action)
+                                   type_is_action=type_is_action,
+                                   explore_eps=explore_eps)
                 a = rets_n[idx] - val.detach()
                 a = (a - a.mean()) / a.std().clamp_min(1e-6)
                 pol = -(lp * a).mean()
@@ -1718,7 +1746,8 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
             # not cancel.
             lsd_now = net.log_std + math.log(max(float(temperature), 1e-6))
             lp = cont_log_prob(logits, mu, lsd_now, acts[idx], us[idx], nargs[idx],
-                               type_is_action=type_is_action)
+                               type_is_action=type_is_action,
+                               explore_eps=explore_eps)
             ratio = (lp - old_lp[idx]).clamp(-20.0, 20.0).exp()
             # THE STATE BASELINE.  Without subtracting V(s) the advantage is the
             # raw return, which is dominated by whether the flight eventually

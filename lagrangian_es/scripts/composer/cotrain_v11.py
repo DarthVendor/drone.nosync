@@ -81,7 +81,23 @@ K_CHAIN = int(__import__("os").environ.get("LES_KCHAIN", "64"))   # the composer
 # fell off, which is why it could not know it had already tried a corridor.
 # 128 covers a whole flight.  Measured cost: a rollout goes from ~12.7s to
 # ~17.7s at this batch size.
-EXPLORE_EPS = 0.0
+# UNIFORM-IN-ACTION EXPLORATION (LES_EXPLORE).  Default 0, unchanged.
+#   Switched off originally because CROSS-ENTROPY has no importance ratio to
+# correct the sampling distribution -- measured, 30% uniform walked the speak
+# rate to exactly 0.324, the mixture's own value.  PPO HAS that ratio, and
+# `actions_cont.log_prob(explore_eps=...)` now scores the mixture exactly (a
+# uniform over the BOUNDED action is normalisable; over the unbounded pre-squash
+# u it is not, which is the other reason it was rejected).
+#   Why it is wanted: the Gaussian's sigma 0.12 is about +-21 degrees of
+# bearing, while routing around a block needs ~+-90.  Measured, the trained
+# placement reads its beams at 1.6% of its own spread while the beams are
+# informative (53% hit, 15% of returns inside 3 m) and the gradient path is
+# alive (0.70 of the goal's) -- consistent with a policy that never samples the
+# detour it would need to learn.
+# `__import__` because `import os as _os` is bound far below this line --
+# the use-before-binding that test_trainer_script_lint.py exists to catch,
+# and which it caught here.
+EXPLORE_EPS = float(__import__("os").environ.get("LES_EXPLORE", "0.0"))
 # No INJECTED exploration.  Cross-entropy has no importance ratio to correct for
 # the distribution its samples came from, so imitating rows drawn from a
 # policy-plus-uniform mixture teaches the policy that mixture.  Measured: with
@@ -600,7 +616,17 @@ def token_use(instr):
 
 def judge(env, max_leg, steps, seed, n=JUDGE_N):
     c = cfg_for(env, max_leg, steps, n)
-    s2, t2, k2 = build(c); comp.stochastic = True; comp.records = []; comp.record_rows = torch.zeros(0, dtype=torch.long); comp.reset(n)   # the ONE policy, sampled; nothing recorded
+    s2, t2, k2 = build(c)
+    # JUDGE THE RUNG BEING TRAINED.  `build` leaves the system at its DEFAULT
+    # difficulty (full density), so the judge silently flew a different map than
+    # training: on corridors, training read arrive 0.62 at 25% walls while the
+    # judge read 0.086 at 100% -- a train/test mismatch that made the training
+    # numbers meaningless as progress.  It also makes the judge useless wherever
+    # full density is unflyable: on the occluded map silence arrives 0.000 at
+    # 1.0 and 0.057 at 0.7, so a judge pinned at 1.0 would read zero forever.
+    if hasattr(s2, "difficulty"):
+        s2.difficulty = DIFF
+    comp.stochastic = True; comp.records = []; comp.record_rows = torch.zeros(0, dtype=torch.long); comp.reset(n)   # the ONE policy, sampled; nothing recorded
     r2 = Rollout(s2, t2, k2, c.rollout, build_sensors(c, s2), composer=comp)
     with torch.no_grad():
         res = r2.run(th[None], k2.sample(n, make_gen(seed)), seed + 1)
@@ -679,7 +705,8 @@ def _update(groups_r, groups_R, holder, groups_win=None, groups_score=None, grou
                                        ent=0.0, target_kl=0.02, opt=opt_c,
                                        max_samples=MAX_SAMPLES, temperature=TEMPERATURE,
                                        # under route_only the type is forced, not chosen
-                                       type_is_action=not ROUTE_ONLY, accum=ACCUM)
+                                       type_is_action=not ROUTE_ONLY, accum=ACCUM,
+                                       explore_eps=EXPLORE_EPS)
         if ACCUM > 1:
             # ONE STEP EVERY `ACCUM` TASK DRAWS.  The policy is untouched while
             # gradients accumulate, so every batch in the window is exactly
@@ -770,6 +797,11 @@ def _join(it_=0):
         f"(update itself {t_u_prev:.0f}s), load {_os.getloadavg()[0]:.0f}]")
 
 
+_SENS_PROBE = []          # [(tokens, beam/pixel mask, permutation)], captured once
+N_PROBE = 24              # records in the probe (was 8 fresh ones each call)
+PROBE_ROWS = 256          # rows kept per record, so the probe fits in memory
+
+
 def _sens(groups_r, n=192):
     """How much the composer's output depends on its PERCEPTION, measured on the
     batch it just flew -- no extra rollout.
@@ -786,21 +818,45 @@ def _sens(groups_r, n=192):
     0.0001 while the composer was ignoring its sensors entirely.
     """
     from lagrangian_es.composer.tokens import BEAM, PIXEL
-    toks = [r["tok"] for g in groups_r for r in g if r.get("tok")]
-    if not toks:
-        return float("nan")
-    step = max(1, len(toks) // 8)
-    dP, k = 0.0, 0
-    with torch.no_grad():
-        for tk in toks[::step][:8]:
+    # A FIXED PROBE, captured once and replayed every iteration.
+    #
+    # This used to draw 8 records off whatever had just been flown and shuffle
+    # them with an UNSEEDED randperm, so both the states and the shuffle were a
+    # fresh draw each time.  MEASURED on a policy that was provably frozen (the
+    # first 15 iterations of an ACCUM=16 window take no step at all): sens read
+    # 0.0034, 0.0044, 0.0057, 0.0069, 0.0058, 0.0066, 0.0053 -- a 2x swing with
+    # ZERO policy change.  Every past reading that `sens` "fell" was that noise.
+    #   The states differ between iterations because the TASKS do, so the only
+    # way sens can answer "did the policy start reading its beams" is to hold
+    # the states and the permutation fixed and let the WEIGHTS be the one thing
+    # that varies -- the same common-random-numbers pairing the judge uses.
+    if not _SENS_PROBE:
+        toks = [r["tok"] for g in groups_r for r in g if r.get("tok")]
+        if not toks:
+            return float("nan")
+        step = max(1, len(toks) // N_PROBE)
+        gen = torch.Generator().manual_seed(0)
+        for tk in toks[::step][:N_PROBE]:
             ty = tk["ent_types"]
             sel = (ty == BEAM) | (ty == PIXEL)
             if not bool(sel.any()) or ty.shape[0] < 2:
                 continue
+            rows = ty.shape[0]
+            keep = torch.randperm(rows, generator=gen)[:PROBE_ROWS].sort().values
+            t0 = {kk: (v[keep].clone() if (torch.is_tensor(v) and v.shape and
+                                           v.shape[0] == rows) else
+                       (v.clone() if torch.is_tensor(v) else v))
+                  for kk, v in tk.items()}
+            perm = torch.randperm(t0["entities"].shape[0], generator=gen)
+            _SENS_PROBE.append((t0, sel[0].clone(), perm))
+    if not _SENS_PROBE:
+        return float("nan")
+    dP, k = 0.0, 0
+    with torch.no_grad():
+        for tk, m0, perm in _SENS_PROBE:
             t1 = {kk: (v.clone() if torch.is_tensor(v) else v) for kk, v in tk.items()}
             e = t1["entities"].clone()
-            m0 = sel[0]
-            e[:, m0] = e[torch.randperm(e.shape[0])][:, m0]
+            e[:, m0] = e[perm][:, m0]
             t1["entities"] = e
             # THE PLACEMENT, not the token type.
             #
