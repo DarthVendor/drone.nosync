@@ -51,6 +51,12 @@ class PolicyComposer(TransformerComposer):
         # it into the plain ComposerNet it builds first
         weights = kw.pop("weights", "")
         self.explore_eps = float(kw.pop("explore_eps", 0.0))     # uniform mixture on the RECORDED rows (see `emit`)
+        # DECISIONS AN EXPLORATION DRAW IS HELD.  This was accepted as a
+        # config key and read by NOTHING for the whole life of the file --
+        # `grep -rn noise_hold src/` returned no hits -- so every run that
+        # set it explored i.i.d. regardless.  A knob that silently does
+        # nothing is worse than no knob.
+        self.noise_hold = int(kw.pop("noise_hold", 1) or 1)
         self.follow_parent = bool(kw.pop("follow_parent", False))  # a population's policy rows take the parent's token (see `emit`)
         # The update reads a capped random subset of the recorded decisions
         # (`ppo_update(max_samples=...)`), yet every recorded row carried its

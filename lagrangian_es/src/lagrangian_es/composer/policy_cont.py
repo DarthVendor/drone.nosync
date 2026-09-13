@@ -577,14 +577,47 @@ class ContComposer(PolicyComposer):
                 # scores the mixture exactly, so PPO's ratio stays correct --
                 # the thing cross-entropy could not do, which is why this was
                 # switched off before.
+                #   HELD (`noise_hold` > 1): the exploration CENTRE and the
+                # decision to use it are drawn once and held for that many
+                # decisions, so a detour is committed to instead of being
+                # re-rolled every 2 s.  See `actions_cont.log_prob` for why the
+                # held quantity is the MEAN and not the ACTION.
                 _ee = float(getattr(self, "explore_eps", 0.0) or 0.0)
+                _emu_full = None
                 if _ee > 0.0:
-                    _pick = torch.rand(mu.shape[0], device=dev) < _ee
+                    _nh = max(1, int(getattr(self, "noise_hold", 1) or 1))
+                    if _nh > 1:
+                        _n_all = max(int(getattr(self, "_B", 0) or 0),
+                                     int(ids.max()) + 1)
+                        if (getattr(self, "_hold_left", None) is None
+                                or self._hold_left.shape[0] < _n_all):
+                            self._hold_left = torch.zeros(_n_all, dtype=torch.long)
+                            self._hold_on = torch.zeros(_n_all, dtype=torch.bool)
+                            self._hold_mu = torch.zeros(_n_all, mu.shape[-1],
+                                                        dtype=torch.float32)
+                        _idc = ids.detach().cpu().to(torch.long)
+                        _need = self._hold_left[_idc] <= 0
+                        if bool(_need.any()):
+                            _rows_n = _idc[_need]; _nd = int(_need.sum())
+                            _a0 = (torch.rand(_nd, mu.shape[-1]) * 2.0 - 1.0
+                                   ).clamp(-0.999, 0.999)
+                            self._hold_mu[_rows_n] = torch.atanh(_a0).float()
+                            self._hold_on[_rows_n] = torch.rand(_nd) < _ee
+                            self._hold_left[_rows_n] = _nh
+                        self._hold_left[_idc] -= 1
+                        _emu_full = self._hold_mu[_idc].to(dev).to(mu.dtype)
+                        _pick = self._hold_on[_idc].to(dev)
+                    else:
+                        _pick = torch.rand(mu.shape[0], device=dev) < _ee
                     if rec_rows is not None:
                         _pick = _pick & rec          # only rows the update sees
                     if bool(_pick.any()):
-                        _a = (torch.rand_like(mu) * 2.0 - 1.0).clamp(-0.999, 0.999)
-                        u = torch.where(_pick[:, None], torch.atanh(_a), u)                # PROBABILISTIC WAYPOINTS FROM THE ACTION.  For the rows whose
+                        if _emu_full is not None:
+                            _draw = _emu_full + s * torch.randn_like(mu)
+                        else:
+                            _a = (torch.rand_like(mu) * 2.0 - 1.0).clamp(-0.999, 0.999)
+                            _draw = torch.atanh(_a)
+                        u = torch.where(_pick[:, None], _draw, u)                # PROBABILISTIC WAYPOINTS FROM THE ACTION.  For the rows whose
                 # token is a WAYPOINT, redraw the argument from exp(-S/T) over
                 # `var_k` of the policy's OWN candidates, S being the two-leg
                 # path action through what the beams see.  The network still
@@ -617,6 +650,11 @@ class ContComposer(PolicyComposer):
                     "logits": b_logits[rec].float().clone(),
                     "pi_logits": logits[rec].float().clone(),
                     "mu": mu[rec].float().clone(),
+                    # THE HELD EXPLORATION CENTRE this decision was scored
+                    # against, so the update can rebuild the exact mixture the
+                    # action was drawn from.  None when exploration is i.i.d.
+                    "explore_mu": (_emu_full[rec].float().clone()
+                                   if _emu_full is not None else None),
                     # THE WIDTH THE ACTION WAS ACTUALLY DRAWN AT, which is
                     # `log_std * temperature`, not the bare parameter.  `choose`
                     # samples with `log_std.exp() * temp`; recording the bare
@@ -1559,6 +1597,7 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
     """
     groups = list(zip(records, returns)) if (records and isinstance(records[0], list)) else [(records, returns)]
     samples, acts, us, nargs, rets, plog, pmu, plsd = [], [], [], [], [], [], [], []
+    pemu = []          # the HELD exploration centre, when there was one
     kb = []
     for gi, (recs, R) in enumerate(groups):
         for k, rec in enumerate(recs):
@@ -1572,6 +1611,8 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
                 acts.append(rec["act"][j]); us.append(rec["u"][j]); nargs.append(rec["n_args"][j])
                 rets.append(R[k, b]); plog.append(rec["pi_logits"][j]); pmu.append(rec["mu"][j])
                 plsd.append(rec["log_std"])
+                _em = rec.get("explore_mu")
+                pemu.append(_em[j] if _em is not None else None)
                 # (decision index, row) so a TD target can find the NEXT
                 # decision of the same flight.  `R` is the MC discounted return,
                 # so the per-decision reward is recoverable exactly:
@@ -1583,12 +1624,17 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
     if max_samples and len(samples) > max_samples:
         pick = torch.randperm(len(samples), generator=gen)[:max_samples].sort().values.tolist()
         take = lambda a: [a[i] for i in pick]
-        samples, acts, us, nargs, rets, plog, pmu, plsd, kb = map(
-            take, (samples, acts, us, nargs, rets, plog, pmu, plsd, kb))
+        samples, acts, us, nargs, rets, plog, pmu, plsd, kb, pemu = map(
+            take, (samples, acts, us, nargs, rets, plog, pmu, plsd, kb, pemu))
     acts = torch.stack(acts).long(); us = torch.stack(us).float()
     nargs = torch.stack(nargs).long(); rets = torch.stack(rets).float()
     old_logits = torch.stack(plog).float(); old_mu = torch.stack(pmu).float()
     old_lsd = torch.stack(plsd).float()
+    # SCORE THE MIXTURE THE ACTION CAME FROM.  A held centre makes the second
+    # component a Gaussian at `old_emu` rather than the uniform; getting this
+    # wrong makes every ratio wrong by a factor no test of the mean would catch.
+    old_emu = (torch.stack(pemu).float()
+               if (pemu and all(x is not None for x in pemu)) else None)
     # the chain grows over a flight and is capped, so records carry different
     # chain lengths; `collate_tok` pads them into one batch (the same helper
     # the token update uses)
@@ -1634,7 +1680,7 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
     # ----------------------------------------------------------------------
     old_lp = cont_log_prob(old_logits, old_mu, old_lsd, acts, us, nargs,
                            type_is_action=type_is_action,
-                           explore_eps=explore_eps).detach()
+                           explore_eps=explore_eps, explore_mu=old_emu).detach()
     # WHERE THIS UPDATE STARTS, which is NOT the behaviour policy.
     #
     # The trainer pipelines: update k-1 runs in a thread while rollout k flies,
@@ -1663,7 +1709,9 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
             _lsd0 = net.log_std + math.log(max(float(temperature), 1e-6))
             _lp0.append(cont_log_prob(_lg, _mu, _lsd0, acts[_sl], us[_sl], nargs[_sl],
                                       type_is_action=type_is_action,
-                                      explore_eps=explore_eps))
+                                      explore_eps=explore_eps,
+                                      explore_mu=(None if old_emu is None
+                                                  else old_emu[_sl])))
         if _lp0:
             lp_start = torch.cat(_lp0).detach()
     opt = opt or torch.optim.Adam(net.parameters(), lr=lr)
@@ -1697,7 +1745,9 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
                 lsd_now = net.log_std + math.log(max(float(temperature), 1e-6))
                 lp = cont_log_prob(logits, mu, lsd_now, acts[idx], us[idx], nargs[idx],
                                    type_is_action=type_is_action,
-                                   explore_eps=explore_eps)
+                                   explore_eps=explore_eps,
+                                   explore_mu=(None if old_emu is None
+                                               else old_emu[idx]))
                 a = rets_n[idx] - val.detach()
                 a = (a - a.mean()) / a.std().clamp_min(1e-6)
                 pol = -(lp * a).mean()
@@ -1747,7 +1797,8 @@ def ppo_update_cont(net: ContPolicyNet, records: List[Dict], returns: Tensor, n_
             lsd_now = net.log_std + math.log(max(float(temperature), 1e-6))
             lp = cont_log_prob(logits, mu, lsd_now, acts[idx], us[idx], nargs[idx],
                                type_is_action=type_is_action,
-                               explore_eps=explore_eps)
+                               explore_eps=explore_eps,
+                               explore_mu=(None if old_emu is None else old_emu[idx]))
             ratio = (lp - old_lp[idx]).clamp(-20.0, 20.0).exp()
             # THE STATE BASELINE.  Without subtracting V(s) the advantage is the
             # raw return, which is dominated by whether the flight eventually

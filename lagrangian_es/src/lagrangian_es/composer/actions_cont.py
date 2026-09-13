@@ -313,7 +313,7 @@ class ContVocab:
 
 def log_prob(tok_logits: Tensor, mu: Tensor, log_std: Tensor, tok: Tensor, u: Tensor,
              n_args: Tensor, type_is_action: bool = True,
-             explore_eps: float = 0.0) -> Tensor:
+             explore_eps: float = 0.0, explore_mu=None) -> Tensor:
     """Log-density of `[type, arguments]`, [B].
 
     Categorical over the type, plus a diagonal Gaussian over the UNSQUASHED
@@ -357,9 +357,35 @@ def log_prob(tok_logits: Tensor, mu: Tensor, log_std: Tensor, tok: Tensor, u: Te
         # explanation for a placement that reads its beams at 1.6% of its own
         # spread while the beams are informative (53% of them hit) and the
         # gradient path is alive (0.70 of the goal's).
-        a = torch.tanh(u)
-        lj = torch.log1p(-(a * a).clamp(max=1.0 - 1e-6)) - math.log(2.0)
-        lu = (lj * used.to(lj.dtype)).sum(-1)
+        #   HELD EXPLORATION (`explore_mu` given).  The second component is a
+        # Gaussian at a centre drawn once and HELD for `noise_hold` decisions
+        # instead of a fresh uniform every time.  MEASURED, why: escapes ARE
+        # sampled -- 12.6% of decisions point past 90 degrees at eps 0.25,
+        # exactly what uniform-over-the-circle predicts -- and are never
+        # reinforced, because clearing a U-shaped pocket is a TEMPORALLY
+        # EXTENDED action.  One 90 degree detour in isolation spends distance
+        # walking away from the goal and then dies anyway, so it is correctly
+        # punished; only a consistent RUN of them pays.  I.i.d. draws give a run
+        # of k with probability eps^k (0.126^3 ~ 0.002); holding gives eps.
+        #   A held MEAN, not a held ACTION.  Holding the action makes the
+        # per-decision density a delta -- no ratio, and since it carries no
+        # theta, exactly ZERO gradient from every escape.  Holding the mean
+        # keeps mu_theta(s) in the first component, so an escape sample still
+        # carries a gradient, attenuated by the posterior that it came from the
+        # policy (~8% at 90 degrees and sigma 0.12, not 0).
+        #   The approximation this DOES make: the component choice is held too,
+        # so the state at decision t leaks whether this hold is exploratory and
+        # the per-decision density is no longer exactly the conditional. That is
+        # the standard correlated-exploration bias (OU noise, parameter-space
+        # noise) and it is why this is verified empirically, not assumed.
+        if explore_mu is not None:
+            ge = -0.5 * (((u - explore_mu) ** 2) / var + 2.0 * log_std
+                         + math.log(2 * math.pi))
+            lu = (ge * used.to(ge.dtype)).sum(-1)
+        else:
+            a = torch.tanh(u)
+            lj = torch.log1p(-(a * a).clamp(max=1.0 - 1e-6)) - math.log(2.0)
+            lu = (lj * used.to(lj.dtype)).sum(-1)
         g = torch.logaddexp(g + math.log(1.0 - explore_eps),
                             lu + math.log(explore_eps))
     return lp + g

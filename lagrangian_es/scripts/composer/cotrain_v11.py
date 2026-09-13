@@ -489,7 +489,15 @@ N_BPTT, B_BPTT, K_BPTT = 4, 48, 100                            # BPTT batches an
 # returns took the mean policy to 0.000 reach.  Exploration must vanish at
 # the goal; a held bearing needs a state-scaled sigma, not this.
 SIGMA_XY = float(sys.argv[8]) if len(sys.argv) > 8 else SIGMA0_COMPOSER
-NOISE_HOLD = sys.argv[9] if len(sys.argv) > 9 else 1                # decisions a draw is held; "flight" = once a flight
+# DECISIONS AN EXPLORATION DRAW IS HELD.  1 = i.i.d., the old behaviour.
+#   MEASURED, why >1: at explore 0.25 the router already points past 90
+# degrees on 12.6% of decisions -- exactly what uniform-over-the-circle
+# predicts -- and never learns from it, because clearing a U-shaped
+# pocket is a TEMPORALLY EXTENDED action.  One detour in isolation spends
+# distance walking away from the goal and is correctly punished; only a
+# consistent RUN pays.  I.i.d. gives a run of k with probability eps^k
+# (0.126^3 ~ 0.002); holding the centre gives eps.
+NOISE_HOLD = int(_os.environ.get("LES_HOLD", "1"))
 JUDGE_N = 256                                                  # judged every 10 on 256 episodes: half the noise of 128 every 5, same cost
 TARGET_KL, LR0, LR_MAX = 0.02, 2e-5, 1e-3     # the composer's trust region; the rate adapts to it
 W = f"{SP}/v11_{ARM}_composer.pt"; G = f"{SP}/v11_{ARM}_genome.json"; STATE = f"{SP}/v11_{ARM}_state.json"
